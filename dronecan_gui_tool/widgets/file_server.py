@@ -100,7 +100,7 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         self._key_to_path = {}
 
     def _resolve_path(self, relative):
-        rel = relative.path.decode().replace(chr(relative.SEPARATOR), os.path.sep)
+        rel = relative.path.decode()
         if rel in self._key_to_path:
             return self._key_to_path[rel]
         return super(FileServerJson, self)._resolve_path(relative)
