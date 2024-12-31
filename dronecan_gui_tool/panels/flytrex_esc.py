@@ -12,6 +12,7 @@ from functools import partial
 from PyQt5.QtWidgets import QVBoxLayout, QLabel, QDialog, \
     QGridLayout, QPushButton, QComboBox, QHBoxLayout, QGroupBox, QCheckBox
 from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtWidgets import QSizePolicy
 from logging import getLogger
 from ..widgets import make_icon_button, get_icon
 
@@ -30,6 +31,7 @@ class _ReadinessLabel(QLabel):
         super(_ReadinessLabel, self).__init__(parent)
         self.set(False)
         self.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        self.setFixedSize(70, 18)
 
     def set(self, value):
         if value:
@@ -101,6 +103,7 @@ class _FPCWidget(QGroupBox):
         self.setLayout(layout)
 
         self.default_stylesheet = self.styleSheet()
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         self._handlers = [self._dronecan_node.add_handler(dronecan.uavcan.equipment.esc.Status,
                                                           self._on_status_message)]
@@ -127,7 +130,7 @@ class _FPCWidget(QGroupBox):
         self._write_flipped()
 
     def _on_ident_clicked(self):
-        request = dronecan.uavcan.equipment.esc.Ident()
+        request = dronecan.uavcan.protocol.AccessCommandShell.Request(input='ident')
         self._dronecan_node.request(request,
                                     self._fpc_node.node_id,
                                     self._on_ident_response,
@@ -220,6 +223,11 @@ class _FPCWidget(QGroupBox):
         millis = diff / datetime.timedelta(milliseconds=1)
         self._age_label.setText("{:2.3f}".format(millis / 1000))
 
+        if diff > datetime.timedelta(seconds=1.5):
+            self._age_label.setStyleSheet("font-weight: bold; color: red")
+        else:
+            self._age_label.setStyleSheet("font-weight: normal; color: black")
+
         QTimer.singleShot(500, self._update_state)
 
     def __del__(self):
@@ -282,6 +290,7 @@ class FlytrexPropulsionControllerPanel(QDialog):
         buttons_layout.addWidget(save_button)
         buttons_layout.addWidget(fetch_button)
         buttons_layout.addWidget(self._status_label)
+        buttons_layout.addStretch()
 
         self._widget_container = QGroupBox("FPC")
         self._widget_layout = QGridLayout()
@@ -296,6 +305,9 @@ class FlytrexPropulsionControllerPanel(QDialog):
         layout.addWidget(buttons_container)
         layout.addWidget(self._widget_container)
         self._update_data()
+
+        # Smallest size policy for this widget
+        self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
 
     def _on_upload_clicked(self):
         for widget in self._widgets.values():
