@@ -42,9 +42,26 @@ class _ReadinessLabel(QLabel):
             self.setStyleSheet('background-color: yellow')
 
 
+class _IntTestLabel(QLabel):
+    def __init__(self, parent):
+        super(_IntTestLabel, self).__init__(parent)
+        self.set(False)
+        self.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        self.setFixedSize(70, 18)
+
+    def set(self, value):
+        if value:
+            self.setText('TEST')
+            self.setStyleSheet('background-color: yellow')
+        else:
+            self.setText('NOMINAL')
+            self.setStyleSheet('background-color: lightgreen')
+
+
 class _FPCWidget(QGroupBox):
     MOTOR_INDEX_PARAM = 'MOTOR_INDEX'
     REVERSE_PARAM = 'REVERSE_DIRECTION'
+    TEST_MODE_PARAM = 'INTEGRATION_TEST_MODE'
 
     def __init__(self, parent, fpc_node, dronecan_node):
         super(_FPCWidget, self).__init__(parent)
@@ -80,6 +97,12 @@ class _FPCWidget(QGroupBox):
         self._age_label = QLabel('Unknown')
         self._last_status = datetime.datetime.now()
 
+        # Test Mode
+        self._test_label = _IntTestLabel(self)
+        self._reset_button = QPushButton('Reset', self)
+        self._reset_button.clicked.connect(self._reset_request)
+        self._test_mode = None
+
         # Layout
         layout = QGridLayout()
 
@@ -99,6 +122,11 @@ class _FPCWidget(QGroupBox):
         # Row 3
         layout.addWidget(QLabel("Data Age"), 3, 0, 1, 1)
         layout.addWidget(self._age_label, 3, 1, 1, 1)
+
+        # Row 4
+        layout.addWidget(QLabel("Integration Test"), 4, 0, 1, 1)
+        layout.addWidget(self._reset_button, 4, 1, 1, 1)
+        layout.addWidget(self._test_label, 4, 2, 1, 1)
 
         self.setLayout(layout)
 
@@ -139,6 +167,50 @@ class _FPCWidget(QGroupBox):
     def _on_ident_response(self, e):
         pass
 
+    def _reset_request(self):
+        request = dronecan.uavcan.protocol.RestartNode.Request()
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_reset,
+                                    timeout=1)
+
+    def _on_reset(self, _):
+        self.fetch()
+
+    def to_test_mode(self):
+        request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.TEST_MODE_PARAM)
+        request.value.boolean_value = bool(True)
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_test_mode_response,
+                                    timeout=0.5)
+
+    def _on_test_mode_response(self, e):
+        if e is None:
+            self.to_test_mode()
+        else:
+            self._test_label.set(True)
+
+    def _read_test_mode(self):
+        request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.TEST_MODE_PARAM)
+        self._test_mode = None
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_test_read_response,
+                                    timeout=0.5)
+
+    def _on_test_read_response(self, e):
+        if e is None:
+            self._read_test_mode()
+        else:
+            try:
+                self._test_label.set(e.response.value.boolean_value)
+                self._test_mode = e.response.value.boolean_value
+            except AttributeError:
+                print(f'NID {self._fpc_node.node_id}')
+                self._test_mode = False
+                self._test_label.set(False)
+
     def _read_index(self):
         request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.MOTOR_INDEX_PARAM)
         self._dronecan_node.request(request,
@@ -156,8 +228,6 @@ class _FPCWidget(QGroupBox):
                 self._index_selector.setCurrentIndex(self._last_index)
                 self._index_selector.blockSignals(False)
                 self._index_label.set(True)
-
-        self.repaint()
 
     def _write_index(self):
         self._index_label.set(False)
@@ -214,7 +284,7 @@ class _FPCWidget(QGroupBox):
             self._flip_checkbox.setEnabled(True)
 
     def _update_state(self):
-        if self._last_direction != -1 and self._last_index != -1:
+        if self._last_direction != -1 and self._last_index != -1 and self._test_mode != None:
             self.setDisabled(False)
         else:
             self.setDisabled(True)
@@ -246,6 +316,7 @@ class _FPCWidget(QGroupBox):
         self.setEnabled(False)
         self._read_index()
         self._read_flipped()
+        self._read_test_mode()
 
     def save(self):
         self.setEnabled(False)
@@ -286,7 +357,11 @@ class FlytrexPropulsionControllerPanel(QDialog):
         self._status_label = QLabel("Status")
         self._status_label.setAlignment(Qt.AlignCenter)
 
+        test_mode_button = make_icon_button('hand-paper-o', 'Integration Test Mode', self,
+                                             text='Test Mode', on_clicked=self._on_test_mode)
+
         buttons_layout = QHBoxLayout(buttons_container)
+        buttons_layout.addWidget(test_mode_button)
         buttons_layout.addWidget(save_button)
         buttons_layout.addWidget(fetch_button)
         buttons_layout.addWidget(self._status_label)
@@ -316,6 +391,10 @@ class FlytrexPropulsionControllerPanel(QDialog):
     def _on_download_clicked(self):
         for widget in self._widgets.values():
             widget.fetch()
+
+    def _on_test_mode(self):
+        for widget in self._widgets.values():
+            widget.to_test_mode()
 
     def _update_data(self):
         QTimer.singleShot(500, self._update_data)
