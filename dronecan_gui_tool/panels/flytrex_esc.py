@@ -339,8 +339,8 @@ class FlytrexPropulsionControllerPanel(QDialog):
                 widget = _FPCWidget(self, dronecan_node=self._node, fpc_node=node)
                 self._widgets[node.node_id] = widget
                 self._widget_layout.addWidget(widget,
-                                              len(self._widgets) // self.COUNT_ROW,
-                                              len(self._widgets) % self.COUNT_ROW)
+                                              (len(self._widgets) - 1) // self.COUNT_ROW,
+                                              (len(self._widgets) - 1) % self.COUNT_ROW)
 
         config_pending = False
         for widget in self._widgets.values():
