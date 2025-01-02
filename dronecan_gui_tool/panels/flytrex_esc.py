@@ -246,6 +246,7 @@ class _FPCWidget(QGroupBox):
             self._saved = False
             self._index_selector.setEnabled(True)
             self._index_label.set(True)
+            self._last_index = self._index_selector.currentIndex()
 
     def _read_flipped(self):
         request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.REVERSE_PARAM)
@@ -307,6 +308,9 @@ class _FPCWidget(QGroupBox):
     def closeEvent(self, event):
         super(_FPCWidget, self).closeEvent(event)
         self.__del__()
+
+    def esc_index(self):
+        return self._last_index
 
     def reset(self):
         self._last_index = -1
@@ -375,10 +379,24 @@ class FlytrexPropulsionControllerPanel(QDialog):
         self._anon_warning.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
         self._anon_warning.setStyleSheet('font-weight: bold; color: red')
 
+        self._warnings = {
+            'DUPLICATE_INDEX': QLabel('Duplicate Motor Indexes'),
+            'NO_INDEX_SET': QLabel('Not all Motor Indexes set'),
+        }
+
         layout = QVBoxLayout(self)
         layout.addWidget(self._anon_warning)
         layout.addWidget(buttons_container)
         layout.addWidget(self._widget_container)
+
+        for w in self._warnings.values():
+            w.setStyleSheet('font-weight: bold; color: red')
+            policy = QSizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            w.setSizePolicy(policy)
+            w.setHidden(True)
+            layout.addWidget(w)
+
         self._update_data()
 
         # Smallest size policy for this widget
@@ -434,6 +452,22 @@ class FlytrexPropulsionControllerPanel(QDialog):
             self._status_label.setStyleSheet('font-weight: bold; color: green')
 
         self._widget_container.setTitle(f'Total {count} FPCs')
+
+        self._check_uniqueness()
+        self._check_no_disabled()
+
+    def _check_uniqueness(self):
+        s = set()
+        for w in self._widgets.values():
+            s.add(w.esc_index())
+        self._warnings['DUPLICATE_INDEX'].setVisible(len(s) != len(self._widgets.values()))
+
+    def _check_no_disabled(self):
+        no_zeros = True
+        for w in self._widgets.values():
+            if w.esc_index() == 0:
+                no_zeros = False
+        self._warnings['NO_INDEX_SET'].setVisible(not no_zeros)
 
     def __del__(self):
         global _singleton
