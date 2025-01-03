@@ -125,8 +125,8 @@ class _FPCWidget(QGroupBox):
 
         # Row 4
         layout.addWidget(QLabel("Integration Test"), 4, 0, 1, 1)
-        layout.addWidget(self._reset_button, 4, 1, 1, 1)
-        layout.addWidget(self._test_label, 4, 2, 1, 1)
+        layout.addWidget(self._reset_button, 4, 2, 1, 1)
+        layout.addWidget(self._test_label, 4, 1, 1, 1)
 
         self.setLayout(layout)
 
@@ -285,7 +285,7 @@ class _FPCWidget(QGroupBox):
             self._flip_checkbox.setEnabled(True)
 
     def _update_state(self):
-        if self._last_direction != -1 and self._last_index != -1 and self._test_mode != None:
+        if self._last_direction != -1 and self._last_index != -1 and self._test_mode is not None:
             self.setDisabled(False)
         else:
             self.setDisabled(True)
@@ -362,7 +362,7 @@ class FlytrexPropulsionControllerPanel(QDialog):
         self._status_label.setAlignment(Qt.AlignCenter)
 
         test_mode_button = make_icon_button('hand-paper-o', 'Integration Test Mode', self,
-                                             text='Test Mode', on_clicked=self._on_test_mode)
+                                            text='Test Mode', on_clicked=self._on_test_mode)
 
         buttons_layout = QHBoxLayout(buttons_container)
         buttons_layout.addWidget(test_mode_button)
