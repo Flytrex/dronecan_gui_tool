@@ -330,7 +330,6 @@ class _FPCWidget(QGroupBox):
                                     self._fpc_node.node_id,
                                     self._on_save_response,
                                     timeout=3.0)
-
     def _on_save_response(self, e):
         if e is None:
             self.save()
@@ -382,6 +381,7 @@ class FlytrexPropulsionControllerPanel(QDialog):
         self._warnings = {
             'DUPLICATE_INDEX': QLabel('Duplicate Motor Indexes'),
             'NO_INDEX_SET': QLabel('Not all Motor Indexes set'),
+            'FW_VERSION': QLabel("Multiple different firmware versions present"),
         }
 
         layout = QVBoxLayout(self)
@@ -455,6 +455,7 @@ class FlytrexPropulsionControllerPanel(QDialog):
 
         self._check_uniqueness()
         self._check_no_disabled()
+        self._check_fw_versions()
 
     def _check_uniqueness(self):
         s = set()
@@ -468,6 +469,15 @@ class FlytrexPropulsionControllerPanel(QDialog):
             if w.esc_index() == 0:
                 no_zeros = False
         self._warnings['NO_INDEX_SET'].setVisible(not no_zeros)
+
+    def _check_fw_versions(self):
+        commits = set()
+        for node in self._monitor.find_all(lambda node_:
+                                           True if node_.info and str(node_.info.name).startswith('com.flytrex.fpc')
+                                           else False):
+            commits.add(node.info.software_version.vcs_commit)
+
+        self._warnings['FW_VERSION'].setVisible(len(commits) > 1)
 
     def __del__(self):
         global _singleton
