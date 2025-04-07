@@ -6,16 +6,17 @@
 # Author: Grisha Revzin
 #
 import datetime
+import os
+import time
 
 import dronecan
 from functools import partial
 from PyQt5.QtWidgets import QVBoxLayout, QLabel, QDialog, \
-    QGridLayout, QPushButton, QComboBox, QHBoxLayout, QGroupBox, QCheckBox
+    QGridLayout, QPushButton, QComboBox, QHBoxLayout, QGroupBox, QCheckBox, QFileDialog, QApplication
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtWidgets import QSizePolicy
 from logging import getLogger
-from ..widgets import make_icon_button, get_icon
-
+from ..widgets import make_icon_button, get_icon, node_properties
 
 __all__ = 'PANEL_NAME', 'spawn', 'get_icon'
 
@@ -64,6 +65,15 @@ class _FPCWidget(QGroupBox):
     TEST_MODE_PARAM = 'INTEGRATION_TEST_MODE'
 
     def __init__(self, parent, fpc_node, dronecan_node):
+        from ..main import MainWindow
+
+        def find_main_window():
+            app = QApplication.instance()
+            for widget in app.topLevelWidgets():
+                if isinstance(widget, MainWindow):
+                    return widget
+            return None
+
         super(_FPCWidget, self).__init__(parent)
 
         self._last_index = -1
@@ -73,6 +83,13 @@ class _FPCWidget(QGroupBox):
         self._dronecan_node = dronecan_node
         self.setDisabled(True)
         self.setTitle('FPC ' + str(self._fpc_node.node_id))
+
+        # For Firmware Update -- very ugly, but reuses a lot of code from Node Properties
+        main_window = find_main_window()
+        self._controls = node_properties.Controls(self, self._dronecan_node, self._fpc_node.node_id,
+                                                  main_window._file_server_widget,
+                                                  main_window._dynamic_node_id_allocation_widget)
+        self._controls.setVisible(False)
 
         # Motor Index
         self._index_selector = QComboBox()
@@ -97,11 +114,9 @@ class _FPCWidget(QGroupBox):
         self._age_label = QLabel('Unknown')
         self._last_status = datetime.datetime.now()
 
-        # Test Mode
-        self._test_label = _IntTestLabel(self)
-        self._reset_button = QPushButton('Reset', self)
-        self._reset_button.clicked.connect(self._reset_request)
-        self._test_mode = None
+        # Firmware Update State
+        self._firmware_update_label = QLabel('N/A')
+        self._firmware_update_title = QLabel("Firmware Update")
 
         # Layout
         layout = QGridLayout()
@@ -121,12 +136,11 @@ class _FPCWidget(QGroupBox):
 
         # Row 3
         layout.addWidget(QLabel("Data Age"), 3, 0, 1, 1)
-        layout.addWidget(self._age_label, 3, 1, 1, 1)
+        layout.addWidget(self._age_label, 3, 1, 1, 2)
 
         # Row 4
-        layout.addWidget(QLabel("Integration Test"), 4, 0, 1, 1)
-        layout.addWidget(self._reset_button, 4, 2, 1, 1)
-        layout.addWidget(self._test_label, 4, 1, 1, 1)
+        layout.addWidget(self._firmware_update_title, 4, 0, 1, 1)
+        layout.addWidget(self._firmware_update_label, 4, 1, 1, 2)
 
         self.setLayout(layout)
 
@@ -174,42 +188,11 @@ class _FPCWidget(QGroupBox):
                                     self._on_reset,
                                     timeout=1)
 
+    def start_firmware_update(self, fw_file):
+        self._controls._do_firmware_update(fw_file)
+
     def _on_reset(self, _):
         self.fetch()
-
-    def to_test_mode(self):
-        request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.TEST_MODE_PARAM)
-        request.value.boolean_value = bool(True)
-        self._dronecan_node.request(request,
-                                    self._fpc_node.node_id,
-                                    self._on_test_mode_response,
-                                    timeout=0.5)
-
-    def _on_test_mode_response(self, e):
-        if e is None:
-            self.to_test_mode()
-        else:
-            self._test_label.set(True)
-
-    def _read_test_mode(self):
-        request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.TEST_MODE_PARAM)
-        self._test_mode = None
-        self._dronecan_node.request(request,
-                                    self._fpc_node.node_id,
-                                    self._on_test_read_response,
-                                    timeout=0.5)
-
-    def _on_test_read_response(self, e):
-        if e is None:
-            self._read_test_mode()
-        else:
-            try:
-                self._test_label.set(e.response.value.boolean_value)
-                self._test_mode = e.response.value.boolean_value
-            except AttributeError:
-                print(f'NID {self._fpc_node.node_id}')
-                self._test_mode = False
-                self._test_label.set(False)
 
     def _read_index(self):
         request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.MOTOR_INDEX_PARAM)
@@ -285,11 +268,13 @@ class _FPCWidget(QGroupBox):
             self._flip_checkbox.setEnabled(True)
 
     def _update_state(self):
-        if self._last_direction != -1 and self._last_index != -1 and self._test_mode is not None:
+        # Disable/enable
+        if self._last_direction != -1 and self._last_index != -1:
             self.setDisabled(False)
         else:
             self.setDisabled(True)
 
+        # Data age
         diff = datetime.datetime.now() - self._last_status
         millis = diff / datetime.timedelta(milliseconds=1)
         self._age_label.setText("{:2.3f}".format(millis / 1000))
@@ -298,6 +283,21 @@ class _FPCWidget(QGroupBox):
             self._age_label.setStyleSheet("font-weight: bold; color: red")
         else:
             self._age_label.setStyleSheet("font-weight: normal; color: black")
+
+        # Firmware update
+        s = dronecan.uavcan.protocol.NodeStatus()
+        if self._fpc_node.status.mode == s.MODE_SOFTWARE_UPDATE:
+            if int(time.time()) % 2:
+                self._firmware_update_title.setStyleSheet('background-color: yellow')
+            else:
+                self._firmware_update_title.setStyleSheet('')
+            self._firmware_update_label.setEnabled(True)
+            self._firmware_update_label.setText(f'{self._fpc_node.status.vendor_specific_status_code}%')
+
+        else:
+            self._firmware_update_label.setEnabled(False)
+            self._firmware_update_label.setText('N/A')
+            self._firmware_update_title.setStyleSheet('')
 
         QTimer.singleShot(500, self._update_state)
 
@@ -320,7 +320,6 @@ class _FPCWidget(QGroupBox):
         self.setEnabled(False)
         self._read_index()
         self._read_flipped()
-        self._read_test_mode()
 
     def save(self):
         self.setEnabled(False)
@@ -330,12 +329,16 @@ class _FPCWidget(QGroupBox):
                                     self._fpc_node.node_id,
                                     self._on_save_response,
                                     timeout=3.0)
+
     def _on_save_response(self, e):
         if e is None:
             self.save()
         else:
             self._saved = True
             self.setEnabled(True)
+
+    def set_node(self, node):
+        self._fpc_node = node
 
 
 class FlytrexPropulsionControllerPanel(QDialog):
@@ -357,17 +360,18 @@ class FlytrexPropulsionControllerPanel(QDialog):
                                        text='Store All', on_clicked=self._on_upload_clicked)
         fetch_button = make_icon_button('refresh', 'Download FPC configs', self,
                                         text='Fetch All', on_clicked=self._on_download_clicked)
+
+        fw_update_button = make_icon_button('bug', 'Firmware Update', self,
+                                            text='Upload Firmware', on_clicked=self._on_firmware_update)
+
         self._status_label = QLabel("Status")
         self._status_label.setAlignment(Qt.AlignCenter)
 
-        test_mode_button = make_icon_button('hand-paper-o', 'Integration Test Mode', self,
-                                            text='Test Mode', on_clicked=self._on_test_mode)
-
         buttons_layout = QHBoxLayout(buttons_container)
-        buttons_layout.addWidget(test_mode_button)
         buttons_layout.addWidget(save_button)
         buttons_layout.addWidget(fetch_button)
         buttons_layout.addWidget(self._status_label)
+        buttons_layout.addWidget(fw_update_button)
         buttons_layout.addStretch()
 
         self._widget_container = QGroupBox("FPC")
@@ -402,6 +406,26 @@ class FlytrexPropulsionControllerPanel(QDialog):
         # Smallest size policy for this widget
         self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
 
+    def _on_firmware_update(self):
+        self._node.set_canfd(True)
+        fw_file = QFileDialog().getOpenFileName(self, 'Select firmware file', '',
+                                                'Binary images (*.bin);;ArduPilot Firmware (*.apj);;AM32 Firmware (*.amj);;PX4 Firmware (*.px4);;All files (*.*)')
+        if not fw_file[0]:
+            return
+
+        try:
+            with open(os.path.normcase(os.path.abspath(fw_file[0])), 'rb') as f:
+                f.read(100)
+        except:
+            return
+
+        for widget in self._widgets.values():
+            widget.start_firmware_update(fw_file)
+
+    def show_message(self, text, *fmt):
+        """ Dummy for node_properties.Controls """
+        pass
+
     def _on_upload_clicked(self):
         for widget in self._widgets.values():
             widget.save()
@@ -409,10 +433,6 @@ class FlytrexPropulsionControllerPanel(QDialog):
     def _on_download_clicked(self):
         for widget in self._widgets.values():
             widget.fetch()
-
-    def _on_test_mode(self):
-        for widget in self._widgets.values():
-            widget.to_test_mode()
 
     def _update_data(self):
         QTimer.singleShot(500, self._update_data)
@@ -438,6 +458,10 @@ class FlytrexPropulsionControllerPanel(QDialog):
                 self._widget_layout.addWidget(widget,
                                               (len(self._widgets) - 1) // self.COUNT_ROW,
                                               (len(self._widgets) - 1) % self.COUNT_ROW)
+            else:
+                # Make sure the widget has the latest node object
+                widget = self._widgets[node.node_id]
+                widget.set_node(node)
 
         config_pending = False
         for widget in self._widgets.values():

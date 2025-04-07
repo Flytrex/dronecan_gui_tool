@@ -237,7 +237,7 @@ class Controls(QGroupBox):
             show_error('Node error', 'Could not send stats request', ex, self)
 
 
-    def _do_firmware_update(self):
+    def _do_firmware_update(self, fw_file = None):
         # Making sure the node is not anonymous
         if self._node.is_anonymous:
             show_error('Cannot request firmware update', 'Local node is anonymous',
@@ -245,8 +245,9 @@ class Controls(QGroupBox):
             return
 
         # Requesting the firmware path
-        fw_file = QFileDialog().getOpenFileName(self, 'Select firmware file', '',
-                                                'Binary images (*.bin);;ArduPilot Firmware (*.apj);;AM32 Firmware (*.amj);;PX4 Firmware (*.px4);;All files (*.*)')
+        if not fw_file:
+            fw_file = QFileDialog().getOpenFileName(self, 'Select firmware file', '',
+                                                    'Binary images (*.bin);;ArduPilot Firmware (*.apj);;AM32 Firmware (*.amj);;PX4 Firmware (*.px4);;All files (*.*)')
         if not fw_file[0]:
             self.window().show_message('Cancelled')
             return
