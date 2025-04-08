@@ -356,12 +356,12 @@ class FlytrexPropulsionControllerPanel(QDialog):
 
         buttons_container = QGroupBox("Configuration", self)
 
-        save_button = make_icon_button('database', 'Upload FPC configs', self,
+        save_button = make_icon_button('fa6s.database', 'Upload FPC configs', self,
                                        text='Store All', on_clicked=self._on_upload_clicked)
-        fetch_button = make_icon_button('refresh', 'Download FPC configs', self,
+        fetch_button = make_icon_button('fa6s.arrows-rotate', 'Download FPC configs', self,
                                         text='Fetch All', on_clicked=self._on_download_clicked)
 
-        fw_update_button = make_icon_button('bug', 'Firmware Update', self,
+        fw_update_button = make_icon_button('fa6s.bug', 'Firmware Update', self,
                                             text='Upload Firmware', on_clicked=self._on_firmware_update)
 
         self._status_label = QLabel("Status")
@@ -527,4 +527,4 @@ def spawn(parent, node):
     return _singleton
 
 
-get_icon = partial(get_icon, 'asterisk')
+get_icon = partial(get_icon, 'fa6s.asterisk')
