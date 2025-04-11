@@ -64,16 +64,16 @@ class _FPCWidget(QGroupBox):
     REVERSE_PARAM = 'REVERSE_DIRECTION'
     TEST_MODE_PARAM = 'INTEGRATION_TEST_MODE'
 
-    def __init__(self, parent, fpc_node, dronecan_node):
+    @staticmethod
+    def find_main_window():
         from ..main import MainWindow
+        app = QApplication.instance()
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, MainWindow):
+                return widget
+        return None
 
-        def find_main_window():
-            app = QApplication.instance()
-            for widget in app.topLevelWidgets():
-                if isinstance(widget, MainWindow):
-                    return widget
-            return None
-
+    def __init__(self, parent, fpc_node, dronecan_node):
         super(_FPCWidget, self).__init__(parent)
 
         self._last_index = -1
@@ -85,7 +85,7 @@ class _FPCWidget(QGroupBox):
         self.setTitle('FPC ' + str(self._fpc_node.node_id))
 
         # For Firmware Update -- very ugly, but reuses a lot of code from Node Properties
-        main_window = find_main_window()
+        main_window = _FPCWidget.find_main_window()
         self._controls = node_properties.Controls(self, self._dronecan_node, self._fpc_node.node_id,
                                                   main_window._file_server_widget,
                                                   main_window._dynamic_node_id_allocation_widget)
@@ -118,6 +118,9 @@ class _FPCWidget(QGroupBox):
         self._firmware_update_label = QLabel('N/A')
         self._firmware_update_title = QLabel("Firmware Update")
 
+        # Version
+        self._version = QLabel('N/A')
+
         # Layout
         layout = QGridLayout()
 
@@ -141,6 +144,10 @@ class _FPCWidget(QGroupBox):
         # Row 4
         layout.addWidget(self._firmware_update_title, 4, 0, 1, 1)
         layout.addWidget(self._firmware_update_label, 4, 1, 1, 2)
+
+        # Row 5
+        layout.addWidget(QLabel("Version"), 5, 0, 1, 1)
+        layout.addWidget(self._version, 5, 1, 1, 2)
 
         self.setLayout(layout)
 
@@ -189,6 +196,7 @@ class _FPCWidget(QGroupBox):
                                     timeout=1)
 
     def start_firmware_update(self, fw_file):
+        _FPCWidget.find_main_window()._adapter_settings_widget._canfd.setChecked(True)
         self._controls._do_firmware_update(fw_file)
 
     def _on_reset(self, _):
@@ -298,6 +306,13 @@ class _FPCWidget(QGroupBox):
             self._firmware_update_label.setEnabled(False)
             self._firmware_update_label.setText('N/A')
             self._firmware_update_title.setStyleSheet('')
+
+        # Firmware version
+        node_name = str(self._fpc_node.info.name)
+        end = node_name.find(' ')
+        if end == -1:
+            end = len(node_name)
+        self._version.setText(node_name[len('com.flytrex.fpc.'):end])
 
         QTimer.singleShot(500, self._update_state)
 
