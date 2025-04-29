@@ -189,9 +189,13 @@ class _FPCWidget(QGroupBox):
 
         # Operational Data
         self._speed = QLabel('N/A')
+        self._speed.setAlignment(Qt.AlignRight)
         self._voltage = QLabel('N/A')
+        self._voltage.setAlignment(Qt.AlignRight)
         self._current = QLabel('N/A')
+        self._current.setAlignment(Qt.AlignRight)
         self._temperature = QLabel('N/A')
+        self._temperature.setAlignment(Qt.AlignRight)
 
         # Layout
         layout = QGridLayout()
@@ -225,8 +229,9 @@ class _FPCWidget(QGroupBox):
         layout.addWidget(self._faults, 6, 0, 1, 3)
 
         # Row 7
-        layout.addWidget(QLabel("RPM"), 7, 0, 1, 1)
-        layout.addWidget(self._speed, 7, 1, 1, 2)
+        layout.addWidget(QLabel("Speed"), 7, 0, 1, 1)
+        layout.addWidget(self._speed, 7, 1, 1, 1)
+        layout.addWidget(QLabel('RPM'), 7, 2, 1, 1)
 
         # Row 8
         layout.addWidget(QLabel("Current"), 8, 0, 1, 1)
@@ -235,12 +240,12 @@ class _FPCWidget(QGroupBox):
 
         # Row 9
         layout.addWidget(QLabel("Voltage"), 9, 0, 1, 1)
-        layout.addWidget(self._voltage, 9, 1, 1, 2)
+        layout.addWidget(self._voltage, 9, 1, 1, 1)
         layout.addWidget(QLabel('V'), 9, 2, 1, 1)
 
         # Row 10
         layout.addWidget(QLabel("Temperature"), 10, 0, 1, 1)
-        layout.addWidget(self._temperature, 10, 1, 1, 2)
+        layout.addWidget(self._temperature, 10, 1, 1, 1)
         layout.addWidget(QLabel('°C'), 10, 2, 1, 1)
 
         self.setLayout(layout)
