@@ -12,9 +12,9 @@ import time
 import dronecan
 from functools import partial
 from PyQt5.QtWidgets import QVBoxLayout, QLabel, QDialog, \
-    QGridLayout, QPushButton, QComboBox, QHBoxLayout, QGroupBox, QCheckBox, QFileDialog, QApplication
+    QGridLayout, QPushButton, QComboBox, QHBoxLayout, QGroupBox, QCheckBox, QFileDialog, QApplication, QMessageBox, \
+    QSizePolicy
 from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtWidgets import QSizePolicy
 from logging import getLogger
 from ..widgets import make_icon_button, get_icon, node_properties
 
@@ -25,6 +25,67 @@ PANEL_NAME = 'Flytrex Propulsion Controller'
 logger = getLogger(__name__)
 
 _singleton = None
+
+
+class _FaultBitLabel(QLabel):
+    STYLESHEET_SET = 'padding: 0px; border: 2px solid black; background-color: red;'
+    STYLESHEET_RESET = 'padding: 0px; border: 2px solid black; background-color: green;'
+    STYLESHEET_HANGING = 'padding: 0px; border: 2px solid black; background-color: yellow;'
+
+    def __init__(self, parent, name):
+        super(_FaultBitLabel, self).__init__(parent)
+        self.setText(name)
+        self.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        self.setFixedWidth(30)
+        self.reset()
+
+    def set(self):
+        self.setStyleSheet(_FaultBitLabel.STYLESHEET_SET)
+
+    def reset(self):
+        self.setStyleSheet(_FaultBitLabel.STYLESHEET_RESET)
+
+    def hang(self):
+        self.setStyleSheet(_FaultBitLabel.STYLESHEET_HANGING)
+
+
+class _FaultGroupBox(QGroupBox):
+
+    FAULT_SEQUENCE = ('DUR', 'OV', 'UV', 'OT', 'ST', 'SFB', 'OCH', 'SW',
+                      'SA', 'OCS', 'DPF', 'R1', 'SAF', 'SY', 'KS', 'TO')
+    ROW_WIDTH = 8
+
+    def __init__(self, parent):
+        super(_FaultGroupBox, self).__init__(parent)
+        self.setTitle('Fault State')
+        layout = QGridLayout()
+        layout.setSpacing(0)
+
+        self._labels = {}
+        self._set_time = {}
+
+        i = 0
+        for fault in _FaultGroupBox.FAULT_SEQUENCE:
+            self._labels[fault] = _FaultBitLabel(self, fault)
+            self._set_time[fault] = datetime.datetime.now()
+            row, column = divmod(i, _FaultGroupBox.ROW_WIDTH)
+            layout.addWidget(self._labels[fault], row, column)
+            i += 1
+
+        self.setLayout(layout)
+
+    def on_new_status_word(self, fault_bitfield):
+        i = 0
+        for i in range(16):
+            if fault_bitfield[i]:
+                self._labels[_FaultGroupBox.FAULT_SEQUENCE[i]].set()
+                self._set_time[_FaultGroupBox.FAULT_SEQUENCE[i]] = datetime.datetime.now()
+            else:
+                # Some of the FPC's fault bits are only present for a few frames, we delay extinguishing those
+                if (datetime.datetime.now() - self._set_time[_FaultGroupBox.FAULT_SEQUENCE[i]]).total_seconds() > 5:
+                    self._labels[_FaultGroupBox.FAULT_SEQUENCE[i]].reset()
+                else:
+                    self._labels[_FaultGroupBox.FAULT_SEQUENCE[i]].hang()
 
 
 class _ReadinessLabel(QLabel):
@@ -63,6 +124,8 @@ class _FPCWidget(QGroupBox):
     MOTOR_INDEX_PARAM = 'MOTOR_INDEX'
     REVERSE_PARAM = 'REVERSE_DIRECTION'
     TEST_MODE_PARAM = 'INTEGRATION_TEST_MODE'
+
+    definitions_message_box_shown = False
 
     @staticmethod
     def find_main_window():
@@ -121,6 +184,15 @@ class _FPCWidget(QGroupBox):
         # Version
         self._version = QLabel('N/A')
 
+        # Faults
+        self._faults = _FaultGroupBox(self)
+
+        # Operational Data
+        self._speed = QLabel('N/A')
+        self._voltage = QLabel('N/A')
+        self._current = QLabel('N/A')
+        self._temperature = QLabel('N/A')
+
         # Layout
         layout = QGridLayout()
 
@@ -149,6 +221,28 @@ class _FPCWidget(QGroupBox):
         layout.addWidget(QLabel("Version"), 5, 0, 1, 1)
         layout.addWidget(self._version, 5, 1, 1, 2)
 
+        # Row 6
+        layout.addWidget(self._faults, 6, 0, 1, 3)
+
+        # Row 7
+        layout.addWidget(QLabel("RPM"), 7, 0, 1, 1)
+        layout.addWidget(self._speed, 7, 1, 1, 2)
+
+        # Row 8
+        layout.addWidget(QLabel("Current"), 8, 0, 1, 1)
+        layout.addWidget(self._current, 8, 1, 1, 1)
+        layout.addWidget(QLabel('A'), 8, 2, 1, 1)
+
+        # Row 9
+        layout.addWidget(QLabel("Voltage"), 9, 0, 1, 1)
+        layout.addWidget(self._voltage, 9, 1, 1, 2)
+        layout.addWidget(QLabel('V'), 9, 2, 1, 1)
+
+        # Row 10
+        layout.addWidget(QLabel("Temperature"), 10, 0, 1, 1)
+        layout.addWidget(self._temperature, 10, 1, 1, 2)
+        layout.addWidget(QLabel('°C'), 10, 2, 1, 1)
+
         self.setLayout(layout)
 
         self.default_stylesheet = self.styleSheet()
@@ -165,12 +259,29 @@ class _FPCWidget(QGroupBox):
     def saved(self):
         return self._saved
 
-    def _on_status_message(self, message):
-        if message.transfer.source_node_id != self._fpc_node.node_id:
+    def _on_status_message(self, transfer):
+        if transfer.transfer.source_node_id != self._fpc_node.node_id:
             pass
         else:
             self._last_status = datetime.datetime.now()
-            pass  # TODO info display later
+            message = transfer.message
+            try:
+                self._faults.on_new_status_word(message.error_flags)
+            except AttributeError:
+                if not _FPCWidget.definitions_message_box_shown:
+                    _FPCWidget.definitions_message_box_shown = True
+                    msg = QMessageBox()
+                    msg.setIcon(QMessageBox.Icon.Critical)
+                    msg.setText('Flytrex DroneCAN custom messages ("DSDLs") have not been installed. '
+                                'Refer to documentation.')
+                    msg.setWindowTitle('Incomplete Installation')
+                    msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+                    msg.exec()
+
+            self._voltage.setText('{:2.2f}'.format(message.voltage))
+            self._current.setText('{:2.1f}'.format(message.current))
+            self._speed.setText('{:4}'.format(message.rpm))
+            self._temperature.setText(('{:3.1f}'.format(message.temperature - 273.15)))
 
     def _on_set_index(self):
         self._write_index()
