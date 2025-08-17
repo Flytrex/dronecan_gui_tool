@@ -13,7 +13,7 @@ import threading
 import copy
 from .widgets import show_error, get_monospace_font, directory_selection
 from PyQt5.QtWidgets import QComboBox, QCompleter, QDialog, QDirModel, QFileDialog, QGroupBox, QHBoxLayout, QLabel, \
-    QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QGridLayout, QCheckBox
+    QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QGridLayout, QCheckBox, QWidget
 from qtwidgets import PasswordEdit
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIntValidator
@@ -30,7 +30,7 @@ assert DEFAULT_BAUD_RATE in STANDARD_BAUD_RATES
 
 RUNNING_ON_LINUX = 'linux' in sys.platform.lower()
 
-
+MACOS_SERIAL_PORTS_FILTER = ['/dev/tty.debug-console', '/dev/tty.wlan-debug', '/dev/tty.Bluetooth-Incoming-Port']
 logger = getLogger(__name__)
 
 
@@ -100,7 +100,8 @@ def list_ifaces():
         for port in QtSerialPort.QSerialPortInfo.availablePorts():
             if sys.platform == 'darwin':
                 if 'tty' in port.systemLocation():
-                    out[port.systemLocation()] = port.systemLocation()
+                    if port.systemLocation() not in MACOS_SERIAL_PORTS_FILTER:
+                        out[port.systemLocation()] = port.systemLocation()
             else:
                 sys_name = port.systemLocation()
                 sys_alpha = re.sub(r'[^a-zA-Z0-9]', '', sys_name)
@@ -114,10 +115,16 @@ def list_ifaces():
             out[x] = x
 
         try:
-            from can import detect_available_configs
-            for interface in detect_available_configs():
-                if interface['interface'] == "pcan":
-                    out[interface['channel']] = interface['channel']
+            if sys.platform != 'darwin':
+                from can import detect_available_configs
+                try:
+                    import pythoncom
+                    pythoncom.CoInitialize()
+                except Exception:
+                    pass
+                for interface in detect_available_configs():
+                    if interface['interface'] == "pcan":
+                        out[interface['channel']] = interface['channel']
         except Exception as ex:
             logger.warning('Could not load can interfaces: %s', ex, exc_info=True)
 
@@ -156,7 +163,7 @@ class BackgroundIfaceListUpdater:
             return copy.copy(self._ifaces)
 
 
-def run_setup_window(icon, dsdl_path=None):
+def run_setup_window(icon, dsdl_path=None, config_baudrate=DEFAULT_BAUD_RATE, config_bitrate=1000000, config_can_bus=1, enable_filtering=False, mavlink_target_system=0, mavlink_signing_key=''):
     win = QDialog()
     win.setWindowTitle('Application Setup')
     win.setWindowIcon(icon)
@@ -177,12 +184,12 @@ def run_setup_window(icon, dsdl_path=None):
     bitrate = QSpinBox(win)
     bitrate.setMaximum(1000000)
     bitrate.setMinimum(10000)
-    bitrate.setValue(1000000)
+    bitrate.setValue(config_bitrate)
 
     bus_number = QSpinBox(win)
     bus_number.setMaximum(4)
     bus_number.setMinimum(1)
-    bus_number.setValue(1)
+    bus_number.setValue(config_can_bus)
     
     baudrate = QComboBox(win)
     baudrate.setEditable(True)
@@ -196,16 +203,18 @@ def run_setup_window(icon, dsdl_path=None):
 
     baudrate.setValidator(QIntValidator(min(STANDARD_BAUD_RATES), max(STANDARD_BAUD_RATES)))
     baudrate.insertItems(0, map(str, STANDARD_BAUD_RATES))
-    baudrate.setCurrentText(str(DEFAULT_BAUD_RATE))
+    baudrate.setCurrentText(str(config_baudrate))
 
     filtered = QCheckBox('Enable Filtering')
+    filtered.setChecked(enable_filtering)
 
     target_system = QSpinBox(win)
     target_system.setMaximum(255)
     target_system.setMinimum(0)
-    target_system.setValue(0)
+    target_system.setValue(mavlink_target_system)
 
     signing_key = PasswordEdit(win)
+    signing_key.setText(mavlink_signing_key)
 
     dir_selection = directory_selection.DirectorySelectionWidget(win, 'Location of custom DSDL definitions [optional]', path=dsdl_path, directory_only=True)
 
@@ -307,6 +316,16 @@ def run_setup_window(icon, dsdl_path=None):
     layout.addWidget(ok)
     layout.setSizeConstraint(layout.SetFixedSize)
     win.setLayout(layout)
+
+    QWidget.setTabOrder(combo, bus_number)
+    QWidget.setTabOrder(bus_number, bitrate)
+    QWidget.setTabOrder(bitrate, baudrate)
+    QWidget.setTabOrder(baudrate, filtered)
+    QWidget.setTabOrder(filtered, target_system)
+    QWidget.setTabOrder(target_system, signing_key)
+    QWidget.setTabOrder(signing_key, dir_selection)
+    QWidget.setTabOrder(dir_selection, ok)
+    QWidget.setTabOrder(ok, combo)
 
     with BackgroundIfaceListUpdater() as iface_lister:
         update_iface_list()
