@@ -283,7 +283,7 @@ class BasicTable(QTableWidget):
                             try:
                                 color = QColor(color_attr)
                                 color_data.append(color if color.isValid() else None)
-                            except:
+                            except (ValueError, TypeError):
                                 color_data.append(None)
                         else:
                             color_data.append(None)
