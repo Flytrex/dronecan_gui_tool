@@ -601,7 +601,7 @@ class ConfigParams(QGroupBox):
         self._load_from_file = make_icon_button('',
                                                 'Load Parameters From File',
                                                 self, text='Load From File', on_clicked=self._do_load_from_file)
-        
+
         columns = [
             BasicTable.Column('Idx',
                               lambda m: m[0]),
@@ -730,7 +730,7 @@ class ConfigParams(QGroupBox):
                 return value.string_value
         else:
             raise RuntimeError('invalid param value type')
-            
+
     def _do_save_to_file(self):
         '''save parameters to a file'''
         param_file = QFileDialog().getSaveFileName(self, 'Select param file', '',
@@ -756,23 +756,36 @@ class ConfigParams(QGroupBox):
                 p = self._params[i]
                 name = str(p.name)
                 if name == str(e.response.name):
-                    logger.info('set %s to %s' % (name, self.param_as_string(e.response.value)))
+                    param_string = self.param_as_string(e.response.value)
+                    logger.info('set %s to %s' % (name, param_string))
+                    value_type = dronecan.get_active_union_field(p.value)
+                    self._update_table_param(p.value, value_type, param_string)
                     self._table.item(i, self.VALUE_COLUMN).setText(self.param_as_string(e.response.value, AM32_Rtttl.is_am32_melody_param(p)))
+
+    def _update_table_param(self, param, value_type, str_value):
+        """
+        @brief        Update the table parameter with the given string value.
+        @param[out]   param       The dronecan.uavcan.protocol.param parameter to update.
+        @param[in]    value_type  The type of the parameter value.
+        @param[in]    str_value   The new string value to set.
+        """
+
+        if value_type == 'integer_value':
+            param.integer_value = int(str_value)
+        elif value_type == 'real_value':
+            param.real_value = float(str_value)
+        elif value_type == 'boolean_value':
+            param.boolean_value = str_value.lower() in ['true', '1', 't', 'y', 'yes']
+        elif value_type == 'string_value':
+            param.string_value = str_value
+        else:
+            raise RuntimeError('bad parameter type on save')
 
     def save_param(self, name, old_value, str_value):
         value_type = dronecan.get_active_union_field(old_value)
-        v = old_value
+        v = dronecan.uavcan.protocol.param.Value()
 
-        if value_type == 'integer_value':
-            v.integer_value = int(str_value)
-        elif value_type == 'real_value':
-            v.real_value = float(str_value)
-        elif value_type == 'boolean_value':
-            v.boolean_value = str_value.lower() in ['true', '1', 't', 'y', 'yes']
-        elif value_type == 'string_value':
-            v.string_value = str_value
-        else:
-            raise RuntimeError('bad parameter type on save')
+        self._update_table_param(v, value_type, str_value)
 
         try:
             request = dronecan.uavcan.protocol.param.GetSet.Request(name=name, value=v)
