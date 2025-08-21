@@ -758,17 +758,17 @@ class ConfigParams(QGroupBox):
                 if name == str(e.response.name):
                     param_string = self.param_as_string(e.response.value)
                     logger.info('set %s to %s' % (name, param_string))
-                    value_type = dronecan.get_active_union_field(p.value)
-                    self._update_table_param(p.value, value_type, param_string)
+                    self._update_table_param(p.value, param_string)
                     self._table.item(i, self.VALUE_COLUMN).setText(self.param_as_string(e.response.value, AM32_Rtttl.is_am32_melody_param(p)))
 
-    def _update_table_param(self, param, value_type, str_value):
+    def _update_table_param(self, param, str_value):
         """
         @brief        Update the table parameter with the given string value.
         @param[out]   param       The dronecan.uavcan.protocol.param parameter to update.
-        @param[in]    value_type  The type of the parameter value.
         @param[in]    str_value   The new string value to set.
         """
+
+        value_type = dronecan.get_active_union_field(param)
 
         if value_type == 'integer_value':
             param.integer_value = int(str_value)
@@ -782,10 +782,11 @@ class ConfigParams(QGroupBox):
             raise RuntimeError('bad parameter type on save')
 
     def save_param(self, name, old_value, str_value):
-        value_type = dronecan.get_active_union_field(old_value)
         v = dronecan.uavcan.protocol.param.Value()
+        value_type = dronecan.get_active_union_field(old_value)
+        setattr(v, value_type, getattr(old_value, value_type))
 
-        self._update_table_param(v, value_type, str_value)
+        self._update_table_param(v, str_value)
 
         try:
             request = dronecan.uavcan.protocol.param.GetSet.Request(name=name, value=v)
