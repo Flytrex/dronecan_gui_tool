@@ -13,7 +13,7 @@ from functools import partial
 import dronecan
 from dronecan.driver import CANFrame
 from PyQt5.QtWidgets import QMainWindow, QHeaderView, QLabel, QSplitter, QSizePolicy, QWidget, QHBoxLayout, \
-    QPlainTextEdit, QDialog, QVBoxLayout, QMenu, QAction
+    QPlainTextEdit, QDialog, QVBoxLayout, QMenu, QAction, QMessageBox
 from PyQt5.QtGui import QColor, QIcon, QTextOption
 from PyQt5.QtCore import Qt, QTimer
 from pyqtgraph import PlotWidget, mkPen
@@ -116,7 +116,7 @@ def formatted_ascii(frame):
     for i in range(int(data_len/8)+1):
         beg = i*8
         end = min((i+1)*8, data_len)
-        fmt_data = "\n".join([fmt_data, 
+        fmt_data = "\n".join([fmt_data,
                     ''.join([(chr(x) if 32 <= x <= 126 else '.') for x in frame.data[beg:end]])])
 
     fmt_data = fmt_data[1:]
@@ -423,8 +423,39 @@ class BusMonitorWindow(QMainWindow):
         if row_index >= 0:
             action_show_definition = QAction(get_icon('fa6.file-code'), 'Open data type &definition', self)
             action_show_definition.triggered.connect(lambda: self._show_data_type_definition(row_index))
+            action_show_count_selected_cmds = QAction(get_icon('fa6.file-code'), 'Count selected commands', self)
+            action_show_count_selected_cmds.triggered.connect(lambda: self._count_selected_commands())
+            action_show_check_time_diff = QAction(get_icon('fa6.file-code'), 'Check time gap', self)
+            action_show_check_time_diff.triggered.connect(lambda: self._check_time_diff())
             menu.addAction(action_show_definition)
+            menu.addAction(action_show_count_selected_cmds)
+            menu.addAction(action_show_check_time_diff)
             menu.popup(self._log_widget.table.mapToGlobal(pos))
+
+    def _check_time_diff(self):
+        # Check the time interval between the last selected 2 rows
+        selected = self._log_widget.table.selectionModel().selectedRows()
+        if len(selected) < 2:
+            QMessageBox.warning(self, "Check Time Interval", "Please select 2 rows.")
+            return
+
+        # Get the row indices of the first two selected rows
+        row1 = selected[0].row()
+        row2 = selected[1].row()
+
+        # Get the timestamp strings from column 1 (adjust if your timestamp column is different)
+        ts1 = self._log_widget.table.item(row1, 1).text()
+        ts2 = self._log_widget.table.item(row2, 1).text()
+
+        # Use your TimestampRenderer.compute_timestamp_difference method
+        dt = TimestampRenderer.compute_timestamp_difference(ts1, ts2)
+        QMessageBox.information(self, "Time Interval", f"Time difference: {dt:.6f} seconds ({dt * 1000:.3f} msec)")
+
+    def _count_selected_commands(self):
+        selected = self._log_widget.table.selectionModel().selectedRows()
+        count = len(selected)
+        QMessageBox.information(self, "Selected Commands", f"Selected Commands = {count}")
+
 
     def _show_data_type_definition(self, row):
         try:
