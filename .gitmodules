@@ -1,0 +1,6 @@
+[submodule "pydronecan"]
+	path = pydronecan
+	url = git@github.com:Flytrex/pydronecan.git
+[submodule "public_regulated_data_types"]
+	path = public_regulated_data_types
+	url = git@github.com:Flytrex/public_regulated_data_types.git
