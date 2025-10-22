@@ -8,7 +8,7 @@
 #         Andrew Tridgell
 #
 #
-__version__ = 1, 2, 29
-
+__version__ = 1, 2, 28
+__flytrex_version__ = 0, 0, 1
 
 

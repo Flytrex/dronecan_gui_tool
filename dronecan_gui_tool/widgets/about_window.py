@@ -7,7 +7,7 @@
 #
 
 import dronecan
-from ..version import __version__
+from ..version import __version__, __flytrex_version__
 from . import get_icon, get_app_icon
 from PyQt5.QtWidgets import QDialog, QTableWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, \
     QTableWidgetItem, QHeaderView
@@ -16,12 +16,12 @@ from PyQt5.QtCore import Qt, PYQT_VERSION_STR, QSize
 
 
 ABOUT_TEXT = ('''
-<h3>DroneCAN GUI Tool v{0}</h3>
+<h3>DroneCAN GUI Tool v{0} (Flytrex v{1})</h3>
 Cross-platform application for <a href="http://dronecan.org/">DroneCAN bus</a> management and diagnostics.
 
 This application is distributed under the terms of the MIT software license. The source repository and the bug \
 tracker are located at <a href="https://github.com/DroneCAN/gui_tool">https://github.com/DroneCAN/gui_tool</a>.
-'''.format('.'.join(map(str, __version__)))).strip().replace('\n', '\n<br/>')
+'''.format('.'.join(map(str, __version__)), '.'.join(map(str, __flytrex_version__)))).strip().replace('\n', '\n<br/>')
 
 
 def _list_3rd_party():
