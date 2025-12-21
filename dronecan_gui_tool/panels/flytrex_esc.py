@@ -1,0 +1,661 @@
+#
+# Copyright (C) 2023  UAVCAN Development Team  <dronecan.org>
+#
+# This software is distributed under the terms of the MIT License.
+#
+# Author: Grisha Revzin
+#
+import datetime
+import os
+import time
+
+import dronecan
+from functools import partial
+from PyQt5.QtWidgets import QVBoxLayout, QLabel, QDialog, \
+    QGridLayout, QPushButton, QComboBox, QHBoxLayout, QGroupBox, QCheckBox, QFileDialog, QApplication, QMessageBox, \
+    QSizePolicy
+from PyQt5.QtCore import QTimer, Qt
+from logging import getLogger
+from ..widgets import make_icon_button, get_icon, node_properties
+
+__all__ = 'PANEL_NAME', 'spawn', 'get_icon'
+
+PANEL_NAME = 'Flytrex Propulsion Controller'
+
+logger = getLogger(__name__)
+
+_singleton = None
+
+
+class _FaultBitLabel(QLabel):
+    STYLESHEET_SET = 'padding: 0px; border: 2px solid black; background-color: red;'
+    STYLESHEET_RESET = 'padding: 0px; border: 2px solid black; background-color: green;'
+    STYLESHEET_HANGING = 'padding: 0px; border: 2px solid black; background-color: yellow;'
+
+    def __init__(self, parent, name):
+        super(_FaultBitLabel, self).__init__(parent)
+        self.setText(name)
+        self.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        self.setFixedWidth(30)
+        self.reset()
+
+    def set(self):
+        self.setStyleSheet(_FaultBitLabel.STYLESHEET_SET)
+
+    def reset(self):
+        self.setStyleSheet(_FaultBitLabel.STYLESHEET_RESET)
+
+    def hang(self):
+        self.setStyleSheet(_FaultBitLabel.STYLESHEET_HANGING)
+
+
+class _FaultGroupBox(QGroupBox):
+
+    FAULT_SEQUENCE = ('DUR', 'OV', 'UV', 'OT', 'ST', 'SFB', 'OCH', 'SW',
+                      'SA', 'OCS', 'DPF', 'R1', 'SAF', 'SY', 'KS', 'TO')
+    ROW_WIDTH = 8
+
+    def __init__(self, parent):
+        super(_FaultGroupBox, self).__init__(parent)
+        self.setTitle('Fault State')
+        layout = QGridLayout()
+        layout.setSpacing(0)
+
+        self._labels = {}
+        self._set_time = {}
+
+        i = 0
+        for fault in _FaultGroupBox.FAULT_SEQUENCE:
+            self._labels[fault] = _FaultBitLabel(self, fault)
+            self._set_time[fault] = datetime.datetime.now()
+            row, column = divmod(i, _FaultGroupBox.ROW_WIDTH)
+            layout.addWidget(self._labels[fault], row, column)
+            i += 1
+
+        self.setLayout(layout)
+
+    def on_new_status_word(self, fault_bitfield):
+        i = 0
+        for i in range(16):
+            if fault_bitfield[i]:
+                self._labels[_FaultGroupBox.FAULT_SEQUENCE[i]].set()
+                self._set_time[_FaultGroupBox.FAULT_SEQUENCE[i]] = datetime.datetime.now()
+            else:
+                # Some of the FPC's fault bits are only present for a few frames, we delay extinguishing those
+                if (datetime.datetime.now() - self._set_time[_FaultGroupBox.FAULT_SEQUENCE[i]]).total_seconds() > 5:
+                    self._labels[_FaultGroupBox.FAULT_SEQUENCE[i]].reset()
+                else:
+                    self._labels[_FaultGroupBox.FAULT_SEQUENCE[i]].hang()
+
+
+class _ReadinessLabel(QLabel):
+    def __init__(self, parent):
+        super(_ReadinessLabel, self).__init__(parent)
+        self.set(False)
+        self.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        self.setFixedSize(70, 18)
+
+    def set(self, value):
+        if value:
+            self.setText('OK')
+            self.setStyleSheet('background-color: lightgreen')
+        else:
+            self.setText('PENDING')
+            self.setStyleSheet('background-color: yellow')
+
+
+class _IntTestLabel(QLabel):
+    def __init__(self, parent):
+        super(_IntTestLabel, self).__init__(parent)
+        self.set(False)
+        self.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        self.setFixedSize(70, 18)
+
+    def set(self, value):
+        if value:
+            self.setText('TEST')
+            self.setStyleSheet('background-color: yellow')
+        else:
+            self.setText('NOMINAL')
+            self.setStyleSheet('background-color: lightgreen')
+
+
+class _FPCWidget(QGroupBox):
+    MOTOR_INDEX_PARAM = 'MOTOR_INDEX'
+    REVERSE_PARAM = 'REVERSE_DIRECTION'
+    TEST_MODE_PARAM = 'INTEGRATION_TEST_MODE'
+
+    definitions_message_box_shown = False
+
+    @staticmethod
+    def find_main_window():
+        from ..main import MainWindow
+        app = QApplication.instance()
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, MainWindow):
+                return widget
+        return None
+
+    def __init__(self, parent, fpc_node, dronecan_node):
+        super(_FPCWidget, self).__init__(parent)
+
+        self._last_index = -1
+        self._last_direction = -1
+
+        self._fpc_node = fpc_node
+        self._dronecan_node = dronecan_node
+        self.setDisabled(True)
+        self.setTitle('FPC ' + str(self._fpc_node.node_id))
+
+        # For Firmware Update -- very ugly, but reuses a lot of code from Node Properties
+        main_window = _FPCWidget.find_main_window()
+        self._controls = node_properties.Controls(self, self._dronecan_node, self._fpc_node.node_id,
+                                                  main_window._file_server_widget,
+                                                  main_window._dynamic_node_id_allocation_widget)
+        self._controls.setVisible(False)
+
+        # Motor Index
+        self._index_selector = QComboBox()
+        for a in ['DISABLED', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10']:
+            self._index_selector.addItem(a)
+        self._index_selector.currentIndexChanged.connect(self._on_set_index)
+
+        self._index_label = _ReadinessLabel(self)
+        self._index_label.set(False)
+
+        # Direction
+        self._flip_checkbox = QCheckBox(self)
+        self._flip_checkbox.clicked.connect(self._on_set_flip)
+        self._flip_label = _ReadinessLabel(self)
+        self._flip_label.set(False)
+
+        # Ident
+        self._ident_button = QPushButton('Ident', self)
+        self._ident_button.clicked.connect(self._on_ident_clicked)
+
+        # Data Age
+        self._age_label = QLabel('Unknown')
+        self._last_status = datetime.datetime.now()
+
+        # Firmware Update State
+        self._firmware_update_label = QLabel('N/A')
+        self._firmware_update_title = QLabel("Firmware Update")
+
+        # Version
+        self._version = QLabel('N/A')
+
+        # Faults
+        self._faults = _FaultGroupBox(self)
+
+        # Operational Data
+        self._speed = QLabel('N/A')
+        self._speed.setAlignment(Qt.AlignRight)
+        self._voltage = QLabel('N/A')
+        self._voltage.setAlignment(Qt.AlignRight)
+        self._current = QLabel('N/A')
+        self._current.setAlignment(Qt.AlignRight)
+        self._temperature = QLabel('N/A')
+        self._temperature.setAlignment(Qt.AlignRight)
+
+        # Layout
+        layout = QGridLayout()
+
+        # Row 0
+        layout.addWidget(QLabel("Motor Index"), 0, 0, 1, 1)
+        layout.addWidget(self._index_selector, 0, 1, 1, 1)
+        layout.addWidget(self._index_label, 0, 2, 1, 1)
+
+        # Row 1
+        layout.addWidget(QLabel("Reverse Rotation"), 1, 0, 1, 1)
+        layout.addWidget(self._flip_checkbox, 1, 1, 1, 1)
+        layout.addWidget(self._flip_label, 1, 2, 1, 1)
+
+        # Row 2
+        layout.addWidget(self._ident_button, 2, 0, 1, 3)
+
+        # Row 3
+        layout.addWidget(QLabel("Data Age"), 3, 0, 1, 1)
+        layout.addWidget(self._age_label, 3, 1, 1, 2)
+
+        # Row 4
+        layout.addWidget(self._firmware_update_title, 4, 0, 1, 1)
+        layout.addWidget(self._firmware_update_label, 4, 1, 1, 2)
+
+        # Row 5
+        layout.addWidget(QLabel("Version"), 5, 0, 1, 1)
+        layout.addWidget(self._version, 5, 1, 1, 2)
+
+        # Row 6
+        layout.addWidget(self._faults, 6, 0, 1, 3)
+
+        # Row 7
+        layout.addWidget(QLabel("Speed"), 7, 0, 1, 1)
+        layout.addWidget(self._speed, 7, 1, 1, 1)
+        layout.addWidget(QLabel('RPM'), 7, 2, 1, 1)
+
+        # Row 8
+        layout.addWidget(QLabel("Current"), 8, 0, 1, 1)
+        layout.addWidget(self._current, 8, 1, 1, 1)
+        layout.addWidget(QLabel('A'), 8, 2, 1, 1)
+
+        # Row 9
+        layout.addWidget(QLabel("Voltage"), 9, 0, 1, 1)
+        layout.addWidget(self._voltage, 9, 1, 1, 1)
+        layout.addWidget(QLabel('V'), 9, 2, 1, 1)
+
+        # Row 10
+        layout.addWidget(QLabel("Temperature"), 10, 0, 1, 1)
+        layout.addWidget(self._temperature, 10, 1, 1, 1)
+        layout.addWidget(QLabel('°C'), 10, 2, 1, 1)
+
+        self.setLayout(layout)
+
+        self.default_stylesheet = self.styleSheet()
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        self._handlers = [self._dronecan_node.add_handler(dronecan.uavcan.equipment.esc.Status,
+                                                          self._on_status_message)]
+        self._saved = True
+
+        self.reset()
+        self.fetch()
+        self._update_state()
+
+    def saved(self):
+        return self._saved
+
+    def _on_status_message(self, transfer):
+        if transfer.transfer.source_node_id != self._fpc_node.node_id:
+            pass
+        else:
+            self._last_status = datetime.datetime.now()
+            message = transfer.message
+            try:
+                self._faults.on_new_status_word(message.error_flags)
+            except AttributeError:
+                if not _FPCWidget.definitions_message_box_shown:
+                    _FPCWidget.definitions_message_box_shown = True
+                    msg = QMessageBox()
+                    msg.setIcon(QMessageBox.Icon.Critical)
+                    msg.setText('Flytrex DroneCAN custom messages ("DSDLs") have not been installed. '
+                                'Refer to documentation.')
+                    msg.setWindowTitle('Incomplete Installation')
+                    msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+                    msg.exec()
+
+            self._voltage.setText('{:2.2f}'.format(message.voltage))
+            self._current.setText('{:2.1f}'.format(message.current))
+            self._speed.setText('{:4}'.format(message.rpm))
+            self._temperature.setText(('{:3.1f}'.format(message.temperature - 273.15)))
+
+    def _on_set_index(self):
+        self._write_index()
+
+    def _on_set_flip(self):
+        self._write_flipped()
+
+    def _on_ident_clicked(self):
+        request = dronecan.uavcan.protocol.AccessCommandShell.Request(input='ident')
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_ident_response,
+                                    timeout=0.5)
+
+    def _on_ident_response(self, e):
+        pass
+
+    def _reset_request(self):
+        request = dronecan.uavcan.protocol.RestartNode.Request()
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_reset,
+                                    timeout=1)
+
+    def start_firmware_update(self, fw_file):
+        _FPCWidget.find_main_window()._adapter_settings_widget._canfd.setChecked(True)
+        self._controls._do_firmware_update(fw_file)
+
+    def _on_reset(self, _):
+        self.fetch()
+
+    def _read_index(self):
+        request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.MOTOR_INDEX_PARAM)
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_index_read_response,
+                                    timeout=0.5)
+
+    def _on_index_read_response(self, e):
+        if e is None:
+            self._read_index()
+        else:
+            self._last_index = e.response.value.integer_value
+            if not self.isEnabled():
+                self._index_selector.blockSignals(True)
+                self._index_selector.setCurrentIndex(self._last_index)
+                self._index_selector.blockSignals(False)
+                self._index_label.set(True)
+
+    def _write_index(self):
+        self._index_label.set(False)
+        request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.MOTOR_INDEX_PARAM)
+        request.value.integer_value = int(self._index_selector.currentIndex())
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_index_write_response,
+                                    timeout=.5)
+        self._index_selector.setEnabled(False)
+
+    def _on_index_write_response(self, e):
+        if e is None:
+            self._write_index()
+        else:
+            self._saved = False
+            self._index_selector.setEnabled(True)
+            self._index_label.set(True)
+            self._last_index = self._index_selector.currentIndex()
+
+    def _read_flipped(self):
+        request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.REVERSE_PARAM)
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_flipped_read_response,
+                                    timeout=0.5)
+
+    def _on_flipped_read_response(self, e):
+        if e is None:
+            self._read_flipped()
+        else:
+            self._last_direction = e.response.value.boolean_value != 0
+            if not self.isEnabled():
+                self._flip_checkbox.blockSignals(True)
+                self._flip_checkbox.setChecked(self._last_direction)
+                self._flip_checkbox.blockSignals(False)
+                self._flip_label.set(True)
+
+    def _write_flipped(self):
+        request = dronecan.uavcan.protocol.param.GetSet.Request(name=self.REVERSE_PARAM)
+        request.value.boolean_value = bool(self._flip_checkbox.checkState())
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_flipped_write_response,
+                                    timeout=.5)
+        self._flip_label.set(False)
+        self._flip_checkbox.setEnabled(False)
+
+    def _on_flipped_write_response(self, e):
+        if e is None:
+            self._write_flipped()
+        else:
+            self._flip_label.set(True)
+            self._saved = False
+            self._flip_checkbox.setEnabled(True)
+
+    def _update_state(self):
+        # Disable/enable
+        if self._last_direction != -1 and self._last_index != -1:
+            self.setDisabled(False)
+        else:
+            self.setDisabled(True)
+
+        # Data age
+        diff = datetime.datetime.now() - self._last_status
+        millis = diff / datetime.timedelta(milliseconds=1)
+        self._age_label.setText("{:2.3f}".format(millis / 1000))
+
+        if diff > datetime.timedelta(seconds=1.5):
+            self._age_label.setStyleSheet("font-weight: bold; color: red")
+        else:
+            self._age_label.setStyleSheet("font-weight: normal; color: black")
+
+        # Firmware update
+        s = dronecan.uavcan.protocol.NodeStatus()
+        if self._fpc_node.status.mode == s.MODE_SOFTWARE_UPDATE:
+            if int(time.time()) % 2:
+                self._firmware_update_title.setStyleSheet('background-color: yellow')
+            else:
+                self._firmware_update_title.setStyleSheet('')
+            self._firmware_update_label.setEnabled(True)
+            self._firmware_update_label.setText(f'{self._fpc_node.status.vendor_specific_status_code}%')
+
+        else:
+            self._firmware_update_label.setEnabled(False)
+            self._firmware_update_label.setText('N/A')
+            self._firmware_update_title.setStyleSheet('')
+
+        # Firmware version
+        node_name = str(self._fpc_node.info.name)
+        end = node_name.find(' ')
+        if end == -1:
+            end = len(node_name)
+        self._version.setText(node_name[len('com.flytrex.fpc.'):end])
+
+        QTimer.singleShot(500, self._update_state)
+
+    def __del__(self):
+        for h in self._handlers:
+            h.remove()
+
+    def closeEvent(self, event):
+        super(_FPCWidget, self).closeEvent(event)
+        self.__del__()
+
+    def esc_index(self):
+        return self._last_index
+
+    def reset(self):
+        self._last_index = -1
+        self._last_direction = -1
+
+    def fetch(self):
+        self.setEnabled(False)
+        self._read_index()
+        self._read_flipped()
+
+    def save(self):
+        self.setEnabled(False)
+        opcodes = dronecan.uavcan.protocol.param.ExecuteOpcode.Request()
+        request = dronecan.uavcan.protocol.param.ExecuteOpcode.Request(opcode=opcodes.OPCODE_SAVE)
+        self._dronecan_node.request(request,
+                                    self._fpc_node.node_id,
+                                    self._on_save_response,
+                                    timeout=3.0)
+
+    def _on_save_response(self, e):
+        if e is None:
+            self.save()
+        else:
+            self._saved = True
+            self.setEnabled(True)
+
+    def set_node(self, node):
+        self._fpc_node = node
+
+
+class FlytrexPropulsionControllerPanel(QDialog):
+    COUNT_ROW = 4
+
+    def __init__(self, parent, node):
+        super(FlytrexPropulsionControllerPanel, self).__init__(parent)
+        self.setWindowTitle('Flytrex Propulsion Controllers')
+        self.setAttribute(Qt.WA_DeleteOnClose)  # This is required to stop background timers!
+
+        self._node = node
+        self._monitor = dronecan.app.node_monitor.NodeMonitor(node)
+
+        self._widgets = dict()
+
+        buttons_container = QGroupBox("Configuration", self)
+
+        save_button = make_icon_button('fa6s.database', 'Upload FPC configs', self,
+                                       text='Store All', on_clicked=self._on_upload_clicked)
+        fetch_button = make_icon_button('fa6s.arrows-rotate', 'Download FPC configs', self,
+                                        text='Fetch All', on_clicked=self._on_download_clicked)
+
+        fw_update_button = make_icon_button('fa6s.bug', 'Firmware Update', self,
+                                            text='Upload Firmware', on_clicked=self._on_firmware_update)
+
+        self._status_label = QLabel("Status")
+        self._status_label.setAlignment(Qt.AlignCenter)
+
+        buttons_layout = QHBoxLayout(buttons_container)
+        buttons_layout.addWidget(save_button)
+        buttons_layout.addWidget(fetch_button)
+        buttons_layout.addWidget(self._status_label)
+        buttons_layout.addWidget(fw_update_button)
+        buttons_layout.addStretch()
+
+        self._widget_container = QGroupBox("FPC")
+        self._widget_layout = QGridLayout()
+        self._widget_container.setLayout(self._widget_layout)
+
+        self._anon_warning = QLabel("Press 'Set Local Node ID' in the main window")
+        self._anon_warning.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        self._anon_warning.setStyleSheet('font-weight: bold; color: red')
+
+        self._warnings = {
+            'DUPLICATE_INDEX': QLabel('Duplicate Motor Indexes'),
+            'NO_INDEX_SET': QLabel('Not all Motor Indexes set'),
+            'FW_VERSION': QLabel("Multiple different firmware versions present"),
+        }
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._anon_warning)
+        layout.addWidget(buttons_container)
+        layout.addWidget(self._widget_container)
+
+        for w in self._warnings.values():
+            w.setStyleSheet('font-weight: bold; color: red')
+            policy = QSizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            w.setSizePolicy(policy)
+            w.setHidden(True)
+            layout.addWidget(w)
+
+        self._update_data()
+
+        # Smallest size policy for this widget
+        self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
+
+    def _on_firmware_update(self):
+        self._node.set_canfd(True)
+        fw_file = QFileDialog().getOpenFileName(self, 'Select firmware file', '',
+                                                'Binary images (*.bin);;ArduPilot Firmware (*.apj);;AM32 Firmware (*.amj);;PX4 Firmware (*.px4);;All files (*.*)')
+        if not fw_file[0]:
+            return
+
+        try:
+            with open(os.path.normcase(os.path.abspath(fw_file[0])), 'rb') as f:
+                f.read(100)
+        except:
+            return
+
+        for widget in self._widgets.values():
+            widget.start_firmware_update(fw_file)
+
+    def show_message(self, text, *fmt):
+        """ Dummy for node_properties.Controls """
+        pass
+
+    def _on_upload_clicked(self):
+        for widget in self._widgets.values():
+            widget.save()
+
+    def _on_download_clicked(self):
+        for widget in self._widgets.values():
+            widget.fetch()
+
+    def _update_data(self):
+        QTimer.singleShot(500, self._update_data)
+
+        if self._node.is_anonymous:
+            self._anon_warning.setHidden(False)
+            self.setDisabled(True)
+            return
+        else:
+            self._anon_warning.setHidden(True)
+            self._widget_container.setLayout(self._widget_layout)
+            self.setEnabled(True)
+
+        count = 0
+        # Create a widget for each node once
+        for node in self._monitor.find_all(lambda node_:
+                                           True if node_.info and str(node_.info.name).startswith('com.flytrex.fpc')
+                                           else False):
+            count += 1
+            if node.node_id not in self._widgets.keys():
+                widget = _FPCWidget(self, dronecan_node=self._node, fpc_node=node)
+                self._widgets[node.node_id] = widget
+                self._widget_layout.addWidget(widget,
+                                              (len(self._widgets) - 1) // self.COUNT_ROW,
+                                              (len(self._widgets) - 1) % self.COUNT_ROW)
+            else:
+                # Make sure the widget has the latest node object
+                widget = self._widgets[node.node_id]
+                widget.set_node(node)
+
+        config_pending = False
+        for widget in self._widgets.values():
+            if not widget.saved():
+                config_pending = True
+
+        if config_pending:
+            self._status_label.setText('[UNSAVED]')
+            self._status_label.setStyleSheet("font-weight: bold; color: red")
+        else:
+            self._status_label.setText('[SAVED]')
+            self._status_label.setStyleSheet('font-weight: bold; color: green')
+
+        self._widget_container.setTitle(f'Total {count} FPCs')
+
+        self._check_uniqueness()
+        self._check_no_disabled()
+        self._check_fw_versions()
+
+    def _check_uniqueness(self):
+        s = set()
+        for w in self._widgets.values():
+            s.add(w.esc_index())
+        self._warnings['DUPLICATE_INDEX'].setVisible(len(s) != len(self._widgets.values()))
+
+    def _check_no_disabled(self):
+        no_zeros = True
+        for w in self._widgets.values():
+            if w.esc_index() == 0:
+                no_zeros = False
+        self._warnings['NO_INDEX_SET'].setVisible(not no_zeros)
+
+    def _check_fw_versions(self):
+        commits = set()
+        for node in self._monitor.find_all(lambda node_:
+                                           True if node_.info and str(node_.info.name).startswith('com.flytrex.fpc')
+                                           else False):
+            commits.add(node.info.software_version.vcs_commit)
+
+        self._warnings['FW_VERSION'].setVisible(len(commits) > 1)
+
+    def __del__(self):
+        global _singleton
+        _singleton = None
+
+    def closeEvent(self, event):
+        super(FlytrexPropulsionControllerPanel, self).closeEvent(event)
+        self.__del__()
+
+
+def spawn(parent, node):
+    global _singleton
+    if _singleton is None:
+        try:
+            _singleton = FlytrexPropulsionControllerPanel(parent, node)
+        except Exception as ex:
+            print(ex)
+
+    _singleton.show()
+    _singleton.raise_()
+    _singleton.activateWindow()
+
+    return _singleton
+
+
+get_icon = partial(get_icon, 'fa6s.asterisk')
