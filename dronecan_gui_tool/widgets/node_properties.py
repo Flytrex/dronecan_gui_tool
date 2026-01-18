@@ -572,6 +572,8 @@ class ConfigParamEditWindow(QDialog):
 
 class ConfigParams(QGroupBox):
     VALUE_COLUMN = 3
+    FETCH_ALL_TEXT = 'Fetch All'
+    STOP_TEXT = 'Stop'
 
     def __init__(self, parent, node, target_node_id):
         super(ConfigParams, self).__init__(parent)
@@ -580,9 +582,11 @@ class ConfigParams(QGroupBox):
         self._node = node
         self._target_node_id = target_node_id
         self._retries = 0
+        self._fetch_in_progress = False
+        self._fetch_session_id = 0
 
         self._read_all_button = make_icon_button('fa6s.arrows-rotate', 'Fetch all config parameters from the node', self,
-                                                 text='Fetch All', on_clicked=self._do_reload)
+                             text=self.FETCH_ALL_TEXT, on_clicked=self._on_fetch_all_clicked)
 
         opcodes = dronecan.uavcan.protocol.param.ExecuteOpcode.Request()
 
@@ -640,6 +644,79 @@ class ConfigParams(QGroupBox):
         layout.addWidget(self._table)
         self.setLayout(layout)
 
+    def _set_fetch_button_caption(self, fetching):
+        '''
+        @brief  Set the fetch button caption
+        @param  fetching - True if fetching is in progress, False otherwise
+        '''
+
+        if fetching:
+            self._read_all_button.setText(self.STOP_TEXT)
+            self._read_all_button.setToolTip('Stop fetching config parameters from the node')
+        else:
+            self._read_all_button.setText(self.FETCH_ALL_TEXT)
+            self._read_all_button.setToolTip('Fetch all config parameters from the node')
+
+    def _finish_fetch(self, session_id, message=None):
+        '''
+        @brief  Finish the fetch operation
+        @param  session_id - The ID of the fetch session
+        @param  message - Optional message to display
+        '''
+
+        if session_id != self._fetch_session_id:
+            return
+
+        self._fetch_in_progress = False
+        self._set_fetch_button_caption(False)
+        if message:
+            self.window().show_message('%s', message)
+
+    def _stop_fetch(self, message=None):
+        '''
+        @brief  Stop the fetch operation
+        @param  message - Optional message to display
+        '''
+
+        if not self._fetch_in_progress:
+            return
+
+        # Invalidate all in-flight and deferred callbacks.
+        self._fetch_in_progress = False
+        self._fetch_session_id += 1
+        self._set_fetch_button_caption(False)
+        if message:
+            self.window().show_message('%s', message)
+
+    def _request_param_index(self, session_id, index):
+        '''
+        @brief  Request a parameter by its index
+        @param  session_id - The ID of the fetch session
+        @param  index - The index of the parameter to request
+        '''
+
+        if (not self._fetch_in_progress) or (session_id != self._fetch_session_id):
+            return
+
+        try:
+            self._node.request(dronecan.uavcan.protocol.param.GetSet.Request(index=index),
+                               self._target_node_id,
+                               partial(self._on_fetch_response, session_id, index),
+                               priority=REQUEST_PRIORITY)
+        except Exception as ex:
+            show_error('Node error', 'Could not send param get request', ex, self)
+            self._finish_fetch(session_id)
+
+    def _on_fetch_all_clicked(self):
+        '''
+        @brief  Handle the fetch all button click event
+        '''
+
+        if self._fetch_in_progress:
+            self._stop_fetch('Param fetch stopped')
+        else:
+            self._do_reload()
+
     def _on_cell_enter_pressed(self, list_of_row_col_pairs):
         unique_rows = set([row for row, _col in list_of_row_col_pairs])
         if len(unique_rows) == 1:
@@ -660,24 +737,24 @@ class ConfigParams(QGroupBox):
         win = ConfigParamEditWindow(self, self._node, self._target_node_id, self._params[index], update_callback)
         win.show()
 
-    def _on_fetch_response(self, index, e):
+    def _on_fetch_response(self, session_id, index, e):
+        if session_id != self._fetch_session_id:
+            return
+
         if e is None:
             if self._retries < 5:
                 self._retries += 1
                 self.window().show_message('Re-requesting index %d', index)
-                self._node.defer(0.1, lambda: self._node.request(dronecan.uavcan.protocol.param.GetSet.Request(index=index),
-                                                                self._target_node_id,
-                                                                partial(self._on_fetch_response, index),
-                                                                priority=REQUEST_PRIORITY))
+                self._node.defer(0.1, lambda: self._request_param_index(session_id, index))
             else:
-                self.window().show_message('Param fetch failed: request timed out')
+                self._finish_fetch(session_id, 'Param fetch failed: request timed out')
             return
 
         # reset retries when we get a response
         self._retries = 0
 
         if len(e.response.name) == 0:
-            self.window().show_message('%d params fetched successfully', index)
+            self._finish_fetch(session_id, '%d params fetched successfully' % index)
             return
 
         self._params.append(e.response)
@@ -687,27 +764,34 @@ class ConfigParams(QGroupBox):
         try:
             index += 1
             self.window().show_message('Requesting index %d', index)
-            self._node.defer(0.1, lambda: self._node.request(dronecan.uavcan.protocol.param.GetSet.Request(index=index),
-                                                             self._target_node_id,
-                                                             partial(self._on_fetch_response, index),
-                                                             priority=REQUEST_PRIORITY))
+            self._node.defer(0.1, lambda: self._request_param_index(session_id, index))
         except Exception as ex:
             logger.error('Param fetch error', exc_info=True)
-            self.window().show_message('Could not send param get request: %r', ex)
+            self._finish_fetch(session_id, 'Could not send param get request: %r' % ex)
 
     def _do_reload(self):
+        if self._fetch_in_progress:
+            return
+
+        self._fetch_in_progress = True
+        self._retries = 0
+        self._fetch_session_id += 1
+        session_id = self._fetch_session_id
+        self._set_fetch_button_caption(True)
+
+        # Clear current view early so the user sees a clean slate during fetch.
+        self._table.setRowCount(0)
+        self._params = []
+
         try:
             index = 0
-            self._node.request(dronecan.uavcan.protocol.param.GetSet.Request(index=index),
-                               self._target_node_id,
-                               partial(self._on_fetch_response, index),
-                               priority=REQUEST_PRIORITY)
+            self.window().show_message('Requesting index %d', index)
+            self._request_param_index(session_id, index)
         except Exception as ex:
             show_error('Node error', 'Could not send param get request', ex, self)
+            self._finish_fetch(session_id)
         else:
             self.window().show_message('Param fetch request sent')
-            self._table.setRowCount(0)
-            self._params = []
 
     def param_as_string(self, value, is_melody=False):
         value_type = dronecan.get_active_union_field(value)
