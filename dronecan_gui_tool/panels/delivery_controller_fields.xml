@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Delivery Controller field definitions.
+
+  Each field uses the format:
+    field_name, field_type, default_value
+
+  Notes:
+  - field_type should be compatible with UAVCAN/DroneCAN DSDL primitive type names
+    (e.g., uint32, int16, float32, float64, bool, uint8[16], uint8[<=16]).
+  - default_value is stored as text and should be parseable according to field_type.
+-->
+<fields>
+  <!-- Examples (edit/remove as needed) -->
+  <field name="field 1" type="uint15" default="0" comment="This is the first field" edit="true"/>
+  <field name="field 2" type="float32" default="0.0" comment="This is the second field" edit="false" />
+  <field name="field 3" type="bool" default="false" comment="This is the third field" edit="true" />
+  <field name="field 4" type="float16" default="3.141592" comment="This is the fourth field" edit="true" />
+
+  <!-- Add your real fields below -->
+  <!-- <field name="" type="" default="" /> -->
+</fields>
