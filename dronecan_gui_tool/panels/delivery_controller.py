@@ -5,8 +5,10 @@
 # This software is distributed under the terms of the MIT License.
 #
 # Author: Ilan Graidy
+# Date:   2026-01-22
 #
 
+import dronecan
 from functools import partial
 from logging import getLogger
 import threading
@@ -15,9 +17,10 @@ import re
 import xml.etree.ElementTree as ET
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QIntValidator
+from PyQt5.QtGui import QIntValidator, QColor
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
-	QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog
+	QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy
+import numpy as np
 
 from ..widgets import get_icon, show_error
 
@@ -31,6 +34,33 @@ _singleton = None
 
 
 class DeliveryControllerPanel(QDialog):
+	REQUEST_PRIORITY = 30
+	
+	REQ_MODE = 'REQ_MODE'
+	SET_WIRE_LENGTH_LOWER = 'SET_WIRE_LENGTH_LOWER'
+	SET_WIRE_LENGTH_LIFT = 'SET_WIRE_LENGTH_LIFT'
+
+	def show_message(self, text, *fmt) -> None:
+		"""Best-effort status reporting (main window status bar if available)."""
+		try:
+			# Unlike many widgets, this panel is a top-level QDialog, so self.window() is usually self.
+			# Prefer sending status messages to the parent/main window if it exposes show_message().
+			parent = self.parent()
+			if parent is not None and hasattr(parent, 'show_message'):
+				parent.show_message(text, *fmt)
+				return
+		except Exception:
+			pass
+		try:
+			logger.info(text % fmt)
+		except Exception:
+			logger.info('%s %s', text, fmt)
+
+	@staticmethod
+	def _encode_param_name(name: str) -> bytes:
+		# UAVCAN v0 param name is uint8[<=92] (bytes)
+		return name.encode('utf-8')
+
 	def __init__(self, parent, node):
 		'''
 		@brief    Create the Delivery Controller panel window.
@@ -40,6 +70,8 @@ class DeliveryControllerPanel(QDialog):
 		'''
 
 		super(DeliveryControllerPanel, self).__init__(parent)
+		self._handlers = []
+
 		self.setWindowTitle(PANEL_NAME)
 		self.setAttribute(Qt.WA_DeleteOnClose)
 		self.resize(900, 600)
@@ -68,6 +100,7 @@ class DeliveryControllerPanel(QDialog):
 		fields_group = QGroupBox('Fields', self)
 		group_layout = QVBoxLayout(fields_group)
 
+		# Set up the fields table
 		self._table = QTableWidget(fields_group)
 		self._table.setColumnCount(5)
 		self._table.setHorizontalHeaderLabels(['Field Name', 'Value', 'Type', 'Num Bits', 'Comment'])
@@ -82,32 +115,117 @@ class DeliveryControllerPanel(QDialog):
 		self._table.setWordWrap(True)
 		self._table.setSelectionBehavior(QTableWidget.SelectRows)
 		self._table.setSelectionMode(QTableWidget.SingleSelection)
+		
+		# Add the tables's buttons
+		self._load_from_file_btn = QPushButton('Load From File', self)
+		self._save_to_file_btn = QPushButton('Save To File', self)
 		group_layout.addWidget(self._table)
+		file_buttons_row = QHBoxLayout()
+		file_buttons_row.addWidget(self._load_from_file_btn)
+		file_buttons_row.addWidget(self._save_to_file_btn)
+		file_buttons_row.addStretch(1)
+		group_layout.addLayout(file_buttons_row)
 
 		layout.addWidget(fields_group)
 
-		buttons_row = QHBoxLayout()
-		self._load_from_file_btn = QPushButton('Load From File', self)
-		self._save_to_file_btn = QPushButton('Save To File', self)
-		self._set_params_btn = QPushButton('Set Params', self)
-		self._get_params_btn = QPushButton('Get Params', self)
-		self._live_param_read_btn = QPushButton('Live Param Read', self)
+		# Controls (below the fields table group)
+		controls_group = QGroupBox('Controls', self)
+		# Keep this group compact; let the fields table take extra vertical space.
+		controls_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+		controls_layout = QGridLayout(controls_group)
+		controls_layout.setColumnStretch(0, 1)
+		controls_layout.setColumnStretch(1, 1)
+		controls_layout.setRowStretch(1, 1)
+
+		# Mode controls
+		mode_group = QGroupBox('Mode', controls_group)
+		mode_layout = QGridLayout(mode_group)
+		mode_layout.setColumnStretch(1, 1)
+
+		self._active_mode_combo = QComboBox(mode_group)
+		self._active_mode_combo.addItem('ENCODER_ALIGNMENT', 1)
+		self._active_mode_combo.addItem('WIRE_HOMING', 2)
+		self._active_mode_combo.addItem('DIRECT_OVERRIDE', 4)
+		self._active_mode_combo.addItem('HALT', 5)
+		self._active_mode_combo.addItem('GROUND_UNLOAD', 6)
+		self._active_mode_combo.addItem('RESET', 7)
+		self._active_mode_combo.addItem('PREPARE_FOR_PICKUP', 8)
+		self._active_mode_combo.addItem('LIFT_PACKAGE', 9)
+		self._active_mode_combo.addItem('LANDING', 11)
+		self._active_mode_combo.addItem('PREPARE_FOR_DELIVERY', 12)
+		self._active_mode_combo.addItem('DELIVERY', 13)
+		self._active_mode_combo.addItem('RELEASE_WIRE', 14)
+		self._active_mode_combo.setCurrentIndex(0)
+		self._set_mode_btn = QPushButton('Set Mode', mode_group)
+		self._set_wire_length_lower_btn = QPushButton('Set Wire Length Lower', mode_group)
+		self._wire_length_lower_edit = QLineEdit(mode_group)
+		self._wire_length_lower_edit.setPlaceholderText('Length')
+		self._set_wire_length_lift_btn = QPushButton('Set Wire Length Lift', mode_group)
+		self._wire_length_lift_edit = QLineEdit(mode_group)
+		self._wire_length_lift_edit.setPlaceholderText('Length')
+
+		# Buttons aligned in column 0, inputs in column 1
+		mode_layout.addWidget(self._set_mode_btn, 0, 0)
+		mode_layout.addWidget(self._active_mode_combo, 0, 1)
+		mode_layout.addWidget(self._set_wire_length_lower_btn, 1, 0)
+		mode_layout.addWidget(self._wire_length_lower_edit, 1, 1)
+		mode_layout.addWidget(self._set_wire_length_lift_btn, 2, 0)
+		mode_layout.addWidget(self._wire_length_lift_edit, 2, 1)
+
+		# Params controls
+		params_group = QGroupBox('Params', controls_group)
+		params_layout = QHBoxLayout(params_group)
+		self._set_params_btn = QPushButton('Set Params', params_group)
+		self._get_params_btn = QPushButton('Get Params', params_group)
+		self._live_param_read_btn = QPushButton('Live Param Read', params_group)
 		self._live_param_read_btn.setCheckable(True)
 		self._live_param_read_btn.setStyleSheet('QPushButton { background-color: #FFFACD; }')
+		params_layout.addWidget(self._set_params_btn)
+		params_layout.addWidget(self._get_params_btn)
+		params_layout.addWidget(self._live_param_read_btn)
+
+		# Layout: Mode spans both rows; Params buttons sit on the top row.
+		controls_layout.addWidget(mode_group, 0, 0, 2, 1)
+		controls_layout.addWidget(params_group, 0, 1, 1, 1, Qt.AlignTop)
+
+		layout.addWidget(controls_group)
+
+		# Connect Fields groupbox buttons signals
 		self._load_from_file_btn.clicked.connect(self._on_load_from_file_clicked)
 		self._save_to_file_btn.clicked.connect(self._on_save_to_file_clicked)
+		# Connect Controls groupbox buttons signals
 		self._set_params_btn.clicked.connect(self._on_set_params_clicked)
 		self._get_params_btn.clicked.connect(self._on_get_params_clicked)
 		self._live_param_read_btn.toggled.connect(self._on_live_param_read_toggled)
-		buttons_row.addWidget(self._load_from_file_btn)
-		buttons_row.addWidget(self._save_to_file_btn)
-		buttons_row.addStretch(1)
-		buttons_row.addWidget(self._set_params_btn)
-		buttons_row.addWidget(self._get_params_btn)
-		buttons_row.addWidget(self._live_param_read_btn)
-		layout.addLayout(buttons_row)
+		self._set_mode_btn.clicked.connect(self._on_set_mode_clicked)
+		self._set_wire_length_lower_btn.clicked.connect(self._on_set_wire_length_lower_clicked)
+		self._set_wire_length_lift_btn.clicked.connect(self._on_set_wire_length_lift_clicked)
 
 		self._load_fields_into_table(self._xml_path)
+
+	def _stop_live_param_read_thread(self) -> None:
+		"""Stop any background work related to live param read.
+
+		Live Param Read currently uses message handlers rather than a background thread,
+		but older versions used a worker thread. Keep this method so closeEvent and __del__
+		can safely stop either implementation.
+		"""
+		try:
+			if self._live_param_read_stop_event is not None:
+				self._live_param_read_stop_event.set()
+		except Exception:
+			pass
+
+		try:
+			t = self._live_param_read_thread
+			if t is not None and t.is_alive():
+				t.join(timeout=2.0)
+		except Exception:
+			pass
+		finally:
+			self._live_param_read_thread = None
+			self._live_param_read_stop_event = None
+			self._live_param_read_node_id = None
 
 	@staticmethod
 	def _type_to_num_bits(field_type: str) -> str:
@@ -248,6 +366,34 @@ class DeliveryControllerPanel(QDialog):
 		if v in ('0', 'false', 'no', 'n', 'off'):
 			return False
 		return bool(default)
+	
+	@staticmethod
+	def parse_value(field_type: str, raw_value: object):
+		ft = (field_type or '').strip()
+		raw = '' if raw_value is None else str(raw_value).strip()
+
+		if ft == 'bool':
+			v = raw.lower()
+			if v in ('1', 'true', 'yes', 'y', 'on'):
+				return True
+			if v in ('0', 'false', 'no', 'n', 'off', ''):
+				return False
+			raise ValueError(f'Invalid bool: {raw!r}')
+
+		if ft.startswith('float') or ft in ('float', 'double'):
+			return 0.0 if raw == '' else float(raw)
+
+		# Integers like uint8/uint16/... or int8/int16/... and legacy *_t
+		if re.fullmatch(r'(u?int)(\d+)', ft) or re.fullmatch(r'(u?int)(\d+)_t', ft):
+			return 0 if raw == '' else int(raw, 0)
+
+		# If type is missing/unknown, try int then float
+		if raw == '':
+			return 0
+		try:
+			return int(raw, 0)
+		except Exception:
+			return float(raw)
 
 	def _gather_fields_from_table(self) -> list[dict[str, object]]:
 		'''
@@ -367,6 +513,128 @@ class DeliveryControllerPanel(QDialog):
 			show_error('Invalid Node ID', 'Node ID must be in range 1..127.', str(node_id), parent=self)
 			return None
 		return node_id
+	
+	def _on_set_mode_clicked(self) -> None:
+		'''
+		@brief    Handle Set Mode button click.
+		@return   None
+		'''
+
+		def _on_response(e):
+			if e is None:
+				self.show_message('Request timed out')
+			else:
+				logger.info('Param get/set response: %s', e.response)
+				self.show_message('Response received')
+
+		node_id = self._get_target_node_id()
+		if node_id is None:
+			return
+
+		try:
+			mode = int(self._active_mode_combo.currentData())
+			msg = dronecan.uavcan.protocol.param.GetSet.Request(
+				name=self._encode_param_name(self.REQ_MODE),
+				value=dronecan.uavcan.protocol.param.Value(integer_value=mode),
+			)
+		except Exception as ex:
+			logger.exception('SetActiveMode type not available: %s', ex)
+			return
+
+		try:
+			self._node.request(msg, node_id, _on_response, priority=self.REQUEST_PRIORITY, canfd=True)
+			logger.info('Send REQ_MODE for target node %s', node_id)
+		except Exception as ex:
+			logger.exception('Failed to broadcast SetActiveMode: %s', ex)
+			show_error('Send failed', 'Could not broadcast SetActiveMode.', ex, parent=self)
+
+	def _on_set_wire_length_lower_clicked(self) -> None:
+		'''
+		@brief    Handle Set Wire Length Lower button click.
+		@return   None
+		'''
+
+		def _on_response(e):
+			if e is None:
+				self.show_message('Request timed out')
+			else:
+				logger.info('Param get/set response: %s', e.response)
+				self.show_message('Response received')
+
+		node_id = self._get_target_node_id()
+		if node_id is None:
+			return
+		
+		wire_len = 0.0
+
+		try:
+			text = self._wire_length_lower_edit.text().strip()
+			# Convert to float16 (half precision) then back to Python float.
+			wire_len = float(np.float16(text))
+		except Exception as ex:
+			logger.exception('Invalid wire length lower value: %s', ex)
+			show_error('Invalid Value', 'Wire Length Lower must be a floating point number.', text, parent=self)
+			return
+
+		try:
+			msg = dronecan.uavcan.protocol.param.GetSet.Request(
+				name=self._encode_param_name(self.SET_WIRE_LENGTH_LOWER),
+				value=dronecan.uavcan.protocol.param.Value(real_value=float(wire_len)),
+			)
+		except Exception as ex:
+			logger.exception('GetSet type not available: %s', ex)
+			return
+
+		try:
+			self._node.request(msg, node_id, _on_response, priority=self.REQUEST_PRIORITY, canfd=True)
+			logger.info('Send %s for target node %s', self.SET_WIRE_LENGTH_LOWER, node_id)
+		except Exception as ex:
+			logger.exception('Failed to send %s: %s', self.SET_WIRE_LENGTH_LOWER, ex)
+			show_error('Send failed', f'Could not send {self.SET_WIRE_LENGTH_LOWER}.', ex, parent=self)
+
+	def _on_set_wire_length_lift_clicked(self) -> None:
+		'''
+		@brief    Handle Set Wire Length Lift button click.
+		@return   None
+		'''
+
+		def _on_response(e):
+			if e is None:
+				self.show_message('Request timed out')
+			else:
+				logger.info('Param get/set response: %s', e.response)
+				self.show_message('Response received')
+
+		node_id = self._get_target_node_id()
+		if node_id is None:
+			return
+		
+		wire_len = 0.0
+
+		try:
+			text = self._wire_length_lift_edit.text().strip()
+			# Convert to float16 (half precision) then back to Python float.
+			wire_len = float(np.float16(text))
+		except Exception as ex:
+			logger.exception('Invalid wire length lift value: %s', ex)
+			show_error('Invalid Value', 'Wire Length Lift must be a floating point number.', text, parent=self)
+			return
+
+		try:
+			msg = dronecan.uavcan.protocol.param.GetSet.Request(
+				name=self._encode_param_name(self.SET_WIRE_LENGTH_LIFT),
+				value=dronecan.uavcan.protocol.param.Value(real_value=float(wire_len)),
+			)
+		except Exception as ex:
+			logger.exception('GetSet type not available: %s', ex)
+			return
+
+		try:
+			self._node.request(msg, node_id, _on_response, priority=self.REQUEST_PRIORITY, canfd=True)
+			logger.info('Send %s for target node %s', self.SET_WIRE_LENGTH_LIFT, node_id)
+		except Exception as ex:
+			logger.exception('Failed to send %s: %s', self.SET_WIRE_LENGTH_LIFT, ex)
+			show_error('Send failed', f'Could not send {self.SET_WIRE_LENGTH_LIFT}.', ex, parent=self)
 
 	def _on_set_params_clicked(self) -> None:
 		'''
@@ -377,7 +645,84 @@ class DeliveryControllerPanel(QDialog):
 		node_id = self._get_target_node_id()
 		if node_id is None:
 			return
-		logger.info('Set Params clicked for node %s (not implemented yet)', node_id)
+
+		try:
+			msg = dronecan.flytrex.delcon.DirectOverride()
+		except Exception as ex:
+			logger.exception('DirectOverride type not available: %s', ex)
+			show_error(
+				'DSDL type not loaded',
+				'Could not access dronecan.flytrex.delcon.DirectOverride. Make sure your custom DSDL directory loaded successfully.',
+				ex,
+				parent=self,
+			)
+			return
+
+		# Add the node ID to the message header
+		setattr(msg, 'node_id', node_id)
+		set_count = 0
+		for f in self._gather_fields_from_table():
+			name = str(f.get('name', '')).strip()
+			if not name:
+				continue
+			if not bool(f.get('edit', True)):
+				continue
+			if not hasattr(msg, name):
+				continue
+			try:
+				value = self.parse_value(str(f.get('type', '')), f.get('default', ''))
+				setattr(msg, name, value)
+				set_count += 1
+			except Exception as ex:
+				show_error(
+					'Invalid field value',
+					f'Could not set {name} on DirectOverride.',
+					f'Type: {f.get("type", "")}\nValue: {f.get("default", "")}\nError: {ex}',
+					parent=self,
+				)
+				return
+
+		if set_count == 0:
+			show_error(
+				'Nothing to send',
+				'No editable fields matched DirectOverride message fields.',
+				'Check your XML field names against the DSDL definition.',
+				parent=self,
+			)
+			return
+
+		try:
+			self._node.broadcast(msg, canfd=True)
+			logger.info('Broadcast DirectOverride (%d fields set) for target node %s', set_count, node_id)
+		except Exception as ex:
+			logger.exception('Failed to broadcast DirectOverride: %s', ex)
+			show_error('Send failed', 'Could not broadcast DirectOverride.', ex, parent=self)
+
+	def _update_fields_table_from_state_report(self, report: dronecan.flytrex.delcon.StateReport) -> None:
+		'''
+		@brief    Update the fields table from a StateReport message.
+		@param    report - The StateReport message instance.
+		@return   None
+		'''
+
+		if report is None:
+			return
+
+		for row in range(self._table.rowCount()):
+			name_item = self._table.item(row, 0)
+			value_item = self._table.item(row, 1)
+			if name_item is None or value_item is None:
+				continue
+			field_name = name_item.text().strip()
+			if not field_name:
+				continue
+			if not hasattr(report, field_name):
+				continue
+			try:
+				value = getattr(report, field_name)
+				value_item.setText(str(value))
+			except Exception:
+				logger.exception('Failed to update field %s from StateReport', field_name)
 
 	def _on_get_params_clicked(self) -> None:
 		'''
@@ -388,62 +733,38 @@ class DeliveryControllerPanel(QDialog):
 		node_id = self._get_target_node_id()
 		if node_id is None:
 			return
-		logger.info('Get Params clicked for node %s (not implemented yet)', node_id)
 
-	def _start_live_param_read_thread(self, node_id: int) -> None:
-		'''
-		@brief    Start the Live Param Read background thread.
-		@param    node_id - Target node ID.
-		@return   None
-		'''
+		holder: dict[str, object] = {'handler': None}
 
-		self._stop_live_param_read_thread()
-		stop_event = threading.Event()
-		thread = threading.Thread(
-			target=self._live_param_read_loop,
-			args=(node_id, stop_event),
-			name='DeliveryControllerLiveParamRead',
-			daemon=True,
-		)
-		self._live_param_read_stop_event = stop_event
-		self._live_param_read_thread = thread
-		self._live_param_read_node_id = node_id
-		thread.start()
+		def on_state_report(e):
+			# Ignore messages not coming from the selected node.
+			if e.transfer.source_node_id != node_id:
+				return
 
-	def _stop_live_param_read_thread(self) -> None:
-		'''
-		@brief    Request the Live Param Read thread to stop.
-		@return   None
-		'''
+			# print(dronecan.to_yaml(e.message))
 
-		evt = self._live_param_read_stop_event
-		thr = self._live_param_read_thread
-		self._live_param_read_stop_event = None
-		self._live_param_read_thread = None
-		self._live_param_read_node_id = None
+			# Update the fields table from the received StateReport.
+			self._update_fields_table_from_state_report(e.message)
 
-		if evt is not None:
-			evt.set()
-		if thr is not None and thr.is_alive():
-			# Keep the UI responsive: wait briefly only.
-			thr.join(timeout=0.25)
+			# One-shot: remove handler after first matching message.
+			h = holder.get('handler')
+			try:
+				if h is not None:
+					h.try_remove()
+			except Exception:
+				logger.exception('Failed to remove one-shot StateReport handler')
+			finally:
+				try:
+					if h is not None and h in self._handlers:
+						self._handlers.remove(h)
+				except Exception:
+					pass
 
-	def _live_param_read_loop(self, node_id: int, stop_event: threading.Event) -> None:
-		'''
-		@brief    Background worker loop for Live Param Read.
-		@param    node_id - Target node ID.
-		@param    stop_event - Event that signals worker shutdown.
-		@return   None
-		'''
-
-		logger.info('Live Param Read thread started for node %s', node_id)
-		# NOTE: This is currently a stub. Replace the body with actual DroneCAN parameter reads.
-		period_s = 1.0
-		while not stop_event.is_set():
-			logger.debug('Live Param Read tick (node %s)', node_id)
-			# Wait returns early when stop_event is set.
-			stop_event.wait(timeout=period_s)
-		logger.info('Live Param Read thread stopped for node %s', node_id)
+		# Install one-shot handler; keep it in _handlers so close/cleanup can remove it if needed.
+		h = self._node.add_handler(dronecan.flytrex.delcon.StateReport, on_state_report)
+		holder['handler'] = h
+		self._handlers.append(h)
+		logger.info('Waiting for one StateReport from node %s', node_id)
 
 	def _on_live_param_read_toggled(self, checked: bool) -> None:
 		'''
@@ -451,6 +772,19 @@ class DeliveryControllerPanel(QDialog):
 		@param    checked - True when enabled (pressed), False when disabled (released).
 		@return   None
 		'''
+
+		def on_state_report(e):
+			node_id = self._get_target_node_id()
+			if node_id is None:
+				return
+
+			if e.transfer.source_node_id != node_id:
+				return
+			print('StateReport from', e.transfer.source_node_id)
+			# print(dronecan.to_yaml(e.message))
+
+			# Update the fields table from the received StateReport.
+			self._update_fields_table_from_state_report(e.message)
 
 		if checked:
 			node_id = self._get_target_node_id()
@@ -460,9 +794,16 @@ class DeliveryControllerPanel(QDialog):
 				self._live_param_read_btn.setChecked(False)
 				self._live_param_read_btn.blockSignals(False)
 				return
-			self._start_live_param_read_thread(node_id)
+			# Add an handler to process incoming parameters here.
+			h = self._node.add_handler(dronecan.flytrex.delcon.StateReport, on_state_report)
+			self._handlers.append(h)
 		else:
-			self._stop_live_param_read_thread()
+			for h in list(self._handlers):
+				try:
+					h.try_remove()
+				except Exception:
+					logger.exception('Failed to remove handler')
+			self._handlers = []
 
 	def _load_fields_into_table(self, xml_path: str) -> None:
 		'''
@@ -527,7 +868,7 @@ class DeliveryControllerPanel(QDialog):
 					tooltip_lines.append(field_type)
 				if not editable:
 					value_item.setFlags(value_item.flags() & ~Qt.ItemIsEditable)
-					value_item.setBackground(Qt.lightGray)
+					value_item.setBackground(QColor(Qt.lightGray).lighter(120))
 					tooltip_lines.append('Read-only')
 				if tooltip_lines:
 					value_item.setToolTip('\n'.join(tooltip_lines))
@@ -577,6 +918,17 @@ class DeliveryControllerPanel(QDialog):
 		except Exception:
 			pass
 
+		# Remove any remaining DroneCAN handlers registered by this panel.
+		try:
+			for h in list(getattr(self, '_handlers', []) or []):
+				try:
+					h.try_remove()
+				except Exception:
+					pass
+			self._handlers = []
+		except Exception:
+			pass
+
 		global _singleton
 		_singleton = None
 
@@ -587,10 +939,18 @@ class DeliveryControllerPanel(QDialog):
 		@return   None
 		'''
 
-		self._stop_live_param_read_thread()
-
-		super(DeliveryControllerPanel, self).closeEvent(event)
-		self.__del__()
+		try:
+			self._stop_live_param_read_thread()
+		except Exception:
+			logger.exception('Failed to stop live param read')
+		try:
+			super(DeliveryControllerPanel, self).closeEvent(event)
+		finally:
+			# Ensure singleton reset/handler cleanup even if shutdown fails.
+			try:
+				self.__del__()
+			except Exception:
+				pass
 
 
 def spawn(parent, node):
