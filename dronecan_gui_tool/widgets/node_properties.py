@@ -668,6 +668,7 @@ class ConfigParams(QGroupBox):
             return
 
         self._fetch_in_progress = False
+        self._fetch_session_id += 1  # Invalidate all in-flight and deferred callbacks for this session
         self._set_fetch_button_caption(False)
         if message:
             self.window().show_message('%s', message)
