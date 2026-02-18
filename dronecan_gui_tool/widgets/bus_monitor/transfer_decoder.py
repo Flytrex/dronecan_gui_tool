@@ -32,6 +32,16 @@ def _is_end_of_transfer(frame):
         return frame.data[-1] & 0b01000000
 
 
+def _frame_has_tail_byte(frame):
+    return bool(getattr(frame, 'data', None)) and len(frame.data) > 0
+
+
+def _frame_payload_without_tail(frame):
+    if not _frame_has_tail_byte(frame):
+        return b''
+    return bytes(frame.data[:-1])
+
+
 def get_payload_from_transfer(transfer, frames=None):
     """
     Inspect the recovered transfer to determine its DSDL type and
@@ -75,19 +85,22 @@ def get_payload_from_transfer(transfer, frames=None):
                 sot = 1 if (tb & 0x80) else 0
                 return f"0x{tb:02X} [Start of Transfer={sot} End of Transfer={eot} Toggle={tog} Transfer ID={tid}]"
 
-            first_tail = frames[0].data[-1] if len(frames[0].data) else None
-            last_tail = frames[-1].data[-1] if len(frames[-1].data) else None
+            frames_with_tail = [f for f in frames if _frame_has_tail_byte(f)]
+            first_tail = frames_with_tail[0].data[-1] if frames_with_tail else None
+            last_tail = frames_with_tail[-1].data[-1] if frames_with_tail else None
             header.append(f"Frames: {len(frames)}")
+            if len(frames_with_tail) != len(frames):
+                header.append(f"Frames without tail byte: {len(frames) - len(frames_with_tail)}")
             if first_tail is not None:
                 header.append(f"First tail: {fmt_tail(first_tail)}")
-            if last_tail is not None and (len(frames) > 1 or last_tail != first_tail):
+            if last_tail is not None and (len(frames_with_tail) > 1 or last_tail != first_tail):
                 header.append(f"Last tail:  {fmt_tail(last_tail)}")
 
             # Payload bytes (per frame) and reconstructed payload
             header.append("Payload bytes (per frame):")
             reconstructed = bytearray()
             for idx, f in enumerate(frames):
-                part = bytes(f.data[:-1]) if len(f.data) else b""
+                part = _frame_payload_without_tail(f)
                 reconstructed += part
                 hex_part = ' '.join(f"{b:02X}" for b in part)
                 header.append(f"  F{idx}: {len(part)} bytes: {hex_part}")
@@ -98,7 +111,7 @@ def get_payload_from_transfer(transfer, frames=None):
 
             # CRC reporting for multi-frame transfers
             if len(frames) > 1:
-                payload_bytes = bytearray(b''.join(bytes(f.data[:-1]) for f in frames))
+                payload_bytes = bytearray(b''.join(_frame_payload_without_tail(f) for f in frames))
                 if len(payload_bytes) >= 2:
                     transfer_crc = payload_bytes[0] | (payload_bytes[1] << 8)
                     header.append(f"Transfer CRC (from frames): 0x{transfer_crc:04X}")
@@ -106,6 +119,8 @@ def get_payload_from_transfer(transfer, frames=None):
                         dtype = dronecan.get_dronecan_data_type(transfer.payload)
                         base_crc = getattr(dtype, 'base_crc', None)
                         if base_crc is not None:
+                            # In UAVCAN v0 multi-frame transfers, the first two payload bytes contain
+                            # the transfer CRC; the CRC is computed over the remaining bytes.
                             computed = dronecan.dsdl.common.crc16_from_bytes(payload_bytes[2:], initial=base_crc)
                             header.append(f"Computed CRC:               0x{computed:04X} (base 0x{base_crc:04X})")
                             header.append(f"CRC match:                  {'yes' if computed == transfer_crc else 'no'}")
@@ -153,6 +168,9 @@ def decode_transfer_from_frame(entry_row, row_to_frame):
             related_rows.append(row)
 
     # The transfer is now fully recovered
+    if any(not _frame_has_tail_byte(x) for x in frames):
+        raise DecodingFailedException('frame without tail byte')
+
     tr = Transfer()
     tr.from_frames([Frame(x.id, x.data, canfd=x.canfd) for x in frames])
 
