@@ -111,7 +111,7 @@ def get_payload_from_transfer(transfer, frames=None):
 
             # CRC reporting for multi-frame transfers
             if len(frames) > 1:
-                payload_bytes = bytearray(b''.join(_frame_payload_without_tail(f) for f in frames))
+                payload_bytes = reconstructed
                 if len(payload_bytes) >= 2:
                     transfer_crc = payload_bytes[0] | (payload_bytes[1] << 8)
                     header.append(f"Transfer CRC (from frames): 0x{transfer_crc:04X}")
