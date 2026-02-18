@@ -168,8 +168,9 @@ def decode_transfer_from_frame(entry_row, row_to_frame):
             related_rows.append(row)
 
     # The transfer is now fully recovered
-    if any(not _frame_has_tail_byte(x) for x in frames):
-        raise DecodingFailedException('frame without tail byte')
+    for i, x in enumerate(frames):
+        if not _frame_has_tail_byte(x):
+            raise DecodingFailedException('Frame at index {} is missing tail byte'.format(i))
 
     tr = Transfer()
     tr.from_frames([Frame(x.id, x.data, canfd=x.canfd) for x in frames])
