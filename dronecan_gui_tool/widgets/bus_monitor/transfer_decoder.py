@@ -130,10 +130,10 @@ def get_payload_from_transfer(transfer, frames=None):
             # Reporting is best-effort; ignore failures
             pass
 
-    payload_section_header  = f"\nParsed payload:"
+    payload_section_header = f"\nParsed payload:"
     yaml_dump = dronecan.to_yaml(transfer.payload)
 
-    parts = ['\n'.join(header), payload_section_header , yaml_dump]
+    parts = ['\n'.join(header), payload_section_header, yaml_dump]
     return "\n".join(parts)
 
 
@@ -168,12 +168,12 @@ def decode_transfer_from_frame(entry_row, row_to_frame):
             related_rows.append(row)
 
     # The transfer is now fully recovered
-    for i, x in enumerate(frames):
-        if not _frame_has_tail_byte(x):
+    for i, frame in enumerate(frames):
+        if not _frame_has_tail_byte(frame):
             raise DecodingFailedException('Frame at index {} is missing tail byte'.format(i))
 
     tr = Transfer()
-    tr.from_frames([Frame(x.id, x.data, canfd=x.canfd) for x in frames])
+    tr.from_frames([Frame(frame.id, frame.data, canfd=frame.canfd) for frame in frames])
 
     full_text = get_payload_from_transfer(tr, frames)
     return related_rows, full_text
