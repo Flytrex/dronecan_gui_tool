@@ -101,7 +101,7 @@ def get_payload_from_transfer(transfer, frames=None):
             reconstructed = bytearray()
             for idx, f in enumerate(frames):
                 part = _frame_payload_without_tail(f)
-                reconstructed += part
+                reconstructed.extend(part)
                 hex_part = ' '.join(f"{b:02X}" for b in part)
                 header.append(f"  F{idx}: {len(part)} bytes: {hex_part}")
             header.append(f"Reconstructed payload: {len(reconstructed)} bytes")
