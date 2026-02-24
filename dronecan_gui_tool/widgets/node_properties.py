@@ -574,6 +574,8 @@ class ConfigParams(QGroupBox):
     VALUE_COLUMN = 3
     FETCH_ALL_TEXT = 'Fetch All'
     STOP_TEXT = 'Stop'
+    FETCH_ALL_TOOLTIP = 'Fetch all config parameters from the node'
+    STOP_TOOLTIP = 'Stop fetching config parameters from the node'
 
     def __init__(self, parent, node, target_node_id):
         super(ConfigParams, self).__init__(parent)
@@ -585,7 +587,7 @@ class ConfigParams(QGroupBox):
         self._fetch_in_progress = False
         self._fetch_session_id = 0
 
-        self._read_all_button = make_icon_button('fa6s.arrows-rotate', 'Fetch all config parameters from the node', self,
+        self._read_all_button = make_icon_button('fa6s.arrows-rotate', self.FETCH_ALL_TOOLTIP, self,
                              text=self.FETCH_ALL_TEXT, on_clicked=self._on_fetch_all_clicked)
 
         opcodes = dronecan.uavcan.protocol.param.ExecuteOpcode.Request()
@@ -652,10 +654,10 @@ class ConfigParams(QGroupBox):
 
         if fetching:
             self._read_all_button.setText(self.STOP_TEXT)
-            self._read_all_button.setToolTip('Stop fetching config parameters from the node')
+            self._read_all_button.setToolTip(self.STOP_TOOLTIP)
         else:
             self._read_all_button.setText(self.FETCH_ALL_TEXT)
-            self._read_all_button.setToolTip('Fetch all config parameters from the node')
+            self._read_all_button.setToolTip(self.FETCH_ALL_TOOLTIP)
 
     def _finish_fetch(self, session_id, message=None):
         '''
