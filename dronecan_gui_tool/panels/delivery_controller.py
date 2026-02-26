@@ -35,7 +35,7 @@ _singleton = None
 
 class DeliveryControllerPanel(QDialog):
 	REQUEST_PRIORITY = 30
-	
+
 	REQ_MODE = 'REQ_MODE'
 	SET_WIRE_LENGTH_LOWER = 'SET_WIRE_LENGTH_LOWER'
 	SET_WIRE_LENGTH_LIFT = 'SET_WIRE_LENGTH_LIFT'
@@ -78,9 +78,8 @@ class DeliveryControllerPanel(QDialog):
 		self.setMinimumSize(700, 400)
 
 		self._node = node
-		self._field_rows = {}
-		self._field_types = {}
-		self._xml_path = os.path.join(os.path.dirname(__file__), 'delivery_controller_fields.xml')
+		# Load initial fields from XML in the config directory. This is just a starting point; the user can edit and save to other files.
+		self._xml_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'delivery_controller_fields.xml')
 		self._live_param_read_thread: threading.Thread | None = None
 		self._live_param_read_stop_event: threading.Event | None = None
 		self._live_param_read_node_id: int | None = None
@@ -115,7 +114,7 @@ class DeliveryControllerPanel(QDialog):
 		self._table.setWordWrap(True)
 		self._table.setSelectionBehavior(QTableWidget.SelectRows)
 		self._table.setSelectionMode(QTableWidget.SingleSelection)
-		
+
 		# Add the tables's buttons
 		self._load_from_file_btn = QPushButton('Load From File', self)
 		self._save_to_file_btn = QPushButton('Save To File', self)
@@ -366,7 +365,7 @@ class DeliveryControllerPanel(QDialog):
 		if v in ('0', 'false', 'no', 'n', 'off'):
 			return False
 		return bool(default)
-	
+
 	@staticmethod
 	def parse_value(field_type: str, raw_value: object):
 		ft = (field_type or '').strip()
@@ -513,7 +512,7 @@ class DeliveryControllerPanel(QDialog):
 			show_error('Invalid Node ID', 'Node ID must be in range 1..127.', str(node_id), parent=self)
 			return None
 		return node_id
-	
+
 	def _on_set_mode_clicked(self) -> None:
 		'''
 		@brief    Handle Set Mode button click.
@@ -564,7 +563,7 @@ class DeliveryControllerPanel(QDialog):
 		node_id = self._get_target_node_id()
 		if node_id is None:
 			return
-		
+
 		wire_len = 0.0
 
 		try:
@@ -608,7 +607,7 @@ class DeliveryControllerPanel(QDialog):
 		node_id = self._get_target_node_id()
 		if node_id is None:
 			return
-		
+
 		wire_len = 0.0
 
 		try:
