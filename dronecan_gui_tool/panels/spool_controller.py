@@ -32,6 +32,8 @@ SPOOL_CONTROLLER_TUNE_NAME = 'Spool Controller Tuning'
 PARAM_FILE_MANAGE_NAME = 'Parameter File Management'
 DESIGN_CONSTANTS_TUNE_NAME = 'DesignConstantsSet Tuning'
 DESIGN_CONSTANTS_SET_NAME = 'DesignConstantsSet'
+PARAM_SET_EDIT_NAME = 'ParamSet Editing'
+PARAM_SET_ID_NAME = 'ParamSet ID'
 
 logger = getLogger(__name__)
 
@@ -74,18 +76,66 @@ class SpoolControllerPanel(QDialog):
 		spool_tune_label.setFont(font_main)
 		header_layout.addWidget(spool_tune_label, 0, Qt.AlignTop)
 
-		# Second row: Two columns with labels and groupbox
-		columns_layout = QHBoxLayout()
+		# Grid layout for two columns + ParamSet Editing below
+		columns_grid = QGridLayout()
+		columns_grid.setColumnStretch(0, 1)
+		columns_grid.setColumnStretch(1, 1)
 
-		# Left column: Parameter File Management section
+		# Row 0, Col 0: Left column - Parameter File Management section
 		left_column = self._create_param_file_manage_section(header_group)
-		columns_layout.addLayout(left_column, 1)
+		columns_grid.addLayout(left_column, 0, 0)
 
-		# Right column: Design Constants section
+		# Row 0, Col 1: Right column - Design Constants section
 		right_column = self._create_design_constants_section(header_group)
-		columns_layout.addLayout(right_column, 1)
+		columns_grid.addLayout(right_column, 0, 1)
 
-		header_layout.addLayout(columns_layout)
+		# Row 1, spanning both columns: ParamSet Editing label
+		param_set_edit_label = QLabel(PARAM_SET_EDIT_NAME, header_group)
+		font_secondary = QFont()
+		font_secondary.setBold(True)
+		param_set_edit_label.setFont(font_secondary)
+		columns_grid.addWidget(param_set_edit_label, 1, 0, 1, 2, Qt.AlignLeft)
+
+		# Row 2, spanning both columns: sunken line
+		param_set_line = QFrame(header_group)
+		param_set_line.setFrameShape(QFrame.HLine)
+		param_set_line.setFrameShadow(QFrame.Sunken)
+		columns_grid.addWidget(param_set_line, 2, 0, 1, 2)
+
+		# Row 3: ParamSet ID label, textbox, and Edit button
+		param_set_id_row = QHBoxLayout()
+		param_set_id_label = QLabel(PARAM_SET_ID_NAME + ':', header_group)
+		param_set_id_row.addWidget(param_set_id_label)
+
+		self._text_box_param_set_id = QLineEdit(header_group)
+		self._text_box_param_set_id.setFixedWidth(120)
+		param_set_id_row.addWidget(self._text_box_param_set_id)
+
+		self._edit_button = QPushButton('Edit', header_group)
+		self._edit_button.clicked.connect(self._on_edit_clicked)
+		param_set_id_row.addWidget(self._edit_button)
+
+		param_set_id_row.addStretch(1)
+		columns_grid.addLayout(param_set_id_row, 3, 0, 1, 2)
+
+		# Row 4: Scrollable area spanning full width for ParamSet editing content
+		self._param_set_scroll_area = QScrollArea(header_group)
+		self._param_set_scroll_area.setWidgetResizable(True)
+		self._param_set_scroll_area.setFrameShape(QFrame.StyledPanel)
+		self._param_set_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+		self._param_set_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+		self._param_set_container = QWidget()
+		self._param_set_container_layout = QVBoxLayout(self._param_set_container)
+		self._param_set_container_layout.setContentsMargins(5, 5, 5, 5)
+		self._param_set_scroll_area.setWidget(self._param_set_container)
+
+		columns_grid.addWidget(self._param_set_scroll_area, 4, 0, 1, 2)
+
+		# Row 5: stretch to absorb remaining space
+		columns_grid.setRowStretch(4, 1)
+
+		header_layout.addLayout(columns_grid)
 
 		layout.addWidget(header_group)
 
@@ -96,11 +146,14 @@ class SpoolControllerPanel(QDialog):
 		@return   QVBoxLayout containing the section.
 		'''
 		left_column = QVBoxLayout()
+		left_column.setContentsMargins(0, 0, 0, 0)
+		left_column.setSpacing(6)
 
 		font_secondary = QFont()
 		font_secondary.setBold(True)
 		param_file_manage_label = QLabel(PARAM_FILE_MANAGE_NAME, parent)
 		param_file_manage_label.setFont(font_secondary)
+		param_file_manage_label.setFixedHeight(20)
 		left_column.addWidget(param_file_manage_label, 0, Qt.AlignTop)
 
 		# Horizontal line below param_file_manage_label
@@ -123,6 +176,7 @@ class SpoolControllerPanel(QDialog):
 		self._upload_browse_button = QPushButton('Browse', parent)
 		self._upload_browse_button.setStyleSheet("background-color: lightblue;")
 		self._upload_browse_button.setFixedWidth(BUTTON_WIDTH)
+		self._upload_browse_button.clicked.connect(self._on_upload_browse_clicked)
 		upload_row.addWidget(self._upload_browse_button)
 		left_column.addLayout(upload_row)
 
@@ -130,6 +184,7 @@ class SpoolControllerPanel(QDialog):
 		self._download_button = QPushButton('Download', parent)
 		self._download_button.setStyleSheet("background-color: lightblue;")
 		self._download_button.setFixedWidth(BUTTON_WIDTH)
+		self._download_button.clicked.connect(self._on_download_clicked)
 		download_row.addWidget(self._download_button)
 
 		self._download_textbox = QLineEdit(parent)
@@ -138,51 +193,99 @@ class SpoolControllerPanel(QDialog):
 		self._download_browse_button = QPushButton('Browse', parent)
 		self._download_browse_button.setStyleSheet("background-color: lightblue;")
 		self._download_browse_button.setFixedWidth(BUTTON_WIDTH)
+		self._download_browse_button.clicked.connect(self._on_download_clicked)
 		download_row.addWidget(self._download_browse_button)
 		left_column.addLayout(download_row)
 
-		STATUS_LABEL_WIDTH = 80
-		STATUS_TEXTBOX_WIDTH = 150
+		STATUS_LABEL_WIDTH = 60
+		STATUS_TEXTBOX_WIDTH = 80
 
-		version_row = QHBoxLayout()
-		version_label = QLabel('Version', parent)
+		status_row = QHBoxLayout()
+		status_row.setSpacing(0)
+
+		version_label = QLabel('Version:', parent)
 		version_label.setFixedWidth(STATUS_LABEL_WIDTH)
-		version_row.addWidget(version_label)
+		status_row.addWidget(version_label)
 
 		self._version_textbox = QLineEdit(parent)
 		self._version_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
-		version_row.addWidget(self._version_textbox)
-		version_row.addStretch(1)
+		self._version_textbox.setReadOnly(True)
+		status_row.addWidget(self._version_textbox)
 
-		left_column.addLayout(version_row)
+		status_row.addSpacing(23)
 
-		crc32_row = QHBoxLayout()
-		crc32_label = QLabel('CRC32', parent)
+		crc32_label = QLabel('CRC32:', parent)
 		crc32_label.setFixedWidth(STATUS_LABEL_WIDTH)
-		crc32_row.addWidget(crc32_label)
+		status_row.addWidget(crc32_label)
 
 		self._crc32_textbox = QLineEdit(parent)
 		self._crc32_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
-		crc32_row.addWidget(self._crc32_textbox)
-		crc32_row.addStretch(1)
+		self._crc32_textbox.setReadOnly(True)
+		status_row.addWidget(self._crc32_textbox)
 
-		left_column.addLayout(crc32_row)
+		status_row.addSpacing(23)
 
-		dirty_row = QHBoxLayout()
-		dirty_label = QLabel('Dirty', parent)
+		dirty_label = QLabel('Dirty:', parent)
 		dirty_label.setFixedWidth(STATUS_LABEL_WIDTH)
-		dirty_row.addWidget(dirty_label)
+		status_row.addWidget(dirty_label)
 
 		self._dirty_textbox = QLineEdit(parent)
 		self._dirty_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
-		dirty_row.addWidget(self._dirty_textbox)
-		dirty_row.addStretch(1)
+		self._dirty_textbox.setReadOnly(True)
+		status_row.addWidget(self._dirty_textbox)
 
-		left_column.addLayout(dirty_row)
+		status_row.addStretch(1)
+
+		left_column.addLayout(status_row)
 
 		left_column.addStretch(1)
 
 		return left_column
+
+	def _on_upload_browse_clicked(self):
+		'''
+		@brief    Handle upload browse button click to select a file.
+		@return   None
+		'''
+		filename, _ = QFileDialog.getOpenFileName(
+			self,
+			'Select file to upload',
+			'',
+			'All files (*.*)'
+		)
+		if filename:
+			self._upload_textbox.setText(filename)
+
+	def _on_edit_clicked(self):
+		'''
+		@brief    Handle Edit button click for ParamSet editing.
+		@return   None
+		'''
+		param_set_id = self._text_box_param_set_id.text().strip()
+		if not param_set_id:
+			show_error('Edit Error', 'Please enter a ParamSet ID.', self)
+			return
+		logger.info('Edit clicked for ParamSet ID: %s', param_set_id)
+
+	def _on_download_clicked(self):
+		'''
+		@brief    Handle download button click to select a save destination.
+		@return   None
+		'''
+		dialog = QFileDialog(self)
+		dialog.setWindowTitle('Select file to download')
+		dialog.setAcceptMode(QFileDialog.AcceptSave)
+		dialog.setFileMode(QFileDialog.AnyFile)
+		dialog.setNameFilter('All files (*.*)')
+
+		initial_path = self._download_textbox.text().strip()
+		if initial_path:
+			dialog.selectFile(initial_path)
+
+		if dialog.exec_():
+			selected_files = dialog.selectedFiles()
+			if selected_files:
+				self._download_textbox.setText(selected_files[0])
 
 	def _load_design_constants_fields(self):
 		'''
@@ -203,11 +306,14 @@ class SpoolControllerPanel(QDialog):
 		@return   QVBoxLayout containing the section.
 		'''
 		right_column = QVBoxLayout()
+		right_column.setContentsMargins(0, 0, 0, 0)
+		right_column.setSpacing(6)
 
 		font_secondary = QFont()
 		font_secondary.setBold(True)
 		design_constants_label = QLabel(DESIGN_CONSTANTS_TUNE_NAME, parent)
 		design_constants_label.setFont(font_secondary)
+		design_constants_label.setFixedHeight(20)
 		right_column.addWidget(design_constants_label, 0, Qt.AlignTop)
 
 		# Horizontal line below design_constants_label
@@ -218,6 +324,8 @@ class SpoolControllerPanel(QDialog):
 
 		design_const_set_group = QGroupBox(DESIGN_CONSTANTS_SET_NAME, parent)
 		design_const_set_group.setMinimumHeight(200)
+		design_const_set_group.setMaximumHeight(320)
+		design_const_set_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 		design_const_set_group.setStyleSheet("""
 			QGroupBox {
 				border: 1px solid gray;
@@ -305,7 +413,9 @@ class SpoolControllerPanel(QDialog):
 		design_const_layout.addWidget(scroll_area, 1, 0)
 		design_const_layout.setRowStretch(1, 1)
 
-		right_column.addWidget(design_const_set_group, 1)
+		right_column.addWidget(design_const_set_group, 0, Qt.AlignTop)
+
+		right_column.addStretch(1)
 
 		return right_column
 
