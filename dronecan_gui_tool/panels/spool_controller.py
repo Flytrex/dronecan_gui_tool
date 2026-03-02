@@ -34,6 +34,10 @@ DESIGN_CONSTANTS_TUNE_NAME = 'DesignConstantsSet Tuning'
 DESIGN_CONSTANTS_SET_NAME = 'DesignConstantsSet'
 PARAM_SET_EDIT_NAME = 'ParamSet Editing'
 PARAM_SET_ID_NAME = 'ParamSet ID'
+PARAM_SET_NAME = 'ParamSet'
+
+BUTTON_HORIZONTAL_SPACING = 3
+PARAM_SET_GROUPBOX_HEIGHT = 200
 
 logger = getLogger(__name__)
 
@@ -50,10 +54,14 @@ class SpoolControllerPanel(QDialog):
 		self.setMinimumSize(700, 400)
 
 		self._node = node
+		self._param_set_id_list = []
 
 		# Load the design constants definition file
 		self._design_const_set_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'DesignConstantsSet.json')
 		self._design_constants_fields = self._load_design_constants_fields()
+		# Load the param set definition file
+		self._param_set_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'ParamSet.json')
+		self._param_set_fields = self._load_param_set_fields()
 
 		self._setup_ui()
 
@@ -128,6 +136,7 @@ class SpoolControllerPanel(QDialog):
 		self._param_set_container = QWidget()
 		self._param_set_container_layout = QVBoxLayout(self._param_set_container)
 		self._param_set_container_layout.setContentsMargins(5, 5, 5, 5)
+		self._param_set_container_layout.setAlignment(Qt.AlignTop)
 		self._param_set_scroll_area.setWidget(self._param_set_container)
 
 		columns_grid.addWidget(self._param_set_scroll_area, 4, 0, 1, 2)
@@ -263,9 +272,145 @@ class SpoolControllerPanel(QDialog):
 		'''
 		param_set_id = self._text_box_param_set_id.text().strip()
 		if not param_set_id:
-			show_error('Edit Error', 'Please enter a ParamSet ID.', self)
+			show_error('Edit Error', 'Please enter a ParamSet ID.', '', parent=self, blocking=True)
 			return
 		logger.info('Edit clicked for ParamSet ID: %s', param_set_id)
+		self._add_param_set_editing_content(param_set_id)
+
+	def _add_param_set_editing_content(self, param_set_id):
+		'''
+		@brief    Add content to the ParamSet editing area based on the given ID.
+		@param    param_set_id - The ID of the ParamSet to edit.
+		@return   None
+		'''
+
+		# Check if this ID is already being edited
+		if param_set_id in self._param_set_id_list:
+			# Show a popup message that this ID is already being edited
+			show_error('Edit Error', f'ParamSet with ID "{param_set_id}" is already being edited.', '', parent=self, blocking=True)
+			return
+
+		# Register this ID as being edited
+		self._param_set_id_list.append(param_set_id)
+		self._add_param_set_editing_groupbox(param_set_id)
+
+	def _add_param_set_editing_groupbox(self, param_set_id):
+		'''
+		@brief    Create and add a groupbox for editing a specific ParamSet ID.
+		@param    param_set_id - The ID of the ParamSet to edit.
+		@return   None
+		'''
+
+		groupbox = QGroupBox(f'{PARAM_SET_NAME} {param_set_id}', self._param_set_container)
+		groupbox.setFixedHeight(PARAM_SET_GROUPBOX_HEIGHT)
+		# Use scroll area width minus scrollbar width for consistent sizing
+		scrollbar_width = self._param_set_scroll_area.verticalScrollBar().sizeHint().width()
+		available_width = self._param_set_scroll_area.width() - scrollbar_width - self._param_set_container_layout.contentsMargins().left() - self._param_set_container_layout.contentsMargins().right()
+		groupbox.setFixedWidth(available_width // 2)
+		groupbox.setStyleSheet("""
+			QGroupBox {
+				border: 1px solid gray;
+				border-radius: 3px;
+				margin-top: 0px;
+				padding-top: 15px;
+				background-color: lightyellow;
+			}
+			QGroupBox::title {
+				subcontrol-origin: margin;
+				subcontrol-position: top left;
+				padding: 2px 5px;
+				background-color: palette(window);
+				border: 1px solid gray;
+				top: 0px;
+				left: 0px;
+			}
+		""")
+
+		# Layout for groupbox
+		groupbox_layout = QGridLayout(groupbox)
+		groupbox_layout.setColumnStretch(0, 1)
+		groupbox_layout.setColumnStretch(1, 0)
+		groupbox_layout.setSpacing(10)
+		groupbox_layout.setContentsMargins(0, 10, 5, 5)
+		groupbox_layout.setRowMinimumHeight(0, 30)
+
+		# Buttons row (fixed at top)
+		buttons_layout = QHBoxLayout()
+		buttons_layout.setSpacing(BUTTON_HORIZONTAL_SPACING)
+		buttons_layout.addStretch(1)
+
+		execute_button = QPushButton('Execute', groupbox)
+		buttons_layout.addWidget(execute_button)
+
+		store_button = QPushButton('Store', groupbox)
+		buttons_layout.addWidget(store_button)
+
+		recall_button = QPushButton('Recall', groupbox)
+		buttons_layout.addWidget(recall_button)
+
+		close_button = QPushButton('Close', groupbox)
+		buttons_layout.addWidget(close_button)
+
+		groupbox_layout.addLayout(buttons_layout, 0, 0)
+
+		# X button at top-right corner (absolute positioning over the groupbox)
+		close_x_button = QPushButton('\u2715', groupbox)
+		close_x_button.setFixedSize(20, 20)
+		close_x_button.setStyleSheet("""
+			QPushButton {
+				background-color: palette(window);
+				border: 1px solid gray;
+				font-weight: bold;
+				color: red;
+				font-size: 12px;
+			}
+			QPushButton:hover {
+				background-color: #ffcccc;
+			}
+		""")
+		close_x_button.clicked.connect(lambda: self._on_param_set_groupbox_close(param_set_id, groupbox))
+		close_x_button.move(groupbox.width() - 20, 0)
+		close_x_button.raise_()
+
+		# Re-position the X button when the groupbox is resized
+		groupbox.resizeEvent = lambda event, btn=close_x_button, gb=groupbox: (
+			btn.move(gb.width() - 20, 0),
+			type(gb).__base__.resizeEvent(gb, event)
+		)
+
+		# Scrollable area for ParamSet fields
+		param_set_scroll = QScrollArea(groupbox)
+		param_set_scroll.setWidgetResizable(True)
+		param_set_scroll.setFrameShape(QFrame.NoFrame)
+		param_set_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+		param_set_fields_container = QWidget()
+		param_set_fields_container.setStyleSheet("background-color: lightyellow;")
+		param_set_fields_layout = QGridLayout(param_set_fields_container)
+		param_set_fields_layout.setColumnStretch(0, 0)
+		param_set_fields_layout.setColumnStretch(1, 1)
+		param_set_fields_layout.setSpacing(5)
+		param_set_fields_layout.setContentsMargins(5, 0, 5, 0)
+
+		self._parse_param_set_file(param_set_id, param_set_fields_container, param_set_fields_layout)
+
+		param_set_scroll.setWidget(param_set_fields_container)
+		groupbox_layout.addWidget(param_set_scroll, 1, 0, 1, 2)
+		groupbox_layout.setRowStretch(1, 1)
+
+		self._param_set_container_layout.addWidget(groupbox)
+
+	def _on_param_set_groupbox_close(self, param_set_id, groupbox):
+		'''
+		@brief    Remove a ParamSet editing groupbox and deregister the ID.
+		@param    param_set_id - The ID of the ParamSet to close.
+		@param    groupbox - The QGroupBox widget to remove.
+		@return   None
+		'''
+		if param_set_id in self._param_set_id_list:
+			self._param_set_id_list.remove(param_set_id)
+		self._param_set_container_layout.removeWidget(groupbox)
+		groupbox.deleteLater()
 
 	def _on_download_clicked(self):
 		'''
@@ -298,6 +443,119 @@ class SpoolControllerPanel(QDialog):
 		except Exception as ex:
 			logger.exception('Failed to load DesignConstantsSet.json: %s', ex)
 			return {}
+
+	def _load_param_set_fields(self):
+		'''
+		@brief    Load and parse the ParamSet.json file.
+		@return   Dictionary containing field definitions.
+		'''
+		try:
+			with open(self._param_set_path, 'r') as f:
+				return json.load(f)
+		except Exception as ex:
+			logger.exception('Failed to load ParamSet.json: %s', ex)
+			return {}
+
+	def _parse_param_set_file(self, param_set_id, fields_container, fields_layout):
+		'''
+		@brief    Parse the ParamSet fields and populate the container with topic labels, sunken lines, and field widgets.
+		@param    param_set_id - The ID of the ParamSet being edited.
+		@param    fields_container - The parent widget for the field widgets.
+		@param    fields_layout - The QGridLayout to add widgets to.
+		@return   None
+		'''
+		font_topic = QFont()
+		font_topic.setBold(True)
+
+		row = 0
+		for topic_name, topic_data in self._param_set_fields.items():
+			# Skip param_id
+			if topic_name == 'param_id':
+				continue
+
+			# Main topic label (bold black)
+			topic_label = QLabel(topic_name, fields_container)
+			topic_label.setFixedHeight(20)
+			topic_label.setFont(font_topic)
+			topic_label.setStyleSheet('color: black;')
+			fields_layout.addWidget(topic_label, row, 0, 1, 2)
+			row += 1
+
+			# Sunken line below topic label
+			topic_line = QFrame(fields_container)
+			topic_line.setFrameShape(QFrame.HLine)
+			topic_line.setFrameShadow(QFrame.Sunken)
+			fields_layout.addWidget(topic_line, row, 0, 1, 2)
+			row += 1
+
+			# Parse sub-fields
+			for field_name, field_data in topic_data.items():
+				# Label
+				label = QLabel(field_name + ':', fields_container)
+				label.setFixedHeight(20)
+				comment = field_data.get('comment', '')
+				if comment:
+					label.setToolTip(comment)
+				color = field_data.get('color', '')
+				if color:
+					label.setStyleSheet(f'color: {color};')
+				fields_layout.addWidget(label, row, 0)
+
+				# Textbox
+				textbox = QLineEdit(fields_container)
+				textbox.setFixedHeight(20)
+				textbox.setStyleSheet("background-color: white;")
+				default_value = field_data.get('default', '')
+				textbox.setText(str(default_value))
+				field_type = field_data.get('type', '')
+				if field_type:
+					textbox.setToolTip(f'{field_type} type')
+				fields_layout.addWidget(textbox, row, 1)
+
+				fields_layout.setRowMinimumHeight(row, 0)
+				row += 1
+
+		# Add stretch at the bottom to push fields to the top
+		fields_layout.setRowStretch(row, 1)
+
+	def _parse_design_constant_set_file(self, fields_container, fields_layout):
+		'''
+		@brief    Parse the design constants fields and populate the container with labels and textboxes.
+		@param    fields_container - The parent widget for the field widgets.
+		@param    fields_layout - The QGridLayout to add widgets to.
+		@return   None
+		'''
+		self._field_inputs = {}
+		row = 0
+		for field_name, field_data in self._design_constants_fields.items():
+			# Label
+			label = QLabel(field_name + ':', fields_container)
+			label.setFixedHeight(20)
+			comment = field_data.get('comment', '')
+			if comment:
+				label.setToolTip(comment)
+			color = field_data.get('color', '')
+			if color:
+				label.setStyleSheet(f'color: {color};')
+			fields_layout.addWidget(label, row, 0)
+
+			# Textbox
+			textbox = QLineEdit(fields_container)
+			textbox.setFixedHeight(20)
+			textbox.setStyleSheet("background-color: white;")
+			default_value = field_data.get('default', '')
+			textbox.setText(str(default_value))
+			field_type = field_data.get('type', '')
+			if field_type:
+				textbox.setToolTip(f'{field_type} type')
+			fields_layout.addWidget(textbox, row, 1)
+
+			self._field_inputs[field_name] = textbox
+			fields_layout.setRowMinimumHeight(row, 0)
+			row += 1
+
+		# Add stretch at the bottom to push fields to the top
+		fields_layout.setRowStretch(row, 1)
 
 	def _create_design_constants_section(self, parent):
 		'''
@@ -354,6 +612,7 @@ class SpoolControllerPanel(QDialog):
 
 		# Buttons row (fixed at top)
 		buttons_layout = QHBoxLayout()
+		buttons_layout.setSpacing(BUTTON_HORIZONTAL_SPACING)
 		buttons_layout.addStretch(1)
 
 		self._store_button = QPushButton('Store', design_const_set_group)
@@ -379,35 +638,7 @@ class SpoolControllerPanel(QDialog):
 		fields_layout.setSpacing(5)
 		fields_layout.setContentsMargins(5, 0, 5, 0)
 
-		# Create label and textbox for each field
-		self._field_inputs = {}
-		row = 0
-		for field_name, field_data in self._design_constants_fields.items():
-			# Label
-			label = QLabel(field_name + ':', fields_container)
-			label.setFixedHeight(20)
-			comment = field_data.get('comment', '')
-			if comment:
-				label.setToolTip(comment)
-			fields_layout.addWidget(label, row, 0)
-
-			# Textbox
-			textbox = QLineEdit(fields_container)
-			textbox.setFixedHeight(20)
-			textbox.setStyleSheet("background-color: white;")
-			default_value = field_data.get('default', '')
-			textbox.setText(str(default_value))
-			field_type = field_data.get('type', '')
-			if field_type:
-				textbox.setToolTip(f'{field_type} type')
-			fields_layout.addWidget(textbox, row, 1)
-
-			self._field_inputs[field_name] = textbox
-			fields_layout.setRowMinimumHeight(row, 0)
-			row += 1
-
-		# Add stretch at the bottom to push fields to the top
-		fields_layout.setRowStretch(row, 1)
+		self._parse_design_constant_set_file(fields_container, fields_layout)
 
 		scroll_area.setWidget(fields_container)
 		design_const_layout.addWidget(scroll_area, 1, 0)

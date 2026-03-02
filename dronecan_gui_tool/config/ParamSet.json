@@ -4,54 +4,70 @@
         "default": 0,
         "comment": "The ParamSet ID number"
     },
-    "load_not_shaft_control": {
-        "type": "bool",
-        "default": 0,
-        "comment": ""
+    "general": {
+        "load_not_shaft_control": {
+            "type": "bool",
+            "default": 0,
+            "comment": "",
+            "color": "black"
+        },
+        "shaft_pos_rad": {
+            "type": "float32",
+            "default": 0,
+            "comment": "The shaft position in radian",
+            "color": "black"
+        },
+        "completion_time_s": {
+            "type": "float32",
+            "default": 0,
+            "comment": "The time to complete the setup",
+            "color": "black"
+        }
     },
-    "shaft_pos_rad": {
-        "type": "float16",
-        "default": 0,
-        "comment": "The shaft position in radian"
+    "limits": {
+        "min_torque_Nm": {
+            "type": "float32",
+            "default": 0,
+            "comment": "The lower threshold of rotational force that the motor is commanded or allowed to maintain",
+            "color": "black"
+        },
+        "max_torque": {
+            "type": "float32",
+            "default": 0,
+            "comment": "The software or hardware limit on the rotational twisting force the motor can apply to the spool shaft",
+            "color": "black"
+        }
     },
-    "completion_time_s": {
-        "type": "float16",
-        "default": 0,
-        "comment": "The time to complete the setup"
-    },
-    "min_torque_Nm": {
-        "type": "float16",
-        "default": 0,
-        "comment": "The lower threshold of rotational force that the motor is commanded or allowed to maintain"
-    },
-    "max_torque": {
-        "type": "float16",
-        "default": 0,
-        "comment": "The software or hardware limit on the rotational twisting force the motor can apply to the spool shaft"
-    },
-    "obs_tension_detector_min_torque_Nm": {
-        "type": "float16",
-        "default": 0,
-        "comment": "The lower threshold of rotational force that the motor is commanded or allowed to maintain"
-    },
-    "obs_tension_detector_window_s": {
-        "type": "float16",
-        "default": 0,
-        "comment": "The time in seconds which obs_tension_detector_min_torque_Nm was observed"
-    },
-    "obs_traj_deviation_pos_m": {
-        "type": "float16",
-        "default": 0,
-        "comment": ""
-    },
-    "obs_traj_deviation_neg_m": {
-        "type": "float16",
-        "default": 0,
-        "comment": ""
-    },
-    "obs_allowed_deviation_pos_window_s": {
-        "type": "float16",
-        "default": 0,
-        "comment": ""
+    "observer": {
+        "obs_tension_detector_min_torque_Nm": {
+            "type": "float32",
+            "default": 0,
+            "comment": "The lower threshold of rotational force that the motor is commanded or allowed to maintain",
+            "color": "black"
+        },
+        "obs_tension_detector_window_s": {
+            "type": "float32",
+            "default": 0,
+            "comment": "The time in seconds which obs_tension_detector_min_torque_Nm was observed",
+            "color": "black"
+        },
+        "obs_traj_deviation_pos_m": {
+            "type": "float32",
+            "default": 0,
+            "comment": "",
+            "color": "black"
+        },
+        "obs_traj_deviation_neg_m": {
+            "type": "float32",
+            "default": 0,
+            "comment": "",
+            "color": "black"
+        },
+        "obs_allowed_deviation_pos_window_s": {
+            "type": "float32",
+            "default": 0,
+            "comment": "",
+            "color": "black"
+        }
     }
 }

@@ -1,32 +1,38 @@
 {
     "wire_diameter": {
-        "type": "float16",
+        "type": "float32",
         "default": 0,
-        "comment": ""
+        "comment": "",
+        "color": "black"
     },
     "barrel_diameter": {
-        "type": "float16",
+        "type": "float32",
         "default": 0,
-        "comment": "The diameter of the barrel in meters"
+        "comment": "The diameter of the barrel in meters",
+        "color": "black"
     },
     "spool_width": {
-        "type": "float16",
+        "type": "float32",
         "default": 0,
-        "comment": "The width of the spool"
+        "comment": "The width of the spool",
+        "color": "black"
     },
     "gearbox_ratio": {
-        "type": "float16",
+        "type": "float32",
         "default": 0,
-        "comment": ""
+        "comment": "",
+        "color": "black"
     },
     "wire_packing_efficiencies": {
-        "type": "float16",
+        "type": "float32",
         "default": 0,
-        "comment": ""
+        "comment": "",
+        "color": "black"
     },
     "total_length_of_spooled_wire": {
-        "type": "float16",
+        "type": "float32",
         "default": 0,
-        "comment": "The wire's total length in meters"
+        "comment": "The wire's total length in meters",
+        "color": "black"
     }
 }
