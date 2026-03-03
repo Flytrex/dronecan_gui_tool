@@ -164,6 +164,7 @@ class SpoolControllerPanel(QDialog):
 		self._param_set_color_map = {}       # param_set_id -> color string
 		self._available_colors = list(_PARAM_SET_LIGHT_COLORS)  # colors not currently in use
 		self._param_set_dirty = {}            # param_set_id -> bool (True if any field was edited)
+		self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLineEdit, type_str)}
 
 		# Load the design constants definition file
 		self._design_const_set_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'DesignConstantsSet.json')
@@ -455,12 +456,15 @@ class SpoolControllerPanel(QDialog):
 		buttons_layout.addStretch(1)
 
 		execute_button = QPushButton('Execute', groupbox)
+		execute_button.clicked.connect(lambda: self._on_param_set_execute(param_set_id))
 		buttons_layout.addWidget(execute_button)
 
 		store_button = QPushButton('Store', groupbox)
+		store_button.clicked.connect(lambda: self._on_param_set_store(param_set_id))
 		buttons_layout.addWidget(store_button)
 
 		recall_button = QPushButton('Recall', groupbox)
+		recall_button.clicked.connect(lambda: self._on_param_set_recall(param_set_id))
 		buttons_layout.addWidget(recall_button)
 
 		close_button = QPushButton('Close', groupbox)
@@ -540,6 +544,7 @@ class SpoolControllerPanel(QDialog):
 				return
 
 		self._param_set_dirty.pop(param_set_id, None)
+		self._param_set_field_inputs.pop(param_set_id, None)
 		if param_set_id in self._param_set_id_list:
 			self._param_set_id_list.remove(param_set_id)
 		# Return the color to the available pool
@@ -548,6 +553,215 @@ class SpoolControllerPanel(QDialog):
 			self._available_colors.append(used_color)
 		self._param_set_container_layout.removeWidget(groupbox)
 		groupbox.deleteLater()
+
+	@staticmethod
+	def _parse_value(field_type, raw_value):
+		'''
+		@brief    Parse a raw string value into the appropriate Python type based on field_type.
+		@param    field_type - Type string (e.g. 'float32', 'uint16', 'bool').
+		@param    raw_value - The raw string from the textbox.
+		@return   Parsed value.
+		'''
+		ft = (field_type or '').strip()
+		raw = '' if raw_value is None else str(raw_value).strip()
+
+		if ft == 'bool':
+			v = raw.lower()
+			if v in ('1', 'true', 'yes', 'y', 'on'):
+				return True
+			if v in ('0', 'false', 'no', 'n', 'off', ''):
+				return False
+			raise ValueError(f'Invalid bool: {raw!r}')
+
+		if ft.startswith('float') or ft in ('float', 'double'):
+			return 0.0 if raw == '' else float(raw)
+
+		if re.fullmatch(r'(u?int)(\d+)', ft) or re.fullmatch(r'(u?int)(\d+)_t', ft):
+			return 0 if raw == '' else int(raw, 0)
+
+		# Fallback: try int then float
+		if raw == '':
+			return 0
+		try:
+			return int(raw, 0)
+		except Exception:
+			return float(raw)
+
+	def _send_param_set_msg(self, param_set_id, operation_name):
+		'''
+		@brief    Helper function to send a ParamSet message with the given operation.
+		@param    param_set_id - The ID of the ParamSet.
+		@param    operation_name - The DSDL constant name (e.g. 'OPERATION_EXECUTE').
+		@return   None
+		'''
+		field_inputs = self._param_set_field_inputs.get(param_set_id)
+		if not field_inputs:
+			show_error('Error', 'No fields found for this ParamSet.', '', parent=self, blocking=True)
+			return
+
+		try:
+			msg = dronecan.flytrex.delcon.ParamSet()
+		except Exception as ex:
+			logger.exception('ParamSet DSDL type not available: %s', ex)
+			show_error(
+				'DSDL type not loaded',
+				'Could not access dronecan.flytrex.delcon.ParamSet.',
+				str(ex),
+				parent=self,
+				blocking=True,
+			)
+			return
+
+		operation = getattr(msg, operation_name)
+		msg.operation = operation
+
+		try:
+			msg.param_id = int(param_set_id)
+		except ValueError:
+			show_error('Error', f'ParamSet ID "{param_set_id}" is not a valid integer.', '', parent=self, blocking=True)
+			return
+
+		# Only set the fields if operation is EXECUTE or STORE (not RECALL)
+		if operation_name == 'OPERATION_RECALL':
+			msg.param_values = []
+			msg.param_value_types = []
+			for field_name, (textbox, field_type) in field_inputs.items():
+				if not hasattr(msg, field_name):
+					logger.warning('Field "%s" not found on ParamSet message, skipping', field_name)
+					continue
+				msg.param_values.append(0)  # placeholder value for recall
+				msg.param_value_types.append(field_type)
+
+		else:
+			for field_name, (textbox, field_type) in field_inputs.items():
+				raw_value = textbox.text().strip()
+				if not hasattr(msg, field_name):
+					logger.warning('Field "%s" not found on ParamSet message, skipping', field_name)
+					continue
+				try:
+					value = self._parse_value(field_type, raw_value)
+					setattr(msg, field_name, value)
+				except Exception as ex:
+					show_error(
+						'Invalid field value',
+						f'Could not parse field "{field_name}".',
+						f'Type: {field_type}\nValue: {raw_value}\nError: {ex}',
+						parent=self,
+						blocking=True,
+					)
+					return
+
+		try:
+			self._node.broadcast(msg)
+			logger.info('Broadcast ParamSet with operation %s for param_id=%s', operation, param_set_id)
+		except Exception as ex:
+			logger.exception('Failed to broadcast ParamSet: %s', ex)
+			show_error('Broadcast failed', 'Could not broadcast ParamSet.', str(ex), parent=self, blocking=True)
+
+
+	def _on_param_set_execute(self, param_set_id):
+		'''
+		@brief    Handle Execute button click: broadcast a flytrex.delcon.ParamSet message with OPERATION_EXECUTE.
+		@param    param_set_id - The ParamSet ID to execute.
+		@return   None
+		'''
+
+		self._send_param_set_msg(param_set_id, 'OPERATION_EXECUTE')
+
+	def _on_param_set_store(self, param_set_id):
+		'''
+		@brief    Handle Store button click: broadcast a flytrex.delcon.ParamSet message with OPERATION_STORE.
+		@param    param_set_id - The ParamSet ID to store.
+		@return   None
+		'''
+
+		self._send_param_set_msg(param_set_id, 'OPERATION_STORE')
+
+	def _on_param_set_recall(self, param_set_id):
+		'''
+		@brief    Handle Recall button click: broadcast a flytrex.delcon.ParamSet message with OPERATION_RECALL.
+		@param    param_set_id - The ParamSet ID to recall.
+		@return   None
+		'''
+
+		self._send_param_set_msg(param_set_id, 'OPERATION_RECALL')
+
+	def _on_design_constants_recall(self):
+		'''
+		@brief    Handle Recall button click: broadcast a flytrex.delcon.DesignConstantsSet message with OPERATION_RECALL.
+		@return   None
+		'''
+		try:
+			msg = dronecan.flytrex.delcon.DesignConstantsSet()
+		except Exception as ex:
+			logger.exception('DesignConstantsSet DSDL type not available: %s', ex)
+			show_error(
+				'DSDL type not loaded',
+				'Could not access dronecan.flytrex.delcon.DesignConstantsSet.',
+				str(ex),
+				parent=self,
+				blocking=True,
+			)
+			return
+
+		msg.operation = msg.OPERATION_RECALL
+
+		try:
+			self._node.broadcast(msg)
+			logger.info('Broadcast DesignConstantsSet OPERATION_RECALL')
+		except Exception as ex:
+			logger.exception('Failed to broadcast DesignConstantsSet: %s', ex)
+			show_error('Broadcast failed', 'Could not broadcast DesignConstantsSet.', str(ex), parent=self, blocking=True)
+
+	def _on_design_constants_store(self):
+		'''
+		@brief    Handle Store button click: broadcast a flytrex.delcon.DesignConstantsSet message with OPERATION_STORE.
+		@return   None
+		'''
+		if not self._field_inputs:
+			show_error('Store Error', 'No design constant fields found.', '', parent=self, blocking=True)
+			return
+
+		try:
+			msg = dronecan.flytrex.delcon.DesignConstantsSet()
+		except Exception as ex:
+			logger.exception('DesignConstantsSet DSDL type not available: %s', ex)
+			show_error(
+				'DSDL type not loaded',
+				'Could not access dronecan.flytrex.delcon.DesignConstantsSet.',
+				str(ex),
+				parent=self,
+				blocking=True,
+			)
+			return
+
+		msg.operation = msg.OPERATION_STORE
+
+		for field_name, textbox in self._field_inputs.items():
+			raw_value = textbox.text().strip()
+			if not hasattr(msg, field_name):
+				logger.warning('Field "%s" not found on DesignConstantsSet message, skipping', field_name)
+				continue
+			field_type = self._design_constants_fields.get(field_name, {}).get('type', 'float32')
+			try:
+				value = self._parse_value(field_type, raw_value)
+				setattr(msg, field_name, value)
+			except Exception as ex:
+				show_error(
+					'Invalid field value',
+					f'Could not parse field "{field_name}".',
+					f'Type: {field_type}\nValue: {raw_value}\nError: {ex}',
+					parent=self,
+					blocking=True,
+				)
+				return
+
+		try:
+			self._node.broadcast(msg)
+			logger.info('Broadcast DesignConstantsSet OPERATION_STORE')
+		except Exception as ex:
+			logger.exception('Failed to broadcast DesignConstantsSet: %s', ex)
+			show_error('Broadcast failed', 'Could not broadcast DesignConstantsSet.', str(ex), parent=self, blocking=True)
 
 	def _on_download_clicked(self):
 		'''
@@ -604,6 +818,8 @@ class SpoolControllerPanel(QDialog):
 		font_topic = QFont()
 		font_topic.setBold(True)
 
+		field_inputs = {}  # field_name -> (QLineEdit, type_str)
+
 		row = 0
 		for topic_name, topic_data in self._param_set_fields.items():
 			# Skip param_id
@@ -649,8 +865,13 @@ class SpoolControllerPanel(QDialog):
 					textbox.setToolTip(f'{field_type} type')
 				fields_layout.addWidget(textbox, row, 1)
 
+				field_inputs[field_name] = (textbox, field_type)
+
 				fields_layout.setRowMinimumHeight(row, 0)
 				row += 1
+
+		# Store field inputs for this ParamSet ID
+		self._param_set_field_inputs[param_set_id] = field_inputs
 
 		# Add stretch at the bottom to push fields to the top
 		fields_layout.setRowStretch(row, 1)
@@ -753,9 +974,11 @@ class SpoolControllerPanel(QDialog):
 		buttons_layout.addStretch(1)
 
 		self._store_button = QPushButton('Store', design_const_set_group)
+		self._store_button.clicked.connect(self._on_design_constants_store)
 		buttons_layout.addWidget(self._store_button)
 
 		self._recall_button = QPushButton('Recall', design_const_set_group)
+		self._recall_button.clicked.connect(self._on_design_constants_recall)
 		buttons_layout.addWidget(self._recall_button)
 
 		design_const_layout.addLayout(buttons_layout, 0, 0)
