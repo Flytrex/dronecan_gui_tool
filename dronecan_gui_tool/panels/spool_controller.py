@@ -15,12 +15,13 @@ import threading
 import os
 import re
 import json
+import random
 import xml.etree.ElementTree as ET
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QRect, QSize, QPoint
 from PyQt5.QtGui import QIntValidator, QColor, QFont
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
-	QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy, QFrame, QScrollArea, QWidget
+	QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy, QFrame, QScrollArea, QWidget, QLayout, QMessageBox
 import numpy as np
 
 from ..widgets import get_icon, show_error
@@ -38,10 +39,115 @@ PARAM_SET_NAME = 'ParamSet'
 
 BUTTON_HORIZONTAL_SPACING = 3
 PARAM_SET_GROUPBOX_HEIGHT = 200
+PARAM_SET_GROUPBOX_WIDTH = 400
+
+_PARAM_SET_LIGHT_COLORS = [
+	'#FFFFCC',  # light yellow
+	'#CCFFCC',  # light green
+	'#CCE5FF',  # light blue
+	'#FFCCCC',  # light red / pink
+	'#E5CCFF',  # light purple
+	'#FFDDCC',  # light orange
+	'#CCFFFF',  # light cyan
+	'#FFE5CC',  # light peach
+	'#D5FFCC',  # light lime
+	'#FFCCFF',  # light magenta
+]
 
 logger = getLogger(__name__)
 
 _singleton = None
+
+
+class FlowLayout(QLayout):
+	"""Layout that arranges child widgets left-to-right, wrapping to the next row when out of space."""
+
+	def __init__(self, parent=None, margin=5, hSpacing=8, vSpacing=8):
+		super().__init__(parent)
+		self._hSpacing = hSpacing
+		self._vSpacing = vSpacing
+		self._items = []
+		self.setContentsMargins(margin, margin, margin, margin)
+
+	def addItem(self, item):
+		self._items.append(item)
+
+	def count(self):
+		return len(self._items)
+
+	def itemAt(self, index):
+		if 0 <= index < len(self._items):
+			return self._items[index]
+		return None
+
+	def takeAt(self, index):
+		if 0 <= index < len(self._items):
+			return self._items.pop(index)
+		return None
+
+	def expandingDirections(self):
+		return Qt.Orientations(0)
+
+	def hasHeightForWidth(self):
+		return True
+
+	def heightForWidth(self, width):
+		return self._doLayout(QRect(0, 0, width, 0), True)
+
+	def setGeometry(self, rect):
+		super().setGeometry(rect)
+		self._doLayout(rect, False)
+
+	def sizeHint(self):
+		return self.minimumSize()
+
+	def minimumSize(self):
+		size = QSize()
+		for item in self._items:
+			size = size.expandedTo(item.minimumSize())
+		m = self.contentsMargins()
+		size += QSize(m.left() + m.right(), m.top() + m.bottom())
+		return size
+
+	def _doLayout(self, rect, testOnly):
+		m = self.contentsMargins()
+		effective = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+		x = effective.x()
+		y = effective.y()
+		lineHeight = 0
+
+		for item in self._items:
+			wid = item.widget()
+			if wid is not None and wid.isHidden():
+				continue
+
+			itemSize = item.sizeHint()
+			nextX = x + itemSize.width() + self._hSpacing
+			if nextX - self._hSpacing > effective.right() + 1 and lineHeight > 0:
+				x = effective.x()
+				y += lineHeight + self._vSpacing
+				nextX = x + itemSize.width() + self._hSpacing
+				lineHeight = 0
+
+			if not testOnly:
+				item.setGeometry(QRect(QPoint(x, y), itemSize))
+
+			x = nextX
+			lineHeight = max(lineHeight, itemSize.height())
+
+		return y + lineHeight - rect.y() + m.bottom()
+
+
+class _FlowContainer(QWidget):
+	"""Container widget that updates its minimum height from the FlowLayout when resized."""
+
+	def resizeEvent(self, event):
+		super().resizeEvent(event)
+		layout = self.layout()
+		if layout and hasattr(layout, 'heightForWidth'):
+			h = layout.heightForWidth(self.width())
+			if h >= 0:
+				self.setMinimumHeight(h)
 
 
 class SpoolControllerPanel(QDialog):
@@ -55,6 +161,9 @@ class SpoolControllerPanel(QDialog):
 
 		self._node = node
 		self._param_set_id_list = []
+		self._param_set_color_map = {}       # param_set_id -> color string
+		self._available_colors = list(_PARAM_SET_LIGHT_COLORS)  # colors not currently in use
+		self._param_set_dirty = {}            # param_set_id -> bool (True if any field was edited)
 
 		# Load the design constants definition file
 		self._design_const_set_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'DesignConstantsSet.json')
@@ -131,12 +240,10 @@ class SpoolControllerPanel(QDialog):
 		self._param_set_scroll_area.setWidgetResizable(True)
 		self._param_set_scroll_area.setFrameShape(QFrame.StyledPanel)
 		self._param_set_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-		self._param_set_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+		self._param_set_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-		self._param_set_container = QWidget()
-		self._param_set_container_layout = QVBoxLayout(self._param_set_container)
-		self._param_set_container_layout.setContentsMargins(5, 5, 5, 5)
-		self._param_set_container_layout.setAlignment(Qt.AlignTop)
+		self._param_set_container = _FlowContainer()
+		self._param_set_container_layout = FlowLayout(self._param_set_container, margin=2, hSpacing=4, vSpacing=4)
 		self._param_set_scroll_area.setWidget(self._param_set_container)
 
 		columns_grid.addWidget(self._param_set_scroll_area, 4, 0, 1, 2)
@@ -292,6 +399,7 @@ class SpoolControllerPanel(QDialog):
 
 		# Register this ID as being edited
 		self._param_set_id_list.append(param_set_id)
+		self._param_set_dirty[param_set_id] = False
 		self._add_param_set_editing_groupbox(param_set_id)
 
 	def _add_param_set_editing_groupbox(self, param_set_id):
@@ -303,19 +411,26 @@ class SpoolControllerPanel(QDialog):
 
 		groupbox = QGroupBox(f'{PARAM_SET_NAME} {param_set_id}', self._param_set_container)
 		groupbox.setFixedHeight(PARAM_SET_GROUPBOX_HEIGHT)
-		# Use scroll area width minus scrollbar width for consistent sizing
-		scrollbar_width = self._param_set_scroll_area.verticalScrollBar().sizeHint().width()
-		available_width = self._param_set_scroll_area.width() - scrollbar_width - self._param_set_container_layout.contentsMargins().left() - self._param_set_container_layout.contentsMargins().right()
-		groupbox.setFixedWidth(available_width // 2)
-		groupbox.setStyleSheet("""
-			QGroupBox {
+		groupbox.setFixedWidth(PARAM_SET_GROUPBOX_WIDTH)
+
+		# Pick a unique light background color
+		if self._available_colors:
+			color = random.choice(self._available_colors)
+			self._available_colors.remove(color)
+		else:
+			# All colors in use — pick a random one from the full palette
+			color = random.choice(_PARAM_SET_LIGHT_COLORS)
+		self._param_set_color_map[param_set_id] = color
+
+		groupbox.setStyleSheet(f"""
+			QGroupBox {{
 				border: 1px solid gray;
 				border-radius: 3px;
 				margin-top: 0px;
 				padding-top: 15px;
-				background-color: lightyellow;
-			}
-			QGroupBox::title {
+				background-color: {color};
+			}}
+			QGroupBox::title {{
 				subcontrol-origin: margin;
 				subcontrol-position: top left;
 				padding: 2px 5px;
@@ -323,7 +438,7 @@ class SpoolControllerPanel(QDialog):
 				border: 1px solid gray;
 				top: 0px;
 				left: 0px;
-			}
+			}}
 		""")
 
 		# Layout for groupbox
@@ -349,6 +464,7 @@ class SpoolControllerPanel(QDialog):
 		buttons_layout.addWidget(recall_button)
 
 		close_button = QPushButton('Close', groupbox)
+		close_button.clicked.connect(lambda: self._on_param_set_groupbox_close(param_set_id, groupbox))
 		buttons_layout.addWidget(close_button)
 
 		groupbox_layout.addLayout(buttons_layout, 0, 0)
@@ -385,7 +501,7 @@ class SpoolControllerPanel(QDialog):
 		param_set_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
 		param_set_fields_container = QWidget()
-		param_set_fields_container.setStyleSheet("background-color: lightyellow;")
+		param_set_fields_container.setStyleSheet(f"background-color: {color};")
 		param_set_fields_layout = QGridLayout(param_set_fields_container)
 		param_set_fields_layout.setColumnStretch(0, 0)
 		param_set_fields_layout.setColumnStretch(1, 1)
@@ -393,6 +509,10 @@ class SpoolControllerPanel(QDialog):
 		param_set_fields_layout.setContentsMargins(5, 0, 5, 0)
 
 		self._parse_param_set_file(param_set_id, param_set_fields_container, param_set_fields_layout)
+
+		# Mark groupbox dirty when any field textbox is edited
+		for textbox in param_set_fields_container.findChildren(QLineEdit):
+			textbox.textChanged.connect(lambda _text, _id=param_set_id: self._param_set_dirty.__setitem__(_id, True))
 
 		param_set_scroll.setWidget(param_set_fields_container)
 		groupbox_layout.addWidget(param_set_scroll, 1, 0, 1, 2)
@@ -407,8 +527,25 @@ class SpoolControllerPanel(QDialog):
 		@param    groupbox - The QGroupBox widget to remove.
 		@return   None
 		'''
+		# Prompt if any field was edited
+		if self._param_set_dirty.get(param_set_id, False):
+			result = QMessageBox.question(
+				self,
+				'Close ParamSet',
+				'A change was made to this ParamSet. Do you want to close the window anyway?',
+				QMessageBox.Yes | QMessageBox.No,
+				QMessageBox.No,
+			)
+			if result != QMessageBox.Yes:
+				return
+
+		self._param_set_dirty.pop(param_set_id, None)
 		if param_set_id in self._param_set_id_list:
 			self._param_set_id_list.remove(param_set_id)
+		# Return the color to the available pool
+		used_color = self._param_set_color_map.pop(param_set_id, None)
+		if used_color and used_color in _PARAM_SET_LIGHT_COLORS and used_color not in self._available_colors:
+			self._available_colors.append(used_color)
 		self._param_set_container_layout.removeWidget(groupbox)
 		groupbox.deleteLater()
 
