@@ -32,7 +32,7 @@
   <field name="spool_input_ack_observer_fault" type="bool" default="0" comment="" edit="true" />
   <field name="spool_input_load_acc" type="float16" default="0.0" comment="The rate of change of the angular velocity of the rotating spool drum (measured in rad/s²)" edit="true" />
   <field name="spool_input_load_dec" type="float16" default="0.0" comment="The rate at which the angular velocity of the spool drum decreases (measured in rad/s²)" edit="true" />
-  <field name="spool_input_req_shaft_ctrl_load" type="float16" default="0.0" comment="" edit="true" />
+  <field name="spool_input_req_shaft_ctrl_load" type="bool" default="0.0" comment="" edit="true" />
   <field name="spool_input_req_exec_hold" type="bool" default="0" comment="A flag for executing/stopping the current action" edit="true" />
   <field name="spool_input_target_ext" type="uint8" default="0" comment="The desired total length of cable to be deployed or unwound" edit="true" />
   <field name="spool_input_home_switch_activated" type="bool" default="0" comment="The endswitch which is triggered when the bobbin is in the house" edit="true" />

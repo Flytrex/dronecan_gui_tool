@@ -31,7 +31,7 @@
             "comment": "The lower threshold of rotational force that the motor is commanded or allowed to maintain",
             "color": "black"
         },
-        "max_torque": {
+        "max_torque_Nm": {
             "type": "float32",
             "default": 0,
             "comment": "The software or hardware limit on the rotational twisting force the motor can apply to the spool shaft",
