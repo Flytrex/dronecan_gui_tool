@@ -17,11 +17,12 @@ import dronecan
 from functools import partial
 from PyQt5.QtWidgets import QVBoxLayout, QLabel, QDialog, \
     QGridLayout, QPushButton, QComboBox, QHBoxLayout, QGroupBox, QCheckBox, QFileDialog, QApplication, QMessageBox, \
-    QSizePolicy
+    QSizePolicy, QMenu, QAction, QLineEdit, QDialogButtonBox
 from PyQt5.QtCore import QTimer, Qt, QObject, QThread, pyqtSignal, pyqtSlot, QMetaObject
 from logging import getLogger
 from ..widgets import BasicTable, make_icon_button, get_icon, node_properties
 from ..widgets.node_monitor import NodeTable
+from ..AutoTests.firmware_update_test import FirmwareUpdateTestDialog
 
 __all__ = 'PANEL_NAME', 'spawn', 'get_icon'
 
@@ -170,17 +171,35 @@ class _BmsAutoCheckTests:
         # Manual test state (kept simple per-test; avoids generic key maps)
         self._batteries_toggle_asked: bool = False
         self._batteries_toggle_answer: Optional[bool] = None
+        self._firmware_update_asked: bool = False
+        self._firmware_update_result: Optional[bool] = None
+        self._firmware_update_repeat: int = 1
+        self._firmware_update_dialog: Optional[FirmwareUpdateTestDialog] = None
 
     def _set_batteries_toggle_answer(self, answer: bool) -> None:
         with self._manual_lock:
             self._batteries_toggle_answer = bool(answer)
+
+    def _set_firmware_update_result(self, result: bool) -> None:
+        with self._manual_lock:
+            self._firmware_update_result = bool(result)
+
+    def reset(self) -> None:
+        '''Reset all manual test state for a fresh run.'''
+        with self._manual_lock:
+            self._batteries_toggle_asked = False
+            self._batteries_toggle_answer = None
+            self._firmware_update_asked = False
+            self._firmware_update_result = None
+            self._firmware_update_repeat = 1
+            self._firmware_update_dialog = None
 
     def critical_tests(self):
         # Timeout defaults are placeholders; adjust per test as you implement them.
         return [
             BmsTest(idx='1',  name='Batteries turn on and off normally', timeout_sec=30.0, callback=self._test_critical_1_batteries_toggle, critical=True),
             BmsTest(idx='2',  name='BQ communications work',            timeout_sec=30.0, callback=self._test_critical_2_bq_comms,          critical=True),
-            BmsTest(idx='3',  name='Firmware update works',             timeout_sec=90.0, callback=self._test_critical_3_firmware_update,  critical=True),
+            BmsTest(idx='3',  name='Firmware update works',             timeout_sec=3600.0, callback=self._test_critical_3_firmware_update,  critical=True),
             BmsTest(idx='4a', name='Board identification works',        timeout_sec=30.0, callback=self._test_critical_4a_board_id,        critical=True),
             BmsTest(idx='4b', name='Battery identification works',      timeout_sec=30.0, callback=self._test_critical_4b_battery_id,      critical=True),
             BmsTest(idx='5',  name='DroneCAN Parameters Check',         timeout_sec=60.0, callback=self._test_critical_5_param_check,      critical=True),
@@ -221,7 +240,15 @@ class _BmsAutoCheckTests:
         pass
 
     def _test_critical_3_firmware_update(self):
-        pass
+        with self._manual_lock:
+            if isinstance(self._firmware_update_result, bool):
+                return self._firmware_update_result
+
+            if not self._firmware_update_asked:
+                self._firmware_update_asked = True
+                self._ui.request_firmware_update_dialog.emit(self._firmware_update_repeat)
+
+        return None
 
     def _test_critical_4a_board_id(self):
         pass
@@ -310,6 +337,7 @@ class BmsNodeTable(NodeTable):
 class BMSAutoCheckPanel(QDialog):
 
     request_batteries_toggle_dialog = pyqtSignal()
+    request_firmware_update_dialog = pyqtSignal(int)
 
     def __init__(self, parent, node):
         super(BMSAutoCheckPanel, self).__init__(parent)
@@ -325,6 +353,8 @@ class BMSAutoCheckPanel(QDialog):
         self._runner_thread: Optional[QThread] = None
         self._runner_worker: Optional[_BmsTestRunnerWorker] = None
         self._is_running: bool = False
+        self._single_test_running: Optional[BmsTest] = None
+        self._selected_node_id: Optional[int] = None
 
         layout = QVBoxLayout(self)
 
@@ -345,6 +375,9 @@ class BMSAutoCheckPanel(QDialog):
         )
         self._test_table.setRowCount(0)
         self._test_table.setMinimumHeight(120)
+        self._test_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._test_table.customContextMenuRequested.connect(
+            lambda pos: self._on_table_context_menu(self._test_table, pos, is_critical=True))
 
         self._critical_tests: List[BmsTest] = list(self._tests.critical_tests())
         self._critical_row_by_id = {}
@@ -369,6 +402,9 @@ class BMSAutoCheckPanel(QDialog):
         )
         self._noncritical_table.setRowCount(0)
         self._noncritical_table.setMinimumHeight(120)
+        self._noncritical_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._noncritical_table.customContextMenuRequested.connect(
+            lambda pos: self._on_table_context_menu(self._noncritical_table, pos, is_critical=False))
 
         self._noncritical_tests: List[BmsTest] = list(self._tests.noncritical_tests())
 
@@ -396,6 +432,7 @@ class BMSAutoCheckPanel(QDialog):
         nodes_layout = QVBoxLayout(self._nodes_group)
 
         self._node_table = BmsNodeTable(self._nodes_group, node)
+        self._node_table.itemSelectionChanged.connect(self._on_node_selected)
         self._status_label = QLabel(self._nodes_group)
 
         nodes_layout.addWidget(self._node_table)
@@ -415,6 +452,126 @@ class BMSAutoCheckPanel(QDialog):
         self._update_status()
 
         self.request_batteries_toggle_dialog.connect(self._show_batteries_toggle_dialog)
+        self.request_firmware_update_dialog.connect(self._show_firmware_update_dialog)
+
+    def _on_node_selected(self) -> None:
+        '''Update _selected_node_id and test group title when a node row is selected.'''
+        selected = self._node_table.selectedItems()
+        if not selected:
+            self._selected_node_id = None
+            self._test_group.setTitle('BMS Test')
+            return
+
+        row = selected[0].row()
+        item = self._node_table.item(row, 0)
+        if item is not None:
+            self._selected_node_id = int(item.text())
+            self._test_group.setTitle(f'BMS Test (ID={self._selected_node_id})')
+
+    def _on_table_context_menu(self, table, pos, is_critical: bool) -> None:
+        '''Show a context menu with Run Test / Stop Test for the clicked row.'''
+        item = table.itemAt(pos)
+        if item is None:
+            return
+
+        row = item.row()
+        tests = self._critical_tests if is_critical else self._noncritical_tests
+        if row < 0 or row >= len(tests):
+            return
+
+        test = tests[row]
+        menu = QMenu(self)
+
+        # Check if this specific test is currently running
+        is_this_test_running = (
+            self._is_running
+            and self._single_test_running is not None
+            and self._single_test_running.idx == test.idx
+            and self._single_test_running.critical == test.critical
+        )
+
+        if is_this_test_running:
+            stop_action = QAction('Stop Test', self)
+            stop_action.triggered.connect(self._stop_runner)
+            menu.addAction(stop_action)
+        else:
+            run_action = QAction('Run Test', self)
+            run_action.triggered.connect(lambda: self._run_single_test(test))
+            if self._is_running:
+                run_action.setEnabled(False)
+            menu.addAction(run_action)
+
+            run_n_action = QAction('Run Test...', self)
+            run_n_action.triggered.connect(lambda: self._run_test_with_count(test))
+            if self._is_running:
+                run_n_action.setEnabled(False)
+            menu.addAction(run_n_action)
+
+        menu.exec_(table.viewport().mapToGlobal(pos))
+
+    def _show_run_count_dialog(self) -> Optional[int]:
+        '''Show a dialog asking for the number of test runs. Returns count or None if cancelled.'''
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Run Test')
+        layout = QVBoxLayout(dialog)
+
+        label = QLabel('Number Of Runs:', dialog)
+        layout.addWidget(label)
+
+        text_box = QLineEdit('1', dialog)
+        layout.addWidget(text_box)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dialog)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec_() == QDialog.Accepted:
+            try:
+                count = int(text_box.text())
+                if count > 0:
+                    return count
+            except ValueError:
+                pass
+        return None
+
+    def _run_test_with_count(self, test: BmsTest) -> None:
+        '''Show the run-count dialog, then run the test N times.'''
+        if self._is_running:
+            return
+        count = self._show_run_count_dialog()
+        if count is None:
+            return
+        self._run_single_test(test, repeat=count)
+
+    def _run_single_test(self, test: BmsTest, repeat: int = 1) -> None:
+        '''Run a test (optionally repeated) then continue with the remaining tests in the suite.'''
+        if self._is_running:
+            return
+
+        # Reset only the row for this test
+        self._set_test_row(test, 'Pending', '')
+
+        self._single_test_running = test
+        self._suite.set_tests([test] * repeat)
+        self._tests.reset()
+        self._tests._firmware_update_repeat = repeat
+
+        self._is_running = True
+        self._start_button.setText('Stop')
+        self._start_button.setEnabled(True)
+        logger.info('Starting single test: %s - %s', test.idx, test.name)
+
+        self._runner_thread = QThread(self)
+        self._runner_worker = _BmsTestRunnerWorker(self._suite)
+        self._runner_worker.moveToThread(self._runner_thread)
+
+        self._runner_thread.started.connect(self._runner_worker.run, Qt.QueuedConnection)
+        self._runner_worker.test_started.connect(self._on_test_started)
+        self._runner_worker.test_updated.connect(self._on_test_updated)
+        self._runner_worker.run_finished.connect(self._on_run_finished)
+
+        self._runner_thread.start()
 
     @pyqtSlot()
     def _show_batteries_toggle_dialog(self) -> None:
@@ -431,6 +588,26 @@ class BMSAutoCheckPanel(QDialog):
         )
 
         self._tests._set_batteries_toggle_answer(result == QMessageBox.Yes)
+
+    @pyqtSlot(int)
+    def _show_firmware_update_dialog(self, repeat: int) -> None:
+        if not self._is_running:
+            return
+
+        # Access file_server_widget from the main window (same pattern as other panels)
+        main_window = self.parent()
+        file_server_widget = getattr(main_window, '_file_server_widget', None)
+
+        dialog = FirmwareUpdateTestDialog(
+            repeat=repeat,
+            node=self._node,
+            target_node_id=self._selected_node_id,
+            file_server_widget=file_server_widget,
+            parent=self,
+        )
+        dialog.test_finished.connect(self._tests._set_firmware_update_result)
+        self._tests._firmware_update_dialog = dialog  # prevent GC
+        dialog.show()
 
     def _reset_test_tables(self) -> None:
         for row, test in enumerate(self._critical_tests):
@@ -465,6 +642,7 @@ class BMSAutoCheckPanel(QDialog):
 
         self._reset_test_tables()
         self._suite.reset()
+        self._tests.reset()
 
         # Mark running before starting the worker thread so queued UI prompts aren't ignored.
         self._is_running = True
@@ -488,7 +666,13 @@ class BMSAutoCheckPanel(QDialog):
             return
 
         if self._runner_worker is not None:
-            QMetaObject.invokeMethod(self._runner_worker, 'request_stop', Qt.QueuedConnection)
+            # Set the flag directly — the worker polls it in its loop.
+            # QueuedConnection won't work here because the worker's run()
+            # never returns to the thread's event loop.
+            self._runner_worker._stop_requested = True
+
+        # Synchronously clean up so the next Start works immediately
+        self._cleanup_runner()
 
     def _cleanup_runner(self) -> None:
         if self._runner_thread is not None:
@@ -497,6 +681,9 @@ class BMSAutoCheckPanel(QDialog):
             self._runner_thread = None
         self._runner_worker = None
         self._is_running = False
+        self._single_test_running = None
+        # Restore the full test list in case a single test was run
+        self._suite.set_tests(self._tests.all_tests())
         self._start_button.setText('Start')
         self._start_button.setEnabled(True)
 
