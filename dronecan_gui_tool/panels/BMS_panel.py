@@ -35,42 +35,70 @@ _singleton = None
 
 @dataclass(frozen=True)
 class BmsTest:
+    """
+    @brief          Immutable descriptor for a single BMS test.
+    @param[in]      idx             Short identifier (e.g. '1', '4a').
+    @param[in]      name            Human-readable test name.
+    @param[in]      timeout_sec     Maximum allowed time for the test.
+    @param[in]      callback        Callable that drives the test:
+                                    - Return True  -> test completed successfully
+                                    - Return False -> test failed
+                                    - Return None  -> test still running / not completed yet
+                                    Exceptions are treated as failure.
+    @param[in]      critical        Whether the test is critical.
+    """
     idx: str
     name: str
     timeout_sec: float
-    # Callback contract:
-    # - Return True  -> test completed successfully
-    # - Return False -> test failed
-    # - Return None  -> test still running / not completed yet
-    # Exceptions are treated as failure.
     callback: Callable[[], Optional[bool]]
     critical: bool
 
 
 class BmsTestSuite:
-    """Owns the BMS test definitions and tracks which test is currently running."""
+    """
+    @brief          Owns the BMS test definitions and tracks which test
+                    is currently running.
+    """
 
     def __init__(self):
+        """
+        @brief          Initialise with an empty test list.
+        """
         self._tests: Sequence[BmsTest] = []
         self._current_index: int = 0
         self._current_started_at: Optional[float] = None
 
     def reset(self) -> None:
-        """Start testing from the beginning (no current test running)."""
+        """
+        @brief          Start testing from the beginning (no current test running).
+        """
         self._current_index = 0
         self._current_started_at = None
 
     def set_tests(self, tests: Sequence[BmsTest]) -> None:
+        """
+        @brief          Replace the test list and reset to the beginning.
+        @param[in]      tests       Sequence of BmsTest to run.
+        """
         self._tests = list(tests)
         self.reset()
 
     def get_test(self) -> Optional[BmsTest]:
-        """Returns the currently running test (or the next test if not started yet)."""
+        """
+        @brief          Get the currently running test (or the next test
+                        if not started yet).
+        @return         The current BmsTest, or None if all tests finished.
+        """
         if self._current_index >= len(self._tests):
             return None
         return self._tests[self._current_index]
 
     def start_current(self) -> Optional[BmsTest]:
+        """
+        @brief          Mark the current test as started and record the
+                        start time.
+        @return         The started BmsTest, or None if no test to start.
+        """
         test = self.get_test()
         if test is None:
             return None
@@ -78,6 +106,11 @@ class BmsTestSuite:
         return test
 
     def is_current_timed_out(self) -> bool:
+        """
+        @brief          Check whether the current test has exceeded its
+                        timeout.
+        @return         True if timed out, False otherwise.
+        """
         test = self.get_test()
         if test is None:
             return False
@@ -86,7 +119,11 @@ class BmsTestSuite:
         return (time.monotonic() - self._current_started_at) > float(test.timeout_sec)
 
     def advance(self) -> Optional[BmsTest]:
-        """Mark current test as finished and move to the next test."""
+        """
+        @brief          Mark current test as finished and move to the
+                        next test.
+        @return         The next BmsTest, or None if all tests finished.
+        """
         if self._current_index < len(self._tests):
             self._current_index += 1
         self._current_started_at = None
@@ -94,11 +131,20 @@ class BmsTestSuite:
 
 
 class _BmsTestRunnerWorker(QObject):
+    """
+    @brief          Worker that runs on a QThread, polling the test suite
+                    and emitting progress signals.
+    """
     test_started = pyqtSignal(object)                 # BmsTest
     test_updated = pyqtSignal(object, str, str)       # BmsTest, status, elapsed_str
     run_finished = pyqtSignal(bool)                   # stopped
 
     def __init__(self, suite: BmsTestSuite, poll_interval_sec: float = 0.2):
+        """
+        @brief          Initialise the worker.
+        @param[in]      suite               BmsTestSuite to run.
+        @param[in]      poll_interval_sec   Seconds between callback polls.
+        """
         super().__init__()
         self._suite = suite
         self._poll_interval_sec = float(poll_interval_sec)
@@ -106,10 +152,18 @@ class _BmsTestRunnerWorker(QObject):
 
     @pyqtSlot()
     def request_stop(self) -> None:
+        """
+        @brief          Request the worker to stop after the current poll.
+        """
         self._stop_requested = True
 
     @pyqtSlot()
     def run(self) -> None:
+        """
+        @brief          Main loop executed on the worker thread. Polls each
+                        test callback in sequence, emitting signals for
+                        progress and completion.
+        """
         try:
             logger.info('BMS test runner thread started')
             while True:
@@ -164,7 +218,16 @@ class _BmsTestRunnerWorker(QObject):
             return
 
 class _BmsAutoCheckTests:
+    """
+    @brief          Holds all BMS test definitions and manual-test state.
+    """
     def __init__(self, node, ui):
+        """
+        @brief          Initialise test definitions and manual-test state.
+        @param[in]      node    Local DroneCAN node instance.
+        @param[in]      ui      The BMSAutoCheckPanel (used for emitting
+                                UI prompt signals).
+        """
         self._node = node
         self._ui = ui
         self._manual_lock = Lock()
@@ -177,15 +240,25 @@ class _BmsAutoCheckTests:
         self._firmware_update_dialog: Optional[FirmwareUpdateTestDialog] = None
 
     def _set_batteries_toggle_answer(self, answer: bool) -> None:
+        """
+        @brief          Record the user's answer to the batteries-toggle prompt.
+        @param[in]      answer      True if batteries toggled normally.
+        """
         with self._manual_lock:
             self._batteries_toggle_answer = bool(answer)
 
     def _set_firmware_update_result(self, result: bool) -> None:
+        """
+        @brief          Record the firmware update test result.
+        @param[in]      result      True if the FW update test passed.
+        """
         with self._manual_lock:
             self._firmware_update_result = bool(result)
 
     def reset(self) -> None:
-        '''Reset all manual test state for a fresh run.'''
+        """
+        @brief          Reset all manual test state for a fresh run.
+        """
         with self._manual_lock:
             self._batteries_toggle_asked = False
             self._batteries_toggle_answer = None
@@ -195,6 +268,10 @@ class _BmsAutoCheckTests:
             self._firmware_update_dialog = None
 
     def critical_tests(self):
+        """
+        @brief          Return the list of critical BmsTest definitions.
+        @return         List of BmsTest with critical=True.
+        """
         # Timeout defaults are placeholders; adjust per test as you implement them.
         return [
             BmsTest(idx='1',  name='Batteries turn on and off normally', timeout_sec=30.0, callback=self._test_critical_1_batteries_toggle, critical=True),
@@ -208,6 +285,10 @@ class _BmsAutoCheckTests:
         ]
 
     def noncritical_tests(self):
+        """
+        @brief          Return the list of non-critical BmsTest definitions.
+        @return         List of BmsTest with critical=False.
+        """
         return [
             BmsTest(idx='1',  name='Smart Charger',                        timeout_sec=60.0, callback=self._test_noncritical_1_smart_charger,        critical=False),
             BmsTest(idx='1a', name='Pre-0.8: Full Charge',                 timeout_sec=60.0, callback=self._test_noncritical_1a_pre08_full_charge,   critical=False),
@@ -218,14 +299,21 @@ class _BmsAutoCheckTests:
         ]
 
     def all_tests(self):
+        """
+        @brief          Return all tests (critical followed by non-critical).
+        @return         Combined list of all BmsTest definitions.
+        """
         return list(self.critical_tests()) + list(self.noncritical_tests())
 
     # --- Critical test callbacks (placeholders) ---
     def _test_critical_1_batteries_toggle(self):
-        # Called repeatedly by the worker thread. Non-blocking:
-        # - schedules a UI dialog once
-        # - returns None until the user answers
-        # - then returns True/False
+        """
+        @brief          Critical test 1: Batteries turn on and off normally.
+                        Called repeatedly by the worker thread (non-blocking).
+                        Schedules a UI dialog once, then returns None until
+                        the user answers. Returns True/False afterwards.
+        @return         True if passed, False if failed, None if pending.
+        """
         with self._manual_lock:
             if isinstance(self._batteries_toggle_answer, bool):
                 return self._batteries_toggle_answer
@@ -237,9 +325,19 @@ class _BmsAutoCheckTests:
         return None
 
     def _test_critical_2_bq_comms(self):
+        """
+        @brief          Critical test 2: BQ communications work.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_critical_3_firmware_update(self):
+        """
+        @brief          Critical test 3: Firmware update works.
+                        Schedules a FirmwareUpdateTestDialog once, then
+                        returns None until the dialog finishes.
+        @return         True if passed, False if failed, None if pending.
+        """
         with self._manual_lock:
             if isinstance(self._firmware_update_result, bool):
                 return self._firmware_update_result
@@ -251,43 +349,95 @@ class _BmsAutoCheckTests:
         return None
 
     def _test_critical_4a_board_id(self):
+        """
+        @brief          Critical test 4a: Board identification works.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_critical_4b_battery_id(self):
+        """
+        @brief          Critical test 4b: Battery identification works.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_critical_5_param_check(self):
+        """
+        @brief          Critical test 5: DroneCAN Parameters Check.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_critical_6_backcompat(self):
+        """
+        @brief          Critical test 6: Backwards Compatibility Check.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_critical_7_lifetime_tracker(self):
+        """
+        @brief          Critical test 7: Lifetime Charge Tracker Validation.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
-    # --- Non-critical test callbacks (placeholders) ---
     def _test_noncritical_1_smart_charger(self):
+        """
+        @brief          Non-critical test 1: Smart Charger.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_noncritical_1a_pre08_full_charge(self):
+        """
+        @brief          Non-critical test 1a: Pre-0.8 Full Charge.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_noncritical_1b_post08_initial_reset(self):
+        """
+        @brief          Non-critical test 1b: Post-0.8 Initial Charge Reset.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_noncritical_1c_post08_alt_control(self):
+        """
+        @brief          Non-critical test 1c: Post-0.8 Alternate Charging Control.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_noncritical_2_atp_complete(self):
+        """
+        @brief          Non-critical test 2: ATP can be completed.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
     def _test_noncritical_3_voltage_protection(self):
+        """
+        @brief          Non-critical test 3: Voltage protection works.
+        @return         True if passed, False if failed, None if pending.
+        """
         pass
 
 
 class BmsNodeTable(NodeTable):
+    """
+    @brief          Node table filtered to show only BMS nodes.
+    """
     @staticmethod
     def _name_contains_bms(entry) -> bool:
+        """
+        @brief          Check whether a node monitor entry has 'bms'
+                        in its name.
+        @param[in]      entry       Node monitor entry to inspect.
+        @return         True if the entry name contains 'bms' (case-insensitive).
+        """
         if not getattr(entry, 'info', None) or not getattr(entry.info, 'name', None):
             return False
 
@@ -300,6 +450,10 @@ class BmsNodeTable(NodeTable):
         return 'bms' in name.lower()
 
     def _update(self):
+        """
+        @brief          Refresh the table rows to match the current set
+                        of online BMS nodes.
+        """
         all_nodes = self._monitor.find_all(lambda _: True)
         known_nodes = {e.node_id: e for e in all_nodes if self._name_contains_bms(e)}
 
@@ -335,11 +489,21 @@ class BmsNodeTable(NodeTable):
             self.set_row(row, known_nodes[nid])
 
 class BMSAutoCheckPanel(QDialog):
+    """
+    @brief          Main panel dialog for BMS automated testing.
+                    Contains critical / non-critical test tables, a node
+                    table, and Start/Stop controls.
+    """
 
     request_batteries_toggle_dialog = pyqtSignal()
     request_firmware_update_dialog = pyqtSignal(int)
 
     def __init__(self, parent, node):
+        """
+        @brief          Initialise the BMS Auto Check panel.
+        @param[in]      parent      Parent QWidget.
+        @param[in]      node        Local DroneCAN node instance.
+        """
         super(BMSAutoCheckPanel, self).__init__(parent)
         self.setWindowTitle(PANEL_NAME)
         self.setAttribute(Qt.WA_DeleteOnClose)              # This is required to stop background timers!
@@ -455,7 +619,10 @@ class BMSAutoCheckPanel(QDialog):
         self.request_firmware_update_dialog.connect(self._show_firmware_update_dialog)
 
     def _on_node_selected(self) -> None:
-        '''Update _selected_node_id and test group title when a node row is selected.'''
+        """
+        @brief          Update _selected_node_id and test group title
+                        when a node row is selected.
+        """
         selected = self._node_table.selectedItems()
         if not selected:
             self._selected_node_id = None
@@ -469,7 +636,13 @@ class BMSAutoCheckPanel(QDialog):
             self._test_group.setTitle(f'BMS Test (ID={self._selected_node_id})')
 
     def _on_table_context_menu(self, table, pos, is_critical: bool) -> None:
-        '''Show a context menu with Run Test / Stop Test for the clicked row.'''
+        """
+        @brief          Show a context menu with Run Test / Stop Test for
+                        the clicked row.
+        @param[in]      table           The BasicTable that was right-clicked.
+        @param[in]      pos             Click position inside the table viewport.
+        @param[in]      is_critical     True if the table is the critical-test table.
+        """
         item = table.itemAt(pos)
         if item is None:
             return
@@ -510,7 +683,10 @@ class BMSAutoCheckPanel(QDialog):
         menu.exec_(table.viewport().mapToGlobal(pos))
 
     def _show_run_count_dialog(self) -> Optional[int]:
-        '''Show a dialog asking for the number of test runs. Returns count or None if cancelled.'''
+        """
+        @brief          Show a dialog asking for the number of test runs.
+        @return         The requested count, or None if cancelled.
+        """
         dialog = QDialog(self)
         dialog.setWindowTitle('Run Test')
         layout = QVBoxLayout(dialog)
@@ -536,7 +712,10 @@ class BMSAutoCheckPanel(QDialog):
         return None
 
     def _run_test_with_count(self, test: BmsTest) -> None:
-        '''Show the run-count dialog, then run the test N times.'''
+        """
+        @brief          Show the run-count dialog, then run the test N times.
+        @param[in]      test    The BmsTest to run.
+        """
         if self._is_running:
             return
         count = self._show_run_count_dialog()
@@ -545,7 +724,12 @@ class BMSAutoCheckPanel(QDialog):
         self._run_single_test(test, repeat=count)
 
     def _run_single_test(self, test: BmsTest, repeat: int = 1) -> None:
-        '''Run a test (optionally repeated) then continue with the remaining tests in the suite.'''
+        """
+        @brief          Run a test (optionally repeated) using a dedicated
+                        worker thread.
+        @param[in]      test    The BmsTest to run.
+        @param[in]      repeat  Number of times to repeat the test.
+        """
         if self._is_running:
             return
 
@@ -575,7 +759,10 @@ class BMSAutoCheckPanel(QDialog):
 
     @pyqtSlot()
     def _show_batteries_toggle_dialog(self) -> None:
-        # If the run was stopped before we got scheduled, ignore.
+        """
+        @brief          Show a Yes/No dialog asking whether the batteries
+                        toggled on and off normally.
+        """
         if not self._is_running:
             return
 
@@ -591,6 +778,10 @@ class BMSAutoCheckPanel(QDialog):
 
     @pyqtSlot(int)
     def _show_firmware_update_dialog(self, repeat: int) -> None:
+        """
+        @brief          Open a FirmwareUpdateTestDialog for the selected node.
+        @param[in]      repeat      Number of firmware update cycles.
+        """
         if not self._is_running:
             return
 
@@ -610,6 +801,9 @@ class BMSAutoCheckPanel(QDialog):
         dialog.show()
 
     def _reset_test_tables(self) -> None:
+        """
+        @brief          Reset all rows in both test tables to 'Pending'.
+        """
         for row, test in enumerate(self._critical_tests):
             if row < len(self._critical_row_data):
                 self._critical_row_data[row].update({'idx': test.idx, 'name': test.name, 'status': 'Pending', 'time': ''})
@@ -621,6 +815,12 @@ class BMSAutoCheckPanel(QDialog):
                 self._noncritical_table.set_row(row, self._noncritical_row_data[row])
 
     def _set_test_row(self, test: BmsTest, status: str, elapsed_str: str) -> None:
+        """
+        @brief          Update a single test row in the appropriate table.
+        @param[in]      test            The BmsTest whose row to update.
+        @param[in]      status          Status text (e.g. 'Running', 'Pass', 'Failed').
+        @param[in]      elapsed_str     Formatted elapsed time string.
+        """
         idx_key = str(test.idx)
 
         if test.critical:
@@ -637,6 +837,10 @@ class BMSAutoCheckPanel(QDialog):
             self._noncritical_table.set_row(row, self._noncritical_row_data[row])
 
     def _start_runner(self) -> None:
+        """
+        @brief          Reset the suite and start the full test run on a
+                        worker thread.
+        """
         if self._is_running:
             return
 
@@ -662,6 +866,9 @@ class BMSAutoCheckPanel(QDialog):
         self._runner_thread.start()
 
     def _stop_runner(self) -> None:
+        """
+        @brief          Request the worker to stop and clean up the thread.
+        """
         if not self._is_running:
             return
 
@@ -675,6 +882,9 @@ class BMSAutoCheckPanel(QDialog):
         self._cleanup_runner()
 
     def _cleanup_runner(self) -> None:
+        """
+        @brief          Terminate the worker thread and restore UI state.
+        """
         if self._runner_thread is not None:
             self._runner_thread.quit()
             self._runner_thread.wait(1500)
@@ -688,6 +898,9 @@ class BMSAutoCheckPanel(QDialog):
         self._start_button.setEnabled(True)
 
     def _on_start_stop_clicked(self):
+        """
+        @brief          Handle Start/Stop button click.
+        """
         if self._is_running:
             self._stop_runner()
         else:
@@ -695,18 +908,34 @@ class BMSAutoCheckPanel(QDialog):
 
     @pyqtSlot(object)
     def _on_test_started(self, test: BmsTest) -> None:
+        """
+        @brief          Slot called when a test starts running.
+        @param[in]      test    The BmsTest that just started.
+        """
         self._set_test_row(test, 'Running', '0.0s')
 
     @pyqtSlot(object, str, str)
     def _on_test_updated(self, test: BmsTest, status: str, elapsed_str: str) -> None:
+        """
+        @brief          Slot called when a test's status or timer updates.
+        @param[in]      test            The BmsTest being updated.
+        @param[in]      status          Current status text.
+        @param[in]      elapsed_str     Formatted elapsed time.
+        """
         self._set_test_row(test, status, elapsed_str)
 
     @pyqtSlot(bool)
     def _on_run_finished(self, stopped: bool) -> None:
-        # If stopped is False, the run completed or failed (worker already set Failed status on failure).
+        """
+        @brief          Slot called when the worker thread finishes.
+        @param[in]      stopped     True if the run was stopped by the user.
+        """
         self._cleanup_runner()
 
     def _update_status(self):
+        """
+        @brief          Refresh the discovery status label.
+        """
         if self._node.is_anonymous:
             self._status_label.setText('Discovery is not possible - local node is configured in anonymous mode')
         else:
@@ -721,6 +950,11 @@ class BMSAutoCheckPanel(QDialog):
         _singleton = None
 
     def closeEvent(self, event):
+        """
+        @brief          Clean up timers, handlers, and the worker thread
+                        when the panel is closed.
+        @param[in]      event       The QCloseEvent.
+        """
         global _singleton
         _singleton = None
 
@@ -756,6 +990,12 @@ class BMSAutoCheckPanel(QDialog):
 
 
 def spawn(parent, node):
+    """
+    @brief          Create or raise the singleton BMSAutoCheckPanel.
+    @param[in]      parent      Parent QWidget.
+    @param[in]      node        Local DroneCAN node instance.
+    @return         The panel instance.
+    """
     global _singleton
     if _singleton is None:
         _singleton = BMSAutoCheckPanel(parent, node)

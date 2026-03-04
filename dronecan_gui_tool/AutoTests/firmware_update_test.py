@@ -2,7 +2,7 @@ import os
 from logging import getLogger
 
 import dronecan
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QLineEdit, QFileDialog, QProgressBar
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QLineEdit, QFileDialog, QProgressBar, QMessageBox
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 
 from dronecan_gui_tool.widgets.file_server import FileServer_PathKey
@@ -13,17 +13,25 @@ REQUEST_PRIORITY = 30
 
 
 class FirmwareUpdateTestDialog(QDialog):
-    """Dialog for the firmware update test.
-
-    Shows OK / Cancel buttons.
-    - OK starts the test (dialog stays open until the test finishes).
-    - Cancel aborts the test immediately.
-    The dialog closes automatically when the test completes.
+    """
+    @brief          Dialog for the firmware update test.
+                    Shows OK / Cancel buttons.
+                    - OK starts the test (dialog stays open until the test finishes).
+                    - Cancel aborts the test immediately.
+                    The dialog closes automatically when the test completes.
     """
 
     test_finished = pyqtSignal(bool)  # True = pass, False = fail
 
     def __init__(self, repeat: int = 1, node=None, target_node_id=None, file_server_widget=None, parent=None):
+        """
+        @brief          Initialise the firmware update test dialog.
+        @param[in]      repeat              Number of firmware update cycles to run.
+        @param[in]      node                Local DroneCAN node instance.
+        @param[in]      target_node_id      Node ID of the target device.
+        @param[in]      file_server_widget  File server widget for serving firmware.
+        @param[in]      parent              Parent QWidget.
+        """
         super().__init__(parent)
         self.setWindowTitle('Firmware Update Test (0/%d)' % max(1, repeat))
         self.setModal(False)
@@ -94,6 +102,9 @@ class FirmwareUpdateTestDialog(QDialog):
         self._last_target_uptime = None
 
     def _on_load_file1(self):
+        """
+        @brief          Open a file dialog to select firmware file 1.
+        """
         path, _ = QFileDialog.getOpenFileName(
             self, 'Select Firmware File', '', 'BIN Files (*.bin);;All Files (*)')
         if path:
@@ -101,6 +112,9 @@ class FirmwareUpdateTestDialog(QDialog):
             self._file1_load_button.setToolTip(path)
 
     def _on_load_file2(self):
+        """
+        @brief          Open a file dialog to select firmware file 2.
+        """
         path, _ = QFileDialog.getOpenFileName(
              self, 'Select Firmware File', '', 'BIN Files (*.bin);;All Files (*)')
         if path:
@@ -108,12 +122,27 @@ class FirmwareUpdateTestDialog(QDialog):
             self._file2_load_button.setToolTip(path)
 
     def _on_ok(self):
+        """
+        @brief          Handle OK button click. Validates file selection
+                        and starts the firmware update test.
+        """
         if self._test_started:
             return
 
         fw_file = self._file1_textbox.text().strip()
         if not fw_file:
             return
+
+        if self._repeat > 1:
+            fw_file2 = self._file2_textbox.text().strip()
+            if not fw_file or not fw_file2:
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Warning)
+                msg.setWindowTitle('Missing File')
+                msg.setText('Two files need to be selected when the number of tests is above 1')
+                msg.setStandardButtons(QMessageBox.Ok)
+                msg.exec_()
+                return
 
         self._test_started = True
         self._ok_button.setEnabled(False)
@@ -123,12 +152,18 @@ class FirmwareUpdateTestDialog(QDialog):
         self._run_firmware_update()
 
     def _on_cancel(self):
+        """
+        @brief          Handle Cancel button click. Aborts the test and closes the dialog.
+        """
         self._result = False
         self.test_finished.emit(False)
         self.close()
 
     def _run_firmware_update(self):
-        """Start (or continue) the firmware update sequence for the current run."""
+        """
+        @brief          Start (or continue) the firmware update sequence
+                        for the current run.
+        """
         if self._current_run >= self._repeat:
             logger.info('FW_TEST [node %s] All %d runs completed — finishing with success',
                         self._target_node_id, self._repeat)
@@ -199,7 +234,10 @@ class FirmwareUpdateTestDialog(QDialog):
         # --- Phase 1 helpers: initiate the update ---
 
         def on_update_accepted():
-            """Node accepted the firmware update.  Stop sending requests, wait for transfer + reboot."""
+            """
+            @brief      Handle node accepting the firmware update. Stops
+                        sending requests and waits for transfer + reboot.
+            """
             if self._closed:
                 logger.debug('on_update_accepted: ignored (dialog closed)')
                 return
@@ -217,7 +255,10 @@ class FirmwareUpdateTestDialog(QDialog):
         # --- Phase 2 helper: transfer done, node rebooted ---
 
         def on_run_complete():
-            """Called when the node reboots after the firmware update."""
+            """
+            @brief      Handle run completion when the node reboots
+                        after the firmware update.
+            """
             if self._closed:
                 logger.debug('on_run_complete: ignored (dialog closed)')
                 return
@@ -344,7 +385,10 @@ class FirmwareUpdateTestDialog(QDialog):
     # --- File-transfer progress helpers ---
 
     def _install_transfer_hook(self):
-        """Register a transfer hook to monitor incoming file.Read requests from the target node."""
+        """
+        @brief          Register a transfer hook to monitor incoming
+                        file.Read requests from the target node.
+        """
         self._uninstall_transfer_hook()
         if self._node is None:
             return
@@ -366,7 +410,9 @@ class FirmwareUpdateTestDialog(QDialog):
         self._transfer_hook_handle = self._node.add_transfer_hook(on_transfer)
 
     def _uninstall_transfer_hook(self):
-        """Remove the transfer hook."""
+        """
+        @brief          Remove the transfer hook.
+        """
         if self._transfer_hook_handle is not None:
             try:
                 self._transfer_hook_handle.remove()
@@ -375,7 +421,10 @@ class FirmwareUpdateTestDialog(QDialog):
             self._transfer_hook_handle = None
 
     def _update_transfer_progress(self):
-        """Called by QTimer — safely updates the progress bar from the Qt thread."""
+        """
+        @brief          Update the progress bar from the Qt thread.
+                        Called by the QTimer periodically.
+        """
         if self._closed or self._fw_file_size <= 0:
             return
         frac = min(self._fw_max_offset / self._fw_file_size, 1.0)
@@ -385,7 +434,9 @@ class FirmwareUpdateTestDialog(QDialog):
     # --- DroneCAN handler cleanup ---
 
     def _cleanup_handlers(self):
-        """Remove any pending DroneCAN handlers."""
+        """
+        @brief          Remove any pending DroneCAN handlers.
+        """
         if self._deferred_request_handle is not None:
             self._deferred_request_handle.remove()
             self._deferred_request_handle = None
@@ -397,7 +448,10 @@ class FirmwareUpdateTestDialog(QDialog):
             self._timeout_handle = None
 
     def _finish_test(self, success: bool):
-        """Call this when the firmware update finishes."""
+        """
+        @brief          Finalise the firmware update test.
+        @param[in]      success     True if the test passed, False otherwise.
+        """
         if self._closed:
             logger.debug('_finish_test(%s): ignored (dialog already closed)', success)
             return
@@ -413,6 +467,11 @@ class FirmwareUpdateTestDialog(QDialog):
         self.close()
 
     def closeEvent(self, event):
+        """
+        @brief          Handle the dialog close event. Cleans up handlers
+                        and emits failure if no result was set.
+        @param[in]      event       The QCloseEvent.
+        """
         logger.debug('FW_TEST closeEvent: result=%s, closed=%s', self._result, self._closed)
         self._closed = True
         self._progress_timer.stop()
