@@ -18,7 +18,7 @@ import json
 import random
 import xml.etree.ElementTree as ET
 
-from PyQt5.QtCore import Qt, QRect, QSize, QPoint
+from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer
 from PyQt5.QtGui import QIntValidator, QColor, QFont
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
 	QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy, QFrame, QScrollArea, QWidget, QLayout, QMessageBox
@@ -28,20 +28,21 @@ from ..widgets import get_icon, show_error
 
 __all__ = 'PANEL_NAME', 'spawn', 'get_icon'
 
-PANEL_NAME = 'Spool Controller'
-SPOOL_CONTROLLER_TUNE_NAME = 'Spool Controller Tuning'
-PARAM_FILE_MANAGE_NAME = 'Parameter File Management'
-DESIGN_CONSTANTS_TUNE_NAME = 'DesignConstantsSet Tuning'
-DESIGN_CONSTANTS_SET_NAME = 'DesignConstantsSet'
-PARAM_SET_EDIT_NAME = 'ParamSet Editing'
-PARAM_SET_ID_NAME = 'ParamSet ID'
-PARAM_SET_NAME = 'ParamSet'
+PANEL_NAME = 'Spool Controller'                    # Main panel window title
+SPOOL_CONTROLLER_TUNE_NAME = 'Spool Controller Tuning'  # Header label for the tuning section
+PARAM_FILE_MANAGE_NAME = 'Parameter File Management'    # Label for the file upload/download section
+DESIGN_CONSTANTS_TUNE_NAME = 'DesignConstantsSet Tuning'  # Label for the design constants section header
+DESIGN_CONSTANTS_SET_NAME = 'DesignConstantsSet'    # Title of the design constants groupbox
+PARAM_SET_EDIT_NAME = 'ParamSet Editing'            # Label for the ParamSet editing section
+PARAM_SET_ID_NAME = 'ParamSet ID'                   # Label next to the ParamSet ID textbox
+PARAM_SET_NAME = 'ParamSet'                         # Prefix for individual ParamSet groupbox titles
 
-BUTTON_HORIZONTAL_SPACING = 3
-PARAM_SET_GROUPBOX_HEIGHT = 200
-PARAM_SET_GROUPBOX_WIDTH = 400
+BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) between buttons in button rows
+PARAM_SET_GROUPBOX_HEIGHT = 200                     # Fixed height (px) for each ParamSet editing groupbox
+PARAM_SET_GROUPBOX_WIDTH = 400                      # Fixed width (px) for each ParamSet editing groupbox
+RECALL_TIMEOUT_SEC = 3                              # Seconds to wait for a report message after sending a recall command before showing a timeout warning
 
-_PARAM_SET_LIGHT_COLORS = [
+_PARAM_SET_LIGHT_COLORS = [                         # Pool of light background colors assigned to ParamSet groupboxes
 	'#FFFFCC',  # light yellow
 	'#CCFFCC',  # light green
 	'#CCE5FF',  # light blue
@@ -159,19 +160,26 @@ class SpoolControllerPanel(QDialog):
 		self.resize(900, 600)
 		self.setMinimumSize(700, 400)
 
-		self._node = node
-		self._param_set_id_list = []
-		self._param_set_color_map = {}       # param_set_id -> color string
-		self._available_colors = list(_PARAM_SET_LIGHT_COLORS)  # colors not currently in use
-		self._param_set_dirty = {}            # param_set_id -> bool (True if any field was edited)
-		self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLineEdit, type_str)}
+		self._node = node                      # Local DroneCAN node used for broadcasting messages and registering handlers
+		self._param_set_id_list = []           # List of ParamSet IDs currently being edited
+		self._param_set_color_map = {}         # param_set_id -> background color string assigned to its groupbox
+		self._available_colors = list(_PARAM_SET_LIGHT_COLORS)  # Colors from the palette not currently assigned to any groupbox
+		self._param_set_dirty = {}             # param_set_id -> bool indicating whether any field was edited since opening
+		self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLineEdit, type_str)} for each ParamSet groupbox
+		self._param_set_groupboxes = {}        # param_set_id -> QGroupBox widget for each ParamSet editing groupbox
 
 		# Load the design constants definition file
 		self._design_const_set_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'DesignConstantsSet.json')
-		self._design_constants_fields = self._load_design_constants_fields()
+		self._design_constants_fields = self._load_design_constants_fields()  # Parsed DesignConstantsSet.json field definitions
 		# Load the param set definition file
 		self._param_set_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'ParamSet.json')
-		self._param_set_fields = self._load_param_set_fields()
+		self._param_set_fields = self._load_param_set_fields()  # Parsed ParamSet.json field definitions
+
+		self._recall_response_handle = None            # DroneCAN handler handle for DesignConstantsSet (active during recall)
+		self._recall_constants_timeout_timer = None    # QTimer for DesignConstantsSet recall timeout
+
+		self._recall_param_set_handle = None           # Shared DroneCAN handler for ParamSet responses (active when any ParamSet recall is pending)
+		self._pending_param_set_recalls = {}           # param_set_id -> QTimer for each pending ParamSet recall
 
 		self._setup_ui()
 
@@ -283,7 +291,6 @@ class SpoolControllerPanel(QDialog):
 
 		upload_row = QHBoxLayout()
 		self._upload_button = QPushButton('Upload', parent)
-		self._upload_button.setStyleSheet("background-color: lightblue;")
 		self._upload_button.setFixedWidth(BUTTON_WIDTH)
 		upload_row.addWidget(self._upload_button)
 
@@ -291,7 +298,6 @@ class SpoolControllerPanel(QDialog):
 		upload_row.addWidget(self._upload_textbox)
 
 		self._upload_browse_button = QPushButton('Browse', parent)
-		self._upload_browse_button.setStyleSheet("background-color: lightblue;")
 		self._upload_browse_button.setFixedWidth(BUTTON_WIDTH)
 		self._upload_browse_button.clicked.connect(self._on_upload_browse_clicked)
 		upload_row.addWidget(self._upload_browse_button)
@@ -299,7 +305,6 @@ class SpoolControllerPanel(QDialog):
 
 		download_row = QHBoxLayout()
 		self._download_button = QPushButton('Download', parent)
-		self._download_button.setStyleSheet("background-color: lightblue;")
 		self._download_button.setFixedWidth(BUTTON_WIDTH)
 		self._download_button.clicked.connect(self._on_download_clicked)
 		download_row.addWidget(self._download_button)
@@ -308,7 +313,6 @@ class SpoolControllerPanel(QDialog):
 		download_row.addWidget(self._download_textbox)
 
 		self._download_browse_button = QPushButton('Browse', parent)
-		self._download_browse_button.setStyleSheet("background-color: lightblue;")
 		self._download_browse_button.setFixedWidth(BUTTON_WIDTH)
 		self._download_browse_button.clicked.connect(self._on_download_clicked)
 		download_row.addWidget(self._download_browse_button)
@@ -411,6 +415,7 @@ class SpoolControllerPanel(QDialog):
 		'''
 
 		groupbox = QGroupBox(f'{PARAM_SET_NAME} {param_set_id}', self._param_set_container)
+		self._param_set_groupboxes[param_set_id] = groupbox
 		groupbox.setFixedHeight(PARAM_SET_GROUPBOX_HEIGHT)
 		groupbox.setFixedWidth(PARAM_SET_GROUPBOX_WIDTH)
 
@@ -545,6 +550,7 @@ class SpoolControllerPanel(QDialog):
 
 		self._param_set_dirty.pop(param_set_id, None)
 		self._param_set_field_inputs.pop(param_set_id, None)
+		self._param_set_groupboxes.pop(param_set_id, None)
 		if param_set_id in self._param_set_id_list:
 			self._param_set_id_list.remove(param_set_id)
 		# Return the color to the available pool
@@ -679,18 +685,63 @@ class SpoolControllerPanel(QDialog):
 
 	def _on_param_set_recall(self, param_set_id):
 		'''
-		@brief    Handle Recall button click: broadcast a flytrex.delcon.ParamSet message with OPERATION_RECALL.
+		@brief    Handle Recall button click: broadcast a flytrex.delcon.ParamSet message with OPERATION_RECALL
+		          and register a listener for ParamSet OPERATION_RESPONSE.
+		          Each groupbox recall is independent — multiple recalls can be pending simultaneously.
 		@param    param_set_id - The ParamSet ID to recall.
 		@return   None
 		'''
+		# If this param_set_id already has a pending recall, clean it up first
+		self._cleanup_param_set_recall(param_set_id)
+
+		# Disable the groupbox while waiting for the response
+		groupbox = self._param_set_groupboxes.get(param_set_id)
+		if groupbox is not None:
+			groupbox.setEnabled(False)
 
 		self._send_param_set_msg(param_set_id, 'OPERATION_RECALL')
 
+		# Register the shared handler if this is the first pending recall
+		if not self._pending_param_set_recalls and self._recall_param_set_handle is None:
+			try:
+				self._recall_param_set_handle = self._node.add_handler(
+					dronecan.flytrex.delcon.ParamSet,
+					self._on_param_set_response,
+				)
+			except Exception as ex:
+				logger.exception('Could not register ParamSet handler: %s', ex)
+				if groupbox is not None:
+					groupbox.setEnabled(True)
+				return
+
+		# Start a per-ID timeout timer
+		timer = QTimer(self)
+		timer.setSingleShot(True)
+		timer.timeout.connect(
+			lambda _id=param_set_id: (
+				self._cleanup_param_set_recall(_id),
+				self._on_recall_timeout(
+					f'No ParamSet OPERATION_RESPONSE for ParamSet ID {_id} was received within {RECALL_TIMEOUT_SEC} seconds.\n\n'
+					f'The spool controller may be offline or not responding.'
+				),
+			)
+		)
+		self._pending_param_set_recalls[param_set_id] = timer
+		timer.start(RECALL_TIMEOUT_SEC * 1000)
+
 	def _on_design_constants_recall(self):
 		'''
-		@brief    Handle Recall button click: broadcast a flytrex.delcon.DesignConstantsSet message with OPERATION_RECALL.
+		@brief    Handle Recall button click: broadcast a flytrex.delcon.DesignConstantsSet message with OPERATION_RECALL
+		          and register a 3-second listener for DesignConstantsSet.
 		@return   None
 		'''
+		# Clean up any previous recall listener
+		self._cleanup_recall_handler()
+
+		# Disable the groupbox while waiting for the report
+		if self._design_const_set_group is not None:
+			self._design_const_set_group.setEnabled(False)
+
 		try:
 			msg = dronecan.flytrex.delcon.DesignConstantsSet()
 		except Exception as ex:
@@ -702,6 +753,8 @@ class SpoolControllerPanel(QDialog):
 				parent=self,
 				blocking=True,
 			)
+			# Clean up any previous recall listener
+			self._cleanup_recall_handler()
 			return
 
 		msg.operation = msg.OPERATION_RECALL
@@ -712,6 +765,150 @@ class SpoolControllerPanel(QDialog):
 		except Exception as ex:
 			logger.exception('Failed to broadcast DesignConstantsSet: %s', ex)
 			show_error('Broadcast failed', 'Could not broadcast DesignConstantsSet.', str(ex), parent=self, blocking=True)
+			# Clean up any previous recall listener
+			self._cleanup_recall_handler()
+			return
+
+		# Register handler for the report message
+		try:
+			self._recall_response_handle = self._node.add_handler(
+				dronecan.flytrex.delcon.DesignConstantsSet,
+				self._on_design_constants,
+			)
+		except Exception as ex:
+			logger.exception('Could not register DesignConstants handler: %s', ex)
+			# Clean up any previous recall listener
+			self._cleanup_recall_handler()
+			return
+
+		# Start a 3-second timeout timer
+		self._recall_constants_timeout_timer = QTimer(self)
+		self._recall_constants_timeout_timer.setSingleShot(True)
+		self._recall_constants_timeout_timer.timeout.connect(
+			lambda: (
+				self._cleanup_recall_handler(),
+				self._on_recall_timeout(
+					f'No DesignConstantsSet OPERATION_RESPONSE was received within {RECALL_TIMEOUT_SEC} seconds.\n\n'
+					f'The spool controller may be offline or not responding.'
+				),
+			)
+		)
+		self._recall_constants_timeout_timer.start(RECALL_TIMEOUT_SEC * 1000)
+
+	def _on_design_constants(self, event):
+		'''
+		@brief    Handle an incoming DesignConstantsSet message and populate
+		          the design constants fields in the UI.
+		@param    event - DroneCAN transfer event containing the report message.
+		@return   None
+		'''
+		self._cleanup_recall_handler()
+
+		msg = event.message
+		# Check that the 'operation' field is OPERATION_RESPONSE
+		if msg.operation != msg.OPERATION_RESPONSE:
+			logger.warning('DesignConstantsSet received with unexpected operation: %s', msg.operation)
+			return
+
+		for field_name, textbox in self._field_inputs.items():
+			value = getattr(msg, field_name, None)
+			if value is not None:
+				textbox.setText(str(value))
+		logger.info('DesignConstantsSet received — fields populated')
+
+	def _on_param_set_response(self, event):
+		'''
+		@brief    Handle an incoming ParamSet message with OPERATION_RESPONSE and populate
+		          the ParamSet fields in the UI. Matches the response to the correct
+		          pending recall by msg.param_id.
+		@param    event - DroneCAN transfer event containing the ParamSet message.
+		@return   None
+		'''
+		msg = event.message
+		# Check that the 'operation' field is OPERATION_RESPONSE
+		if msg.operation != msg.OPERATION_RESPONSE:
+			return
+
+		param_set_id = str(msg.param_id)
+		if param_set_id not in self._pending_param_set_recalls:
+			logger.warning('ParamSet response for param_id=%s but no pending recall', param_set_id)
+			return
+
+		self._cleanup_param_set_recall(param_set_id)
+
+		field_inputs = self._param_set_field_inputs.get(param_set_id)
+		if not field_inputs:
+			logger.warning('ParamSet response received but no field inputs found for ParamSet ID %s', param_set_id)
+			return
+
+		for field_name, (textbox, field_type) in field_inputs.items():
+			value = getattr(msg, field_name, None)
+			if value is not None:
+				textbox.setText(str(value))
+		logger.info('ParamSet OPERATION_RESPONSE received — ParamSet %s fields populated', param_set_id)
+
+	def _on_recall_timeout(self, message):
+		'''
+		@brief    Show a recall timeout warning dialog. The caller is responsible
+		          for invoking the appropriate cleanup handler before calling this.
+		@param    message - The text to display in the warning dialog.
+		@return   None
+		'''
+		logger.warning('Recall timeout: %s', message)
+
+		dlg = QMessageBox(self)
+		dlg.setIcon(QMessageBox.Warning)
+		dlg.setWindowTitle('Recall Timeout')
+		dlg.setText(message)
+		dlg.setStandardButtons(QMessageBox.Ok)
+		dlg.exec_()
+
+	def _cleanup_recall_handler(self):
+		'''
+		@brief    Remove the DesignConstantsSet handler and stop the timeout timer.
+		@return   None
+		'''
+		if self._recall_constants_timeout_timer is not None:
+			self._recall_constants_timeout_timer.stop()
+			self._recall_constants_timeout_timer = None
+		if self._recall_response_handle is not None:
+			try:
+				self._recall_response_handle.remove()
+			except Exception:
+				pass
+			self._recall_response_handle = None
+		if self._design_const_set_group is not None:
+			self._design_const_set_group.setEnabled(True)
+
+	def _cleanup_param_set_recall(self, param_set_id):
+		'''
+		@brief    Clean up a single pending ParamSet recall: stop its timer, re-enable
+		          its groupbox, and remove the shared handler if no recalls remain.
+		@param    param_set_id - The ParamSet ID whose recall is being cleaned up.
+		@return   None
+		'''
+		timer = self._pending_param_set_recalls.pop(param_set_id, None)
+		if timer is not None:
+			timer.stop()
+		# Re-enable the groupbox
+		groupbox = self._param_set_groupboxes.get(param_set_id)
+		if groupbox is not None:
+			groupbox.setEnabled(True)
+		# Remove the shared handler if no more pending recalls
+		if not self._pending_param_set_recalls and self._recall_param_set_handle is not None:
+			try:
+				self._recall_param_set_handle.remove()
+			except Exception:
+				pass
+			self._recall_param_set_handle = None
+
+	def _cleanup_param_set_recall_handler(self):
+		'''
+		@brief    Clean up all pending ParamSet recalls. Used during panel shutdown.
+		@return   None
+		'''
+		for pid in list(self._pending_param_set_recalls):
+			self._cleanup_param_set_recall(pid)
 
 	def _on_design_constants_store(self):
 		'''
@@ -938,26 +1135,28 @@ class SpoolControllerPanel(QDialog):
 		design_line.setFrameShadow(QFrame.Sunken)
 		right_column.addWidget(design_line)
 
-		design_const_set_group = QGroupBox(DESIGN_CONSTANTS_SET_NAME, parent)
+		self._design_const_set_group = QGroupBox(DESIGN_CONSTANTS_SET_NAME, parent)
+		design_const_set_group = self._design_const_set_group
 		design_const_set_group.setMinimumHeight(200)
 		design_const_set_group.setMaximumHeight(320)
 		design_const_set_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 		design_const_set_group.setStyleSheet("""
 			QGroupBox {
-				border: 1px solid gray;
+				border: 2px outset #b0b0b0;
 				border-radius: 3px;
 				margin-top: 0px;
 				padding-top: 15px;
-				background-color: lightblue;
+				background-color: palette(window);
 			}
 			QGroupBox::title {
 				subcontrol-origin: margin;
 				subcontrol-position: top left;
 				padding: 2px 5px;
 				background-color: palette(window);
-				border: 1px solid gray;
-				top: 0px;
-				left: 0px;
+				border: 2px inset #b0b0b0;
+				font-weight: bold;
+				top: 3px;
+				left: 3px;
 			}
 		""")
 
@@ -991,7 +1190,6 @@ class SpoolControllerPanel(QDialog):
 
 		# Container widget for fields
 		fields_container = QWidget()
-		fields_container.setStyleSheet("background-color: lightblue;")
 		fields_layout = QGridLayout(fields_container)
 		fields_layout.setColumnStretch(0, 0)
 		fields_layout.setColumnStretch(1, 1)
@@ -1025,6 +1223,15 @@ class SpoolControllerPanel(QDialog):
 		@param    event - Qt close event.
 		@return   None
 		'''
+
+		try:
+			self._cleanup_recall_handler()
+		except Exception:
+			pass
+		try:
+			self._cleanup_param_set_recall_handler()
+		except Exception:
+			pass
 
 		try:
 			super(SpoolControllerPanel, self).closeEvent(event)
