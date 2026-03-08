@@ -21,10 +21,11 @@ import xml.etree.ElementTree as ET
 from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer
 from PyQt5.QtGui import QIntValidator, QColor, QFont
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
-	QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy, QFrame, QScrollArea, QWidget, QLayout, QMessageBox
+	QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy, QFrame, QScrollArea, QWidget, QLayout, QMessageBox, QProgressBar
 import numpy as np
 
 from ..widgets import get_icon, show_error
+from ..widgets.file_server import FileServer_PathKey
 
 __all__ = 'PANEL_NAME', 'spawn', 'get_icon'
 
@@ -41,6 +42,7 @@ BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) be
 PARAM_SET_GROUPBOX_HEIGHT = 200                     # Fixed height (px) for each ParamSet editing groupbox
 PARAM_SET_GROUPBOX_WIDTH = 400                      # Fixed width (px) for each ParamSet editing groupbox
 RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
+CONFIG_FILE_TRANSFER_TIMEOUT = 30                   # Number of seconds to wait for a config file upload/download to complete before showing a timeout error dialog
 
 _PARAM_SET_LIGHT_COLORS = [                         # Pool of light background colors assigned to ParamSet groupboxes
 	'#FFFFCC',  # light yellow
@@ -186,6 +188,9 @@ class SpoolControllerPanel(QDialog):
 		self._upload_timeout_timer = None              # QTimer for WriteConfigFile upload timeout
 		self._download_response_handle = None          # DroneCAN handler handle for ReadConfigFile (active during download)
 		self._download_timeout_timer = None            # QTimer for ReadConfigFile download timeout
+		self._config_transfer_timer = None             # QTimer for config file transfer timeout
+		self._config_transfer_key = None               # File server key used to track transfer activity
+		self._config_transfer_start_hits = 0           # Hit count at transfer start
 
 		self._setup_ui()
 
@@ -368,6 +373,21 @@ class SpoolControllerPanel(QDialog):
 
 		left_column.addStretch(1)
 
+		progress_row = QHBoxLayout()
+		progress_row.setSpacing(0)
+		self._config_transfer_progress = QProgressBar(parent)
+		self._config_transfer_progress.setRange(0, 100)
+		self._config_transfer_progress.setValue(0)
+		self._config_transfer_progress.setAlignment(Qt.AlignCenter)
+		self._config_transfer_progress.setFixedWidth(
+			(STATUS_LABEL_WIDTH * 3) + (STATUS_TEXTBOX_WIDTH * 3) + 46
+		)
+		progress_row.addWidget(self._config_transfer_progress)
+		progress_row.addStretch(1)
+		left_column.addLayout(progress_row)
+
+		left_column.addSpacing(2)
+
 		return left_column
 
 	def _on_upload_browse_clicked(self):
@@ -386,7 +406,7 @@ class SpoolControllerPanel(QDialog):
 
 	def _on_upload_clicked(self):
 		'''
-		@brief    Handle upload button click: validate local file path and send WriteConfigFile.
+		@brief    Handle upload button click: validate local file, configure file server, and send WriteConfigFile.
 		@return   None
 		'''
 		upload_path = self._upload_textbox.text().strip()
@@ -394,10 +414,39 @@ class SpoolControllerPanel(QDialog):
 			self._show_ok_dialog('Upload', 'Choose a file to upload!')
 			return
 
+		self._cleanup_config_transfer_timeout()
+
+		# Get the file server widget from the main window
+		try:
+			file_server_widget = self._get_file_server_widget()
+			if file_server_widget is None:
+				show_error('File Server Error', 'File server widget not available.', '', parent=self, blocking=True)
+				return
+		except Exception as ex:
+			logger.exception('Could not access file server widget: %s', ex)
+			show_error('File Server Error', 'Could not access file server.', str(ex), parent=self, blocking=True)
+			return
+
+		# Add the file to the file server
+		try:
+			file_server_widget.add_path(upload_path)
+			file_server_widget.force_start()
+			logger.info('File server configured for: %s', upload_path)
+		except Exception as ex:
+			logger.exception('Could not configure file server: %s', ex)
+			show_error('File Server Error', 'Could not configure file server.', str(ex), parent=self, blocking=True)
+			return
+
+		# Get the remote path that the file server will use
+		remote_config_file = FileServer_PathKey(upload_path)
+		logger.info('Remote config file path: %r', remote_config_file)
+		self._config_transfer_key = remote_config_file
+
+		# Create and send WriteConfigFile message
 		try:
 			msg = dronecan.flytrex.delcon.WriteConfigFile()
 			msg.destination_node_id = 0
-			msg.image_file_remote_path.path = upload_path
+			msg.image_file_remote_path.path = remote_config_file
 		except Exception as ex:
 			logger.exception('WriteConfigFile DSDL type not available: %s', ex)
 			show_error(
@@ -417,7 +466,7 @@ class SpoolControllerPanel(QDialog):
 
 		try:
 			self._node.broadcast(msg)
-			logger.info('Broadcast WriteConfigFile for %s', upload_path)
+			logger.info('Broadcast WriteConfigFile for %s', remote_config_file)
 		except Exception as ex:
 			logger.exception('Failed to broadcast WriteConfigFile: %s', ex)
 			show_error('Broadcast failed', 'Could not broadcast WriteConfigFile.', str(ex), parent=self, blocking=True)
@@ -449,6 +498,8 @@ class SpoolControllerPanel(QDialog):
 			)
 		)
 		self._upload_timeout_timer.start(RESPONSE_TIMEOUT * 1000)
+
+		self._show_message('Upload request sent. Waiting for spool controller response...')
 
 	def _on_download_clicked(self):
 		'''
@@ -1093,6 +1144,7 @@ class SpoolControllerPanel(QDialog):
 	def _on_upload_response(self, event):
 		'''
 		@brief    Handle an incoming WriteConfigFile response message.
+		          The spool controller will automatically request the file from the file server.
 		@param    event - DroneCAN transfer event containing the response message.
 		@return   None
 		'''
@@ -1103,7 +1155,9 @@ class SpoolControllerPanel(QDialog):
 
 		try:
 			if msg.status == msg.STATUS_OK:
-				self._show_ok_dialog('Upload Success', 'File uploaded successfully!')
+				logger.info('Upload successful. Spool controller is reading the config file.')
+				self._start_config_transfer_timeout()
+				self._show_ok_dialog('Upload Complete', 'Config file upload request accepted. The spool controller is reading the file.')
 			elif msg.status == msg.STATUS_BUSY:
 				self._show_ok_dialog('Upload Status', 'The spool controller is busy. Please try again later.')
 			elif msg.status == msg.STATUS_LOW_MEM:
@@ -1115,6 +1169,95 @@ class SpoolControllerPanel(QDialog):
 		except Exception as ex:
 			logger.exception('Error processing upload response: %s', ex)
 			self._show_ok_dialog('Upload Error', f'Error processing upload response: {ex}')
+
+	def _start_config_transfer_timeout(self):
+		'''
+		@brief    Start a timeout for config file transfer activity.
+		@return   None
+		'''
+		self._cleanup_config_transfer_timeout()
+		key = self._config_transfer_key
+		if not key:
+			return
+
+		self._config_transfer_start_hits = 0
+		try:
+			file_server_widget = self._get_file_server_widget()
+			file_server = getattr(file_server_widget, '_file_server', None)
+			if file_server is not None:
+				self._config_transfer_start_hits = file_server.path_hit_counters.get(key, 0)
+		except Exception:
+			logger.exception('Could not read file server hit counters')
+
+		self._config_transfer_timer = QTimer(self)
+		self._config_transfer_timer.setSingleShot(True)
+		self._config_transfer_timer.timeout.connect(self._on_config_transfer_timeout)
+		self._config_transfer_timer.start(CONFIG_FILE_TRANSFER_TIMEOUT * 1000)
+
+	def _on_config_transfer_timeout(self):
+		'''
+		@brief    Handle config file transfer timeout.
+		@return   None
+		'''
+		hits = self._config_transfer_start_hits
+		try:
+			file_server_widget = self._get_file_server_widget()
+			file_server = getattr(file_server_widget, '_file_server', None)
+			if file_server is not None and self._config_transfer_key:
+				hits = file_server.path_hit_counters.get(self._config_transfer_key, hits)
+		except Exception:
+			logger.exception('Could not read file server hit counters')
+
+		message = (
+			f'Config file transfer did not complete within {CONFIG_FILE_TRANSFER_TIMEOUT} seconds.'
+		)
+		if hits <= self._config_transfer_start_hits:
+			message += '\n\nNo file read activity was observed from the spool controller.'
+
+		self._show_ok_dialog('Transfer Timeout', message)
+		self._cleanup_config_transfer_timeout()
+
+	def _cleanup_config_transfer_timeout(self):
+		'''
+		@brief    Stop the config file transfer timeout timer and reset state.
+		@return   None
+		'''
+		if self._config_transfer_timer is not None:
+			self._config_transfer_timer.stop()
+			self._config_transfer_timer = None
+		self._config_transfer_key = None
+		self._config_transfer_start_hits = 0
+
+	def _get_file_server_widget(self):
+		'''
+		@brief    Walk parent chain to find the main window file server widget.
+		@return   FileServerWidget or None.
+		'''
+		parent = self.parent()
+		while parent is not None:
+			if hasattr(parent, '_file_server_widget'):
+				return parent._file_server_widget
+			parent = parent.parent()
+		return None
+
+	def _show_message(self, text, *fmt):
+		'''
+		@brief    Send a status message to the main window if available.
+		@return   None
+		'''
+		parent = self.parent()
+		while parent is not None:
+			if hasattr(parent, 'show_message'):
+				try:
+					parent.show_message(text, *fmt)
+					return
+				except Exception:
+					break
+			parent = parent.parent()
+		try:
+			logger.info(text, *fmt)
+		except Exception:
+			pass
 
 	def _cleanup_upload_handler(self):
 		'''
@@ -1540,6 +1683,10 @@ class SpoolControllerPanel(QDialog):
 
 		try:
 			self._cleanup_upload_handler()
+		except Exception:
+			pass
+		try:
+			self._cleanup_config_transfer_timeout()
 		except Exception:
 			pass
 		try:
