@@ -40,7 +40,7 @@ PARAM_SET_NAME = 'ParamSet'                         # Prefix for individual Para
 BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) between buttons in button rows
 PARAM_SET_GROUPBOX_HEIGHT = 200                     # Fixed height (px) for each ParamSet editing groupbox
 PARAM_SET_GROUPBOX_WIDTH = 400                      # Fixed width (px) for each ParamSet editing groupbox
-RECALL_TIMEOUT_SEC = 3                              # Seconds to wait for a report message after sending a recall command before showing a timeout warning
+RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
 
 _PARAM_SET_LIGHT_COLORS = [                         # Pool of light background colors assigned to ParamSet groupboxes
 	'#FFFFCC',  # light yellow
@@ -180,6 +180,12 @@ class SpoolControllerPanel(QDialog):
 
 		self._recall_param_set_handle = None           # Shared DroneCAN handler for ParamSet responses (active when any ParamSet recall is pending)
 		self._pending_param_set_recalls = {}           # param_set_id -> QTimer for each pending ParamSet recall
+		self._pending_param_set_compare = {}           # param_set_id -> {field_name: value} for store-then-recall compare
+
+		self._upload_response_handle = None            # DroneCAN handler handle for WriteConfigFile (active during upload)
+		self._upload_timeout_timer = None              # QTimer for WriteConfigFile upload timeout
+		self._download_response_handle = None          # DroneCAN handler handle for ReadConfigFile (active during download)
+		self._download_timeout_timer = None            # QTimer for ReadConfigFile download timeout
 
 		self._setup_ui()
 
@@ -292,6 +298,7 @@ class SpoolControllerPanel(QDialog):
 		upload_row = QHBoxLayout()
 		self._upload_button = QPushButton('Upload', parent)
 		self._upload_button.setFixedWidth(BUTTON_WIDTH)
+		self._upload_button.clicked.connect(self._on_upload_clicked)
 		upload_row.addWidget(self._upload_button)
 
 		self._upload_textbox = QLineEdit(parent)
@@ -314,7 +321,7 @@ class SpoolControllerPanel(QDialog):
 
 		self._download_browse_button = QPushButton('Browse', parent)
 		self._download_browse_button.setFixedWidth(BUTTON_WIDTH)
-		self._download_browse_button.clicked.connect(self._on_download_clicked)
+		self._download_browse_button.clicked.connect(self._on_download_browse_clicked)
 		download_row.addWidget(self._download_browse_button)
 		left_column.addLayout(download_row)
 
@@ -376,6 +383,142 @@ class SpoolControllerPanel(QDialog):
 		)
 		if filename:
 			self._upload_textbox.setText(filename)
+
+	def _on_upload_clicked(self):
+		'''
+		@brief    Handle upload button click: validate local file path and send WriteConfigFile.
+		@return   None
+		'''
+		upload_path = self._upload_textbox.text().strip()
+		if not upload_path or not os.path.isfile(upload_path):
+			self._show_ok_dialog('Upload', 'Choose a file to upload!')
+			return
+
+		try:
+			msg = dronecan.flytrex.delcon.WriteConfigFile()
+			msg.destination_node_id = 0
+			msg.image_file_remote_path.path = upload_path
+		except Exception as ex:
+			logger.exception('WriteConfigFile DSDL type not available: %s', ex)
+			show_error(
+				'DSDL type not loaded',
+				'Could not access dronecan.flytrex.delcon.WriteConfigFile.',
+				str(ex),
+				parent=self,
+				blocking=True,
+			)
+			return
+
+		# Clean up any previous upload handler
+		self._cleanup_upload_handler()
+
+		# Disable the upload button while waiting for response
+		self._upload_button.setEnabled(False)
+
+		try:
+			self._node.broadcast(msg)
+			logger.info('Broadcast WriteConfigFile for %s', upload_path)
+		except Exception as ex:
+			logger.exception('Failed to broadcast WriteConfigFile: %s', ex)
+			show_error('Broadcast failed', 'Could not broadcast WriteConfigFile.', str(ex), parent=self, blocking=True)
+			self._upload_button.setEnabled(True)
+			return
+
+		# Register handler for the response message
+		try:
+			self._upload_response_handle = self._node.add_handler(
+				dronecan.flytrex.delcon.WriteConfigFile,
+				self._on_upload_response,
+			)
+		except Exception as ex:
+			logger.exception('Could not register WriteConfigFile handler: %s', ex)
+			self._upload_button.setEnabled(True)
+			self._cleanup_upload_handler()
+			return
+
+		# Start timeout timer
+		self._upload_timeout_timer = QTimer(self)
+		self._upload_timeout_timer.setSingleShot(True)
+		self._upload_timeout_timer.timeout.connect(
+			lambda: (
+				self._cleanup_upload_handler(),
+				self._on_recall_timeout(
+					f'No WriteConfigFile response was received within {RESPONSE_TIMEOUT} seconds.\n\n'
+					f'The spool controller may be offline or not responding.'
+				),
+			)
+		)
+		self._upload_timeout_timer.start(RESPONSE_TIMEOUT * 1000)
+
+	def _on_download_clicked(self):
+		'''
+		@brief    Handle download button click: validate destination path and send ReadConfigFile.
+		@return   None
+		'''
+		download_path = self._download_textbox.text().strip()
+		if not download_path:
+			self._show_ok_dialog('Download', 'Choose a file to download!')
+			return
+
+		download_dir = os.path.dirname(download_path)
+		if download_dir and not os.path.isdir(download_dir):
+			self._show_ok_dialog('Download', 'Choose a valid download directory!')
+			return
+
+		try:
+			msg = dronecan.flytrex.delcon.ReadConfigFile()
+			msg.destination_node_id = 0
+		except Exception as ex:
+			logger.exception('ReadConfigFile DSDL type not available: %s', ex)
+			show_error(
+				'DSDL type not loaded',
+				'Could not access dronecan.flytrex.delcon.ReadConfigFile.',
+				str(ex),
+				parent=self,
+				blocking=True,
+			)
+			return
+
+		# Clean up any previous download handler
+		self._cleanup_download_handler()
+
+		# Disable the download button while waiting for response
+		self._download_button.setEnabled(False)
+
+		try:
+			self._node.broadcast(msg)
+			logger.info('Broadcast ReadConfigFile for %s', download_path)
+		except Exception as ex:
+			logger.exception('Failed to broadcast ReadConfigFile: %s', ex)
+			show_error('Broadcast failed', 'Could not broadcast ReadConfigFile.', str(ex), parent=self, blocking=True)
+			self._download_button.setEnabled(True)
+			return
+
+		# Register handler for the response message
+		try:
+			self._download_response_handle = self._node.add_handler(
+				dronecan.flytrex.delcon.ReadConfigFile,
+				self._on_download_response,
+			)
+		except Exception as ex:
+			logger.exception('Could not register ReadConfigFile handler: %s', ex)
+			self._download_button.setEnabled(True)
+			self._cleanup_download_handler()
+			return
+
+		# Start timeout timer
+		self._download_timeout_timer = QTimer(self)
+		self._download_timeout_timer.setSingleShot(True)
+		self._download_timeout_timer.timeout.connect(
+			lambda: (
+				self._cleanup_download_handler(),
+				self._on_recall_timeout(
+					f'No ReadConfigFile response was received within {RESPONSE_TIMEOUT} seconds.\n\n'
+					f'The spool controller may be offline or not responding.'
+				),
+			)
+		)
+		self._download_timeout_timer.start(RESPONSE_TIMEOUT * 1000)
 
 	def _on_edit_clicked(self):
 		'''
@@ -598,12 +741,12 @@ class SpoolControllerPanel(QDialog):
 		@brief    Helper function to send a ParamSet message with the given operation.
 		@param    param_set_id - The ID of the ParamSet.
 		@param    operation_name - The DSDL constant name (e.g. 'OPERATION_EXECUTE').
-		@return   None
+		@return   True if the message was broadcast successfully.
 		'''
 		field_inputs = self._param_set_field_inputs.get(param_set_id)
 		if not field_inputs:
 			show_error('Error', 'No fields found for this ParamSet.', '', parent=self, blocking=True)
-			return
+			return False
 
 		try:
 			msg = dronecan.flytrex.delcon.ParamSet()
@@ -616,7 +759,7 @@ class SpoolControllerPanel(QDialog):
 				parent=self,
 				blocking=True,
 			)
-			return
+			return False
 
 		operation = getattr(msg, operation_name)
 		msg.operation = operation
@@ -625,7 +768,7 @@ class SpoolControllerPanel(QDialog):
 			msg.param_id = int(param_set_id)
 		except ValueError:
 			show_error('Error', f'ParamSet ID "{param_set_id}" is not a valid integer.', '', parent=self, blocking=True)
-			return
+			return False
 
 		# Only set the fields if operation is EXECUTE or STORE (not RECALL)
 		if operation_name == 'OPERATION_RECALL':
@@ -655,7 +798,7 @@ class SpoolControllerPanel(QDialog):
 						parent=self,
 						blocking=True,
 					)
-					return
+					return False
 
 		try:
 			self._node.broadcast(msg)
@@ -663,6 +806,73 @@ class SpoolControllerPanel(QDialog):
 		except Exception as ex:
 			logger.exception('Failed to broadcast ParamSet: %s', ex)
 			show_error('Broadcast failed', 'Could not broadcast ParamSet.', str(ex), parent=self, blocking=True)
+			return False
+
+		return True
+
+	def _capture_param_set_values(self, param_set_id):
+		'''
+		@brief    Capture current ParamSet UI values for comparison after a recall.
+		@param    param_set_id - The ParamSet ID to capture.
+		@return   Dict of field values or None if capture failed.
+		'''
+		field_inputs = self._param_set_field_inputs.get(param_set_id)
+		if not field_inputs:
+			show_error('Error', 'No fields found for this ParamSet.', '', parent=self, blocking=True)
+			return None
+
+		snapshot = {}
+		for field_name, (textbox, field_type) in field_inputs.items():
+			raw_value = textbox.text().strip()
+			try:
+				snapshot[field_name] = self._parse_value(field_type, raw_value)
+			except Exception as ex:
+				show_error(
+					'Invalid field value',
+					f'Could not parse field "{field_name}" for compare.',
+					f'Type: {field_type}\nValue: {raw_value}\nError: {ex}',
+					parent=self,
+					blocking=True,
+				)
+				return None
+
+		return snapshot
+
+	@staticmethod
+	def _values_match(left_value, right_value):
+		'''
+		@brief    Compare values with a small tolerance for floats.
+		@param    left_value - First value.
+		@param    right_value - Second value.
+		@return   True if values match.
+		'''
+		if isinstance(left_value, float) or isinstance(right_value, float):
+			try:
+				return abs(float(left_value) - float(right_value)) <= 1e-6
+			except Exception:
+				return False
+		return left_value == right_value
+
+	def _show_ok_dialog(self, title, message):
+		'''
+		@brief    Show a warning dialog with a title, message, and a single OK button.
+		@param    title - Dialog window title.
+		@param    message - Dialog body text.
+		@return   None
+		'''
+		dlg = QMessageBox(self)
+		dlg.setIcon(QMessageBox.Warning)
+		dlg.setWindowTitle(str(title))
+		dlg.setText(str(message))
+		dlg.setStandardButtons(QMessageBox.Ok)
+		dlg.exec_()
+
+	def _show_store_failed(self):
+		'''
+		@brief    Show a warning dialog when stored values do not match recalled values.
+		@return   None
+		'''
+		self._show_ok_dialog('Store Failed', "Store didn't work!")
 
 
 	def _on_param_set_execute(self, param_set_id):
@@ -680,8 +890,15 @@ class SpoolControllerPanel(QDialog):
 		@param    param_set_id - The ParamSet ID to store.
 		@return   None
 		'''
+		snapshot = self._capture_param_set_values(param_set_id)
+		if snapshot is None:
+			return
 
-		self._send_param_set_msg(param_set_id, 'OPERATION_STORE')
+		if not self._send_param_set_msg(param_set_id, 'OPERATION_STORE'):
+			return
+
+		self._pending_param_set_compare[param_set_id] = snapshot
+		self._on_param_set_recall(param_set_id)
 
 	def _on_param_set_recall(self, param_set_id):
 		'''
@@ -721,13 +938,13 @@ class SpoolControllerPanel(QDialog):
 			lambda _id=param_set_id: (
 				self._cleanup_param_set_recall(_id),
 				self._on_recall_timeout(
-					f'No ParamSet OPERATION_RESPONSE for ParamSet ID {_id} was received within {RECALL_TIMEOUT_SEC} seconds.\n\n'
+					f'No ParamSet OPERATION_RESPONSE for ParamSet ID {_id} was received within {RESPONSE_TIMEOUT} seconds.\n\n'
 					f'The spool controller may be offline or not responding.'
 				),
 			)
 		)
 		self._pending_param_set_recalls[param_set_id] = timer
-		timer.start(RECALL_TIMEOUT_SEC * 1000)
+		timer.start(RESPONSE_TIMEOUT * 1000)
 
 	def _on_design_constants_recall(self):
 		'''
@@ -788,12 +1005,12 @@ class SpoolControllerPanel(QDialog):
 			lambda: (
 				self._cleanup_recall_handler(),
 				self._on_recall_timeout(
-					f'No DesignConstantsSet OPERATION_RESPONSE was received within {RECALL_TIMEOUT_SEC} seconds.\n\n'
+					f'No DesignConstantsSet OPERATION_RESPONSE was received within {RESPONSE_TIMEOUT} seconds.\n\n'
 					f'The spool controller may be offline or not responding.'
 				),
 			)
 		)
-		self._recall_constants_timeout_timer.start(RECALL_TIMEOUT_SEC * 1000)
+		self._recall_constants_timeout_timer.start(RESPONSE_TIMEOUT * 1000)
 
 	def _on_design_constants(self, event):
 		'''
@@ -834,11 +1051,27 @@ class SpoolControllerPanel(QDialog):
 			logger.warning('ParamSet response for param_id=%s but no pending recall', param_set_id)
 			return
 
+		compare_snapshot = self._pending_param_set_compare.get(param_set_id)
 		self._cleanup_param_set_recall(param_set_id)
 
 		field_inputs = self._param_set_field_inputs.get(param_set_id)
 		if not field_inputs:
 			logger.warning('ParamSet response received but no field inputs found for ParamSet ID %s', param_set_id)
+			return
+
+		if compare_snapshot is not None:
+			for field_name, (textbox, field_type) in field_inputs.items():
+				if not hasattr(msg, field_name):
+					continue
+				recalled_value = getattr(msg, field_name, None)
+				if recalled_value is None:
+					continue
+				stored_value = compare_snapshot.get(field_name)
+				if not self._values_match(stored_value, recalled_value):
+					self._show_store_failed()
+					logger.warning('Store compare failed for ParamSet %s field %s', param_set_id, field_name)
+					return
+			logger.info('Store compare matched for ParamSet %s', param_set_id)
 			return
 
 		for field_name, (textbox, field_type) in field_inputs.items():
@@ -855,13 +1088,50 @@ class SpoolControllerPanel(QDialog):
 		@return   None
 		'''
 		logger.warning('Recall timeout: %s', message)
+		self._show_ok_dialog('Recall Timeout', message)
 
-		dlg = QMessageBox(self)
-		dlg.setIcon(QMessageBox.Warning)
-		dlg.setWindowTitle('Recall Timeout')
-		dlg.setText(message)
-		dlg.setStandardButtons(QMessageBox.Ok)
-		dlg.exec_()
+	def _on_upload_response(self, event):
+		'''
+		@brief    Handle an incoming WriteConfigFile response message.
+		@param    event - DroneCAN transfer event containing the response message.
+		@return   None
+		'''
+		self._cleanup_upload_handler()
+
+		msg = event.message
+		logger.info('WriteConfigFile response received: status=%s', msg.status)
+
+		try:
+			if msg.status == msg.STATUS_OK:
+				self._show_ok_dialog('Upload Success', 'File uploaded successfully!')
+			elif msg.status == msg.STATUS_BUSY:
+				self._show_ok_dialog('Upload Status', 'The spool controller is busy. Please try again later.')
+			elif msg.status == msg.STATUS_LOW_MEM:
+				self._show_ok_dialog('Upload Status', 'The spool controller has low memory. Please try again later.')
+			elif msg.status == msg.STATUS_UNKNOWN_ERR:
+				self._show_ok_dialog('Upload Error', 'An unknown error occurred during upload.')
+			else:
+				self._show_ok_dialog('Upload Error', f'Upload failed with status code: {msg.status}')
+		except Exception as ex:
+			logger.exception('Error processing upload response: %s', ex)
+			self._show_ok_dialog('Upload Error', f'Error processing upload response: {ex}')
+
+	def _cleanup_upload_handler(self):
+		'''
+		@brief    Remove the WriteConfigFile handler and stop the timeout timer.
+		@return   None
+		'''
+		if self._upload_timeout_timer is not None:
+			self._upload_timeout_timer.stop()
+			self._upload_timeout_timer = None
+		if self._upload_response_handle is not None:
+			try:
+				self._upload_response_handle.remove()
+			except Exception:
+				pass
+			self._upload_response_handle = None
+		if self._upload_button is not None:
+			self._upload_button.setEnabled(True)
 
 	def _cleanup_recall_handler(self):
 		'''
@@ -890,6 +1160,7 @@ class SpoolControllerPanel(QDialog):
 		timer = self._pending_param_set_recalls.pop(param_set_id, None)
 		if timer is not None:
 			timer.stop()
+		self._pending_param_set_compare.pop(param_set_id, None)
 		# Re-enable the groupbox
 		groupbox = self._param_set_groupboxes.get(param_set_id)
 		if groupbox is not None:
@@ -960,9 +1231,9 @@ class SpoolControllerPanel(QDialog):
 			logger.exception('Failed to broadcast DesignConstantsSet: %s', ex)
 			show_error('Broadcast failed', 'Could not broadcast DesignConstantsSet.', str(ex), parent=self, blocking=True)
 
-	def _on_download_clicked(self):
+	def _on_download_browse_clicked(self):
 		'''
-		@brief    Handle download button click to select a save destination.
+		@brief    Handle download browse button click to select a save destination.
 		@return   None
 		'''
 		dialog = QFileDialog(self)
@@ -979,6 +1250,49 @@ class SpoolControllerPanel(QDialog):
 			selected_files = dialog.selectedFiles()
 			if selected_files:
 				self._download_textbox.setText(selected_files[0])
+
+	def _on_download_response(self, event):
+		'''
+		@brief    Handle an incoming ReadConfigFile response message.
+		@param    event - DroneCAN transfer event containing the response message.
+		@return   None
+		'''
+		self._cleanup_download_handler()
+
+		msg = event.message
+		logger.info('ReadConfigFile response received: status=%s', msg.status)
+
+		try:
+			if msg.status == msg.STATUS_OK:
+				self._show_ok_dialog('Download Started', 'ReadConfigFile request accepted.')
+			elif msg.status == msg.STATUS_BUSY:
+				self._show_ok_dialog('Download Status', 'The spool controller is busy. Please try again later.')
+			elif msg.status == msg.STATUS_LOW_MEM:
+				self._show_ok_dialog('Download Status', 'The spool controller has low memory. Please try again later.')
+			elif msg.status == msg.STATUS_UNKNOWN_ERR:
+				self._show_ok_dialog('Download Error', 'An unknown error occurred during download.')
+			else:
+				self._show_ok_dialog('Download Error', f'Download failed with status code: {msg.status}')
+		except Exception as ex:
+			logger.exception('Error processing download response: %s', ex)
+			self._show_ok_dialog('Download Error', f'Error processing download response: {ex}')
+
+	def _cleanup_download_handler(self):
+		'''
+		@brief    Remove the ReadConfigFile handler and stop the timeout timer.
+		@return   None
+		'''
+		if self._download_timeout_timer is not None:
+			self._download_timeout_timer.stop()
+			self._download_timeout_timer = None
+		if self._download_response_handle is not None:
+			try:
+				self._download_response_handle.remove()
+			except Exception:
+				pass
+			self._download_response_handle = None
+		if self._download_button is not None:
+			self._download_button.setEnabled(True)
 
 	def _load_design_constants_fields(self):
 		'''
@@ -1224,6 +1538,14 @@ class SpoolControllerPanel(QDialog):
 		@return   None
 		'''
 
+		try:
+			self._cleanup_upload_handler()
+		except Exception:
+			pass
+		try:
+			self._cleanup_download_handler()
+		except Exception:
+			pass
 		try:
 			self._cleanup_recall_handler()
 		except Exception:
