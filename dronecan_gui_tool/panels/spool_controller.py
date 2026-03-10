@@ -17,6 +17,7 @@ import re
 import json
 import random
 import xml.etree.ElementTree as ET
+import struct
 
 from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer
 from PyQt5.QtGui import QIntValidator, QColor, QFont
@@ -26,6 +27,7 @@ import numpy as np
 
 from ..widgets import get_icon, show_error
 from ..widgets.file_server import FileServer_PathKey
+from .utils import calculate_crc32
 
 __all__ = 'PANEL_NAME', 'spawn', 'get_icon'
 
@@ -61,6 +63,334 @@ _PARAM_SET_LIGHT_COLORS = [                         # Pool of light background c
 logger = getLogger(__name__)
 
 _singleton = None
+
+class DesignConstantsSetPayload:
+	'''
+	@brief    Class representing the payload of a DesignConstantsSet message, responsible for parsing and storing field values.
+	'''
+	FORMAT = '<6f'
+	SIZE = struct.calcsize(FORMAT)
+
+	wire_diameter: float = 0.0                      # The diameter of the wire used in the delivery system. 4 bytes
+	barrel_diameter: float = 0.0                    # The inner diameter of the barrel through which the payload is delivered. 4 bytes
+	spool_width: float = 0.0                        # The width of the spool that holds the wire. 4 bytes
+	gearbox_ratio: float = 0.0                      # The gear ratio of the spool controller's motor gearbox. 4 bytes
+	wire_packing_efficiencies: float = 0.0          # The efficiency of wire packing on the spool. 4 bytes
+	total_length_of_spooled_wire: float = 0.0       # The total length of wire currently spooled, used for calculating remaining wire and feed rate. 4 bytes
+
+	def __init__(self):
+		self.wire_diameter = 0.0
+		self.barrel_diameter = 0.0
+		self.spool_width = 0.0
+		self.gearbox_ratio = 0.0
+		self.wire_packing_efficiencies = 0.0
+		self.total_length_of_spooled_wire = 0.0
+
+	def set(self, **kwargs):
+		'''
+		@brief    Set multiple fields of the DesignConstantsSetPayload at once using keyword arguments.
+		@param    kwargs - Field names and values to set (e.g. wire_diameter=0.5, spool_width=10.0).
+		@return   None
+		'''
+		for key, value in kwargs.items():
+			if hasattr(self, key):
+				setattr(self, key, value)
+			else:
+				raise ValueError(f'Invalid field name for DesignConstantsSetPayload: {key}')
+
+	def serialize(self) -> bytes:
+		'''
+		@brief    Serialize the DesignConstantsSetPayload to bytes.
+		@return   Bytes array containing the serialized payload.
+		'''
+		return struct.pack(self.FORMAT,
+			self.wire_diameter,
+			self.barrel_diameter,
+			self.spool_width,
+			self.gearbox_ratio,
+			self.wire_packing_efficiencies,
+			self.total_length_of_spooled_wire
+		)
+
+	def deserialize(self, data, offset=0):
+		'''
+		@brief    Deserialize a DesignConstantsSetPayload from a bytes-like object.
+		@param    data - Input bytes-like buffer.
+		@param    offset - Starting index in the input buffer.
+		@return   Next offset after parsing this payload.
+		'''
+		buffer = memoryview(data)
+		end = offset + self.SIZE
+		if end > len(buffer):
+			raise ValueError(f'Not enough data to deserialize DesignConstantsSetPayload: need {self.SIZE} bytes from offset {offset}, got {len(buffer) - offset}')
+
+		(
+			wire_diameter,
+			barrel_diameter,
+			spool_width,
+			gearbox_ratio,
+			wire_packing_efficiencies,
+			total_length_of_spooled_wire,
+		) = struct.unpack_from(self.FORMAT, buffer, offset)
+
+		self.wire_diameter = wire_diameter
+		self.barrel_diameter = barrel_diameter
+		self.spool_width = spool_width
+		self.gearbox_ratio = gearbox_ratio
+		self.wire_packing_efficiencies = wire_packing_efficiencies
+		self.total_length_of_spooled_wire = total_length_of_spooled_wire
+		return end
+
+class ParamSetPayload:
+	'''
+	@brief    Class representing the payload of a ParamSet message, responsible for parsing and storing field values.
+	'''
+	FORMAT = '<H?9f'
+	SIZE = struct.calcsize(FORMAT)
+
+	param_set_id: int = 0                           # The ID of the ParamSet, used to identify which set of parameters is being edited or applied. 2 bytes
+	load_not_shaft_control: bool = False            # Whether the spool controller should operate in load control mode (true) or shaft control mode (false). 1 byte
+	shaft_pos_rad: float = 0.0                      # The target shaft position in radians, used when load_not_shaft_control is false. 4 bytes
+	completion_time_s: float = 0.0                  # The desired time in seconds to complete the movement to the target position or load. 4 bytes
+	min_torque_Nm: float = 0.0                      # The minimum torque in Newton-meters that the controller should apply during the movement. 4 bytes
+	max_torque_Nm: float = 0.0                      # The maximum torque in Newton-meters that the controller should apply during the movement. 4 bytes
+	obs_tension_detector_min_torque_Nm: float = 0.0  # The minimum torque threshold in Newton-meters for the obstacle tension detector, used to detect if the payload is snagged on an obstacle. 4 bytes
+	obs_tension_detector_window_s: float = 0.0       # The time window in seconds for the obstacle tension detector to evaluate if the torque has been below the threshold for long enough to indicate a snag. 4 bytes
+	obs_traj_deviation_pos_m: float = 0.0           # The position deviation threshold in meters for the obstacle trajectory deviation detector, used to detect if the payload is snagged on an obstacle based on unexpected deviations from the planned trajectory. 4 bytes
+	obs_traj_deviation_neg_m: float = 0.0           # The position deviation threshold in meters for the obstacle trajectory deviation detector, used to detect if the payload is snagged on an obstacle based on unexpected deviations from the planned trajectory. 4 bytes
+	obs_allowed_deviation_pos_window_s: float = 0.0  # The time window in seconds for the obstacle trajectory deviation detector to evaluate if the position has been above the positive deviation threshold for long enough to indicate a snag. 4 bytes
+
+	def __init__(self):
+		self.param_set_id = 0
+		self.load_not_shaft_control = False
+		self.shaft_pos_rad = 0.0
+		self.completion_time_s = 0.0
+		self.min_torque_Nm = 0.0
+		self.max_torque_Nm = 0.0
+		self.obs_tension_detector_min_torque_Nm = 0.0
+		self.obs_tension_detector_window_s = 0.0
+		self.obs_traj_deviation_pos_m = 0.0
+		self.obs_traj_deviation_neg_m = 0.0
+		self.obs_allowed_deviation_pos_window_s = 0.0
+
+	def set(self, **kwargs):
+		'''
+		@brief    Set multiple fields of the ParamSetPayload at once using keyword arguments.
+		@param    kwargs - Field names and values to set (e.g. param_set_id=1, shaft_pos_rad=0.5).
+		@return   None
+		'''
+		for key, value in kwargs.items():
+			if hasattr(self, key):
+				setattr(self, key, value)
+			else:
+				raise ValueError(f'Invalid field name for ParamSetPayload: {key}')
+
+	def serialize(self) -> bytes:
+		'''
+		@brief    Serialize the ParamSetPayload to bytes.
+		@return   Bytes array containing the serialized payload.
+		'''
+		return struct.pack(self.FORMAT,
+			self.param_set_id,
+			self.load_not_shaft_control,
+			self.shaft_pos_rad,
+			self.completion_time_s,
+			self.min_torque_Nm,
+			self.max_torque_Nm,
+			self.obs_tension_detector_min_torque_Nm,
+			self.obs_tension_detector_window_s,
+			self.obs_traj_deviation_pos_m,
+			self.obs_traj_deviation_neg_m,
+			self.obs_allowed_deviation_pos_window_s
+		)
+
+	def deserialize(self, data, offset=0):
+		'''
+		@brief    Deserialize a ParamSetPayload from a bytes-like object.
+		@param    data - Input bytes-like buffer.
+		@param    offset - Starting index in the input buffer.
+		@return   Next offset after parsing this payload.
+		'''
+		buffer = memoryview(data)
+		end = offset + self.SIZE
+		if end > len(buffer):
+			raise ValueError(f'Not enough data to deserialize ParamSetPayload: need {self.SIZE} bytes from offset {offset}, got {len(buffer) - offset}')
+
+		(
+			param_set_id,
+			load_not_shaft_control,
+			shaft_pos_rad,
+			completion_time_s,
+			min_torque_Nm,
+			max_torque_Nm,
+			obs_tension_detector_min_torque_Nm,
+			obs_tension_detector_window_s,
+			obs_traj_deviation_pos_m,
+			obs_traj_deviation_neg_m,
+			obs_allowed_deviation_pos_window_s,
+		) = struct.unpack_from(self.FORMAT, buffer, offset)
+
+		self.param_set_id = param_set_id
+		self.load_not_shaft_control = load_not_shaft_control
+		self.shaft_pos_rad = shaft_pos_rad
+		self.completion_time_s = completion_time_s
+		self.min_torque_Nm = min_torque_Nm
+		self.max_torque_Nm = max_torque_Nm
+		self.obs_tension_detector_min_torque_Nm = obs_tension_detector_min_torque_Nm
+		self.obs_tension_detector_window_s = obs_tension_detector_window_s
+		self.obs_traj_deviation_pos_m = obs_traj_deviation_pos_m
+		self.obs_traj_deviation_neg_m = obs_traj_deviation_neg_m
+		self.obs_allowed_deviation_pos_window_s = obs_allowed_deviation_pos_window_s
+		return end
+
+class ParamSetFile:
+	'''
+	@brief    Class representing a ParamSet definition file, responsible for parsing the file and providing field definitions.
+	'''
+
+	CRC_HEADER_INITIAL = 0xF00FF00F  # Initial CRC value for the header section, used to verify that the header CRC is calculated correctly (matches the C++ implementation)
+	HEADER_FORMAT = '<BHII'
+	HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+	VERSION = 1
+
+	_version: int = VERSION                         # Version string from the ParamSet file (e.g. "1.0"). 1 byte
+	_num_param_set: int = 0                         # Number of ParamSet definitions in the file. 2 bytes
+	_hdr_crc: int = 0                               # CRC32 of the header section. 4 bytes
+	_payload_crc: int = 0                           # CRC32 of the payload section (DesignConstantsSet + all ParamSetPayloads). 4 bytes
+	_design_constants_set_payload: DesignConstantsSetPayload  # DesignConstantsSetPayload object parsed from the file
+	_param_sets: list[ParamSetPayload] = []		    # List of ParamSetPayload objects parsed from the file, one for each ParamSet definition in the file
+
+	def __init__(self):
+		self._version = self.VERSION
+		self._num_param_set = 0
+		self._hdr_crc = 0
+		self._payload_crc = 0
+		self._design_constants_set_payload = DesignConstantsSetPayload()
+		self._param_sets = []
+
+	def serialize(self) -> bytes:
+		'''
+		@brief    Serialize the ParamSetFile to bytes.
+		@return   Bytes array containing the serialized file.
+		'''
+		# Serialize header: version (1 byte), num_param_set (2 bytes), hdr_crc (4 bytes), payload_crc (4 bytes)
+		result = struct.pack(self.HEADER_FORMAT,
+			self._version,
+			self._num_param_set,
+			self._hdr_crc,
+			self._payload_crc
+		)
+
+		# Serialize design constants payload
+		result += self._design_constants_set_payload.serialize()
+
+		# Serialize each param set
+		for param_set in self._param_sets:
+			result += param_set.serialize()
+
+		return result
+
+	def deserialize(self, data):
+		'''
+		@brief    Deserialize a ParamSetFile from a bytes-like object.
+		@param    data - Input bytes-like buffer containing header and payload.
+		@return   Self after parsing.
+		'''
+		buffer = memoryview(data)
+		if len(buffer) < self.HEADER_SIZE:
+			raise ValueError(f'Not enough data to deserialize ParamSetFile header: need {self.HEADER_SIZE} bytes, got {len(buffer)}')
+
+		version, num_param_set, hdr_crc, payload_crc = struct.unpack_from(self.HEADER_FORMAT, buffer, 0)
+		offset = self.HEADER_SIZE
+
+		design_constants_payload = DesignConstantsSetPayload()
+		offset = design_constants_payload.deserialize(buffer, offset)
+		param_sets = []
+		for _ in range(num_param_set):
+			param_set_payload = ParamSetPayload()
+			offset = param_set_payload.deserialize(buffer, offset)
+			param_sets.append(param_set_payload)
+
+		self._version = version
+		self._num_param_set = num_param_set
+		self._hdr_crc = hdr_crc
+		self._payload_crc = payload_crc
+		self._design_constants_set_payload = design_constants_payload
+		self._param_sets = param_sets
+
+		if offset != len(buffer):
+			logger.warning('ParamSetFile deserialize: %d trailing bytes were not parsed', len(buffer) - offset)
+
+		return self
+
+	def calculate_header_crc(self) -> int:
+		'''
+		@brief    Calculate the CRC32 of the header section (version and num_param_set).
+		@return   Calculated CRC32 value as an integer.
+		'''
+		self._hdr_crc = 0  # Set to 0 for CRC calculation
+		header_bytes = struct.pack(self.HEADER_FORMAT,
+			self._version,
+			self._num_param_set,
+			self._hdr_crc,
+			self._payload_crc
+		)
+		self._hdr_crc = calculate_crc32(header_bytes, self.CRC_HEADER_INITIAL)
+
+		return self._hdr_crc
+
+	def calculate_payload_crc(self) -> int:
+		'''
+		@brief    Calculate the CRC32 of the payload section (DesignConstantsSet and all ParamSetPayloads).
+		@return   Calculated CRC32 value as an integer.
+		'''
+		self._payload_crc = 0  # Set to 0 for CRC calculation
+		payload_bytes = self._design_constants_set_payload.serialize()
+		for param_set in self._param_sets:
+			payload_bytes += param_set.serialize()
+		self._payload_crc = calculate_crc32(payload_bytes)
+
+		return self._payload_crc
+
+	def calculate_crc(self) -> int:
+		'''
+		@brief    Calculate the CRC32 of the entire ParamSetFile (header + payload).
+		@         Payload CRC is calculated first, then header CRC is calculated.
+		@return   Calculated CRC32 value as an integer.
+		'''
+		self._payload_crc = self.calculate_payload_crc()
+		self._hdr_crc = self.calculate_header_crc()
+
+		return calculate_crc32(self.serialize())
+
+	def clear(self):
+		'''
+		@brief    Clear all fields and reset to default values.
+		@return   None
+		'''
+		self._version = self.VERSION
+		self._num_param_set = 0
+		self._hdr_crc = 0
+		self._payload_crc = 0
+		self._design_constants_set_payload = DesignConstantsSetPayload()
+		self._param_sets = []
+
+	def set_design_constants(self, design_constants_set_payload: DesignConstantsSetPayload):
+		'''
+		@brief    Set the DesignConstantsSet payload for this ParamSetFile.
+		@param    design_constants_set_payload - DesignConstantsSetPayload object containing the design constants values to set.
+		@return   None
+		'''
+		self._design_constants_set_payload = design_constants_set_payload
+
+	def add_param_set(self, param_set_payload: ParamSetPayload):
+		'''
+		@brief    Add a ParamSetPayload to the list of ParamSets in this file.
+		@param    param_set_payload - ParamSetPayload object containing the parameter set values to add.
+		@return   None
+		'''
+		self._param_sets.append(param_set_payload)
+		self._num_param_set = len(self._param_sets)
 
 
 class FlowLayout(QLayout):
@@ -171,6 +501,8 @@ class SpoolControllerPanel(QDialog):
 		self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLineEdit, type_str)} for each ParamSet groupbox
 		self._param_set_groupboxes = {}        # param_set_id -> QGroupBox widget for each ParamSet editing groupbox
 
+		self._param_set_file: ParamSetFile = ParamSetFile()          # Currently loaded ParamSetFile object, used for editing and uploading
+
 		# Load the design constants definition file
 		self._design_const_set_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'DesignConstantsSet.json')
 		self._design_constants_fields = self._load_design_constants_fields()  # Parsed DesignConstantsSet.json field definitions
@@ -262,6 +594,14 @@ class SpoolControllerPanel(QDialog):
 		self._edit_button = QPushButton('Edit', header_group)
 		self._edit_button.clicked.connect(self._on_edit_clicked)
 		param_set_id_row.addWidget(self._edit_button)
+
+		self._create_config_file_button = QPushButton('Create Config File', header_group)
+		self._create_config_file_button.clicked.connect(self._on_create_config_file_clicked)
+		param_set_id_row.addWidget(self._create_config_file_button)
+
+		self._read_config_file_button = QPushButton('Read Config File', header_group)
+		self._read_config_file_button.clicked.connect(self._on_read_config_file_clicked)
+		param_set_id_row.addWidget(self._read_config_file_button)
 
 		param_set_id_row.addStretch(1)
 		columns_grid.addLayout(param_set_id_row, 3, 0, 1, 2)
@@ -593,6 +933,183 @@ class SpoolControllerPanel(QDialog):
 			return
 		logger.info('Edit clicked for ParamSet ID: %s', param_set_id)
 		self._add_param_set_editing_content(param_set_id)
+
+	def _on_create_config_file_clicked(self):
+		'''
+		@brief    Handle Create Config File button click.
+		@return   None
+		'''
+
+		# Prompt user for save destination before doing any work
+		dialog = QFileDialog(self)
+		dialog.setWindowTitle('Save Config File')
+		dialog.setAcceptMode(QFileDialog.AcceptSave)
+		dialog.setFileMode(QFileDialog.AnyFile)
+		dialog.setNameFilter('Binary config files (*.bin);;All files (*.*)')
+		dialog.setDefaultSuffix('bin')
+
+		if not dialog.exec_():
+			return
+
+		selected_files = dialog.selectedFiles()
+		if not selected_files:
+			return
+		save_path = selected_files[0]
+
+		# Clear any existing data in the ParamSetFile before populating with current field values
+		self._param_set_file.clear()
+
+		temp_design_constants = DesignConstantsSetPayload()
+		# Extract the current values from the Design Constants fields
+		for field_name, textbox in self._field_inputs.items():
+			raw_value = textbox.text().strip()
+			field_type = self._design_constants_fields.get(field_name, {}).get('type', 'float32')
+			try:
+				value = self._parse_value(field_type, raw_value)
+				setattr(temp_design_constants, field_name, value)
+			except Exception as ex:
+				show_error(
+					'Invalid field value',
+					f'Could not parse field "{field_name}".',
+					f'Type: {field_type}\nValue: {raw_value}\nError: {ex}',
+					parent=self,
+					blocking=True,
+				)
+				return
+		self._param_set_file.set_design_constants(temp_design_constants)
+		# Extract current field values from all open ParamSet groupboxes.
+		extracted_param_sets = {}
+		for param_set_id, _groupbox in self._param_set_groupboxes.items():
+			field_inputs = self._param_set_field_inputs.get(param_set_id, {})
+			fields = {}
+			temp_param_set_payload = ParamSetPayload()
+
+			# Set the param_set_id
+			try:
+				temp_param_set_payload.param_set_id = int(param_set_id)
+			except ValueError:
+				show_error(
+					'Invalid ParamSet ID',
+					f'ParamSet ID "{param_set_id}" is not a valid integer.',
+					'',
+					parent=self,
+					blocking=True,
+				)
+				return
+
+			# Extract and set field values
+			for field_name, (textbox, field_type) in field_inputs.items():
+				raw_value = textbox.text().strip()
+				fields[field_name] = {
+					'value': raw_value,
+					'type': field_type,
+				}
+				try:
+					value = self._parse_value(field_type, raw_value)
+					setattr(temp_param_set_payload, field_name, value)
+				except Exception as ex:
+					show_error(
+						'Invalid field value',
+						f'Could not parse field "{field_name}" for ParamSet {param_set_id}.',
+						f'Type: {field_type}\nValue: {raw_value}\nError: {ex}',
+						parent=self,
+						blocking=True,
+					)
+					return
+
+			# Add the populated payload to the param set file
+			self._param_set_file.add_param_set(temp_param_set_payload)
+			extracted_param_sets[param_set_id] = fields
+
+		logger.info('Extracted fields from %d ParamSet groupboxes', len(extracted_param_sets))
+		# Calculate the CRC
+		self._param_set_file.calculate_crc()
+
+		# Serialize and write to file
+		try:
+			data = self._param_set_file.serialize()
+			with open(save_path, 'wb') as f:
+				f.write(data)
+			logger.info('Config file written to %s (%d bytes)', save_path, len(data))
+			self._show_ok_dialog('Create Config File', f'Config file saved to:\n{save_path}')
+		except Exception as ex:
+			logger.exception('Failed to write config file: %s', ex)
+			show_error('Save Error', 'Could not write config file.', str(ex), parent=self, blocking=True)
+
+	def _on_read_config_file_clicked(self):
+		'''
+		@brief    Handle Read Config File button click.
+		@return   None
+		'''
+		filename, _ = QFileDialog.getOpenFileName(
+			self,
+			'Read Config File',
+			'',
+			'Binary config files (*.bin);;All files (*.*)'
+		)
+		if not filename:
+			return
+
+		try:
+			with open(filename, 'rb') as file_handle:
+				data = file_handle.read()
+		except Exception as ex:
+			logger.exception('Failed to read config file: %s', ex)
+			show_error('Read Error', 'Could not read config file.', str(ex), parent=self, blocking=True)
+			return
+
+		try:
+			self._param_set_file.clear()
+			self._param_set_file.deserialize(data)
+		except Exception as ex:
+			logger.exception('Failed to deserialize config file: %s', ex)
+			show_error('Read Error', 'Could not parse config file.', str(ex), parent=self, blocking=True)
+			return
+
+		self._clear_all_param_set_groupboxes()
+
+		design_constants_payload = self._param_set_file._design_constants_set_payload
+		for field_name, textbox in self._field_inputs.items():
+			if not hasattr(design_constants_payload, field_name):
+				continue
+			textbox.blockSignals(True)
+			textbox.setText(str(getattr(design_constants_payload, field_name)))
+			textbox.blockSignals(False)
+
+		for param_set_payload in self._param_set_file._param_sets:
+			param_set_id = str(param_set_payload.param_set_id)
+			self._add_param_set_editing_content(param_set_id)
+			field_inputs = self._param_set_field_inputs.get(param_set_id, {})
+			for field_name, (textbox, _field_type) in field_inputs.items():
+				if not hasattr(param_set_payload, field_name):
+					continue
+				textbox.blockSignals(True)
+				textbox.setText(str(getattr(param_set_payload, field_name)))
+				textbox.blockSignals(False)
+			self._param_set_dirty[param_set_id] = False
+
+		self._version_textbox.setText(str(self._param_set_file._version))
+		self._crc32_textbox.setText(f'{self._param_set_file.calculate_crc():08X}')
+		self._dirty_textbox.setText('False')
+		logger.info('Config file loaded from %s with %d ParamSet entries', filename, self._param_set_file._num_param_set)
+		self._show_ok_dialog('Read Config File', f'Config file loaded from:\n{filename}')
+
+	def _clear_all_param_set_groupboxes(self):
+		'''
+		@brief    Remove all ParamSet editing groupboxes without prompting the user.
+		@return   None
+		'''
+		for param_set_id, groupbox in list(self._param_set_groupboxes.items()):
+			self._param_set_dirty.pop(param_set_id, None)
+			self._param_set_field_inputs.pop(param_set_id, None)
+			self._param_set_groupboxes.pop(param_set_id, None)
+			if param_set_id in self._param_set_id_list:
+				self._param_set_id_list.remove(param_set_id)
+			used_color = self._param_set_color_map.pop(param_set_id, None)
+			if used_color and used_color in _PARAM_SET_LIGHT_COLORS and used_color not in self._available_colors:
+				self._available_colors.append(used_color)
+			self._param_set_container_layout.removeWidget(groupbox)
+			groupbox.deleteLater()
 
 	def _add_param_set_editing_content(self, param_set_id):
 		'''
