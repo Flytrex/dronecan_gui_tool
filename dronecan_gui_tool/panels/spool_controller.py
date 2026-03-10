@@ -43,6 +43,7 @@ PARAM_SET_GROUPBOX_HEIGHT = 200                     # Fixed height (px) for each
 PARAM_SET_GROUPBOX_WIDTH = 400                      # Fixed width (px) for each ParamSet editing groupbox
 RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
 CONFIG_FILE_TRANSFER_TIMEOUT = 30                   # Number of seconds to wait for a config file upload/download to complete before showing a timeout error dialog
+BROADCAST_PRIORITY = 16                             # DroneCAN message broadcast priority (lower number = higher priority)
 
 _PARAM_SET_LIGHT_COLORS = [                         # Pool of light background colors assigned to ParamSet groupboxes
 	'#FFFFCC',  # light yellow
@@ -183,6 +184,13 @@ class SpoolControllerPanel(QDialog):
 		self._recall_param_set_handle = None           # Shared DroneCAN handler for ParamSet responses (active when any ParamSet recall is pending)
 		self._pending_param_set_recalls = {}           # param_set_id -> QTimer for each pending ParamSet recall
 		self._pending_param_set_compare = {}           # param_set_id -> {field_name: value} for store-then-recall compare
+		self._pending_param_set_compare_notified = {}  # param_set_id -> bool indicating store success dialog shown
+		self._pending_design_constants_compare = None  # {field_name: value} for store-then-recall compare
+		self._param_set_store_response_handle = None   # Shared DroneCAN handler for ParamSet store responses
+		self._pending_param_set_stores = {}            # param_set_id -> QTimer for each pending ParamSet store
+		self._pending_param_set_store_snapshots = {}   # param_set_id -> {field_name: value} snapshot waiting for store response
+		self._param_set_execute_response_handle = None  # Shared DroneCAN handler for ParamSet execute responses
+		self._pending_param_set_executes = {}          # param_set_id -> QTimer for each pending ParamSet execute
 
 		self._upload_response_handle = None            # DroneCAN handler handle for WriteConfigFile (active during upload)
 		self._upload_timeout_timer = None              # QTimer for WriteConfigFile upload timeout
@@ -191,6 +199,9 @@ class SpoolControllerPanel(QDialog):
 		self._config_transfer_timer = None             # QTimer for config file transfer timeout
 		self._config_transfer_key = None               # File server key used to track transfer activity
 		self._config_transfer_start_hits = 0           # Hit count at transfer start
+		self._store_constants_response_handle = None   # DroneCAN handler handle for DesignConstantsSet store response
+		self._store_constants_timeout_timer = None     # QTimer for DesignConstantsSet store timeout
+		self._pending_store_constants_snapshot = None  # Snapshot of values sent during OPERATION_STORE
 
 		self._setup_ui()
 
@@ -465,7 +476,7 @@ class SpoolControllerPanel(QDialog):
 		self._upload_button.setEnabled(False)
 
 		try:
-			self._node.broadcast(msg)
+			self._node.broadcast(msg, priority=BROADCAST_PRIORITY)
 			logger.info('Broadcast WriteConfigFile for %s', remote_config_file)
 		except Exception as ex:
 			logger.exception('Failed to broadcast WriteConfigFile: %s', ex)
@@ -537,7 +548,7 @@ class SpoolControllerPanel(QDialog):
 		self._download_button.setEnabled(False)
 
 		try:
-			self._node.broadcast(msg)
+			self._node.broadcast(msg, priority=BROADCAST_PRIORITY)
 			logger.info('Broadcast ReadConfigFile for %s', download_path)
 		except Exception as ex:
 			logger.exception('Failed to broadcast ReadConfigFile: %s', ex)
@@ -852,7 +863,7 @@ class SpoolControllerPanel(QDialog):
 					return False
 
 		try:
-			self._node.broadcast(msg)
+			self._node.broadcast(msg, priority=BROADCAST_PRIORITY)
 			logger.info('Broadcast ParamSet with operation %s for param_id=%s', operation, param_set_id)
 		except Exception as ex:
 			logger.exception('Failed to broadcast ParamSet: %s', ex)
@@ -925,6 +936,103 @@ class SpoolControllerPanel(QDialog):
 		'''
 		self._show_ok_dialog('Store Failed', "Store didn't work!")
 
+	@staticmethod
+	def _parse_error_msg(error_obj, operation_context):
+		'''
+		@brief    Parse a DroneCAN error object and return appropriate user-facing messages.
+		@param    error_obj - The error object from a DroneCAN message (e.g., msg.error).
+		@param    operation_context - String describing the operation (e.g., 'upload', 'download', 'execute', 'store', 'recall').
+		@return   Tuple of (dialog_title, dialog_message, log_message) or None if STATUS_OK.
+		'''
+		if not hasattr(error_obj, 'value'):
+			return ('Error', f'{operation_context.capitalize()} failed with unknown error.', 'Unknown error object')
+
+		error_value = error_obj.value
+
+		# STATUS_OK = 0
+		if error_value == 0:
+			return None
+
+		# Map error codes to messages
+		if hasattr(error_obj, 'STATUS_FILE_NOT_FOUND') and error_value == error_obj.STATUS_FILE_NOT_FOUND:
+			return (
+				f'{operation_context.capitalize()} Error',
+				'The spool controller could not find the file on the file server. Please check that the file was uploaded correctly and try again.',
+				f'{operation_context} failed with file not found error'
+			)
+		elif hasattr(error_obj, 'STATUS_IO_ERROR') and error_value == error_obj.STATUS_IO_ERROR:
+			return (
+				f'{operation_context.capitalize()} Error',
+				'An I/O error occurred while the spool controller was processing the request. Please try again.',
+				f'{operation_context} failed with I/O error'
+			)
+		elif hasattr(error_obj, 'STATUS_ACCESS_DENIED') and error_value == error_obj.STATUS_ACCESS_DENIED:
+			return (
+				f'{operation_context.capitalize()} Error',
+				'The spool controller was denied access. Please check permissions and try again.',
+				f'{operation_context} failed with access denied error'
+			)
+		elif hasattr(error_obj, 'STATUS_IS_DIRECTORY') and error_value == error_obj.STATUS_IS_DIRECTORY:
+			return (
+				f'{operation_context.capitalize()} Error',
+				'The specified path is a directory, not a file. Please check the path and try again.',
+				f'{operation_context} failed with is directory error'
+			)
+		elif hasattr(error_obj, 'STATUS_INVALID_VALUE') and error_value == error_obj.STATUS_INVALID_VALUE:
+			return (
+				f'{operation_context.capitalize()} Error',
+				'The request was invalid. Please check the parameters and try again.',
+				f'{operation_context} failed with invalid value error'
+			)
+		elif hasattr(error_obj, 'STATUS_FILE_TOO_LARGE') and error_value == error_obj.STATUS_FILE_TOO_LARGE:
+			return (
+				f'{operation_context.capitalize()} Error',
+				'The file is too large for the spool controller to handle. Please check the file size and try again.',
+				f'{operation_context} failed with file too large error'
+			)
+		elif hasattr(error_obj, 'STATUS_OUT_OF_SPACE') and error_value == error_obj.STATUS_OUT_OF_SPACE:
+			return (
+				f'{operation_context.capitalize()} Error',
+				'The spool controller does not have enough space. Please free up space and try again.',
+				f'{operation_context} failed with out of space error'
+			)
+		elif hasattr(error_obj, 'STATUS_NOT_IMPLEMENTED') and error_value == error_obj.STATUS_NOT_IMPLEMENTED:
+			return (
+				f'{operation_context.capitalize()} Error',
+				f'The spool controller does not support {operation_context} operations. Please check the controller capabilities and try again.',
+				f'{operation_context} failed with not implemented error'
+			)
+		elif hasattr(error_obj, 'STATUS_IDX_OUT_OF_BOUNDS') and error_value == error_obj.STATUS_IDX_OUT_OF_BOUNDS:
+			return (
+				f'{operation_context.capitalize()} Error',
+				'The request index was out of bounds. Please check the parameters and try again.',
+				f'{operation_context} failed with index out of bounds error'
+			)
+		elif hasattr(error_obj, 'STATUS_BUSY') and error_value == error_obj.STATUS_BUSY:
+			return (
+				f'{operation_context.capitalize()} Status',
+				'The spool controller is busy. Please try again later.',
+				f'{operation_context} failed - controller busy'
+			)
+		elif hasattr(error_obj, 'STATUS_LOW_MEM') and error_value == error_obj.STATUS_LOW_MEM:
+			return (
+				f'{operation_context.capitalize()} Status',
+				'The spool controller has low memory. Please try again later.',
+				f'{operation_context} failed - low memory'
+			)
+		elif hasattr(error_obj, 'STATUS_UNKNOWN_ERROR') and error_value == error_obj.STATUS_UNKNOWN_ERROR:
+			return (
+				f'{operation_context.capitalize()} Error',
+				f'An unknown error occurred during {operation_context}.',
+				f'{operation_context} failed with unknown error'
+			)
+		else:
+			return (
+				f'{operation_context.capitalize()} Error',
+				f'{operation_context.capitalize()} failed with error code: {error_value}',
+				f'{operation_context} failed with error code {error_value}'
+			)
+
 
 	def _on_param_set_execute(self, param_set_id):
 		'''
@@ -932,12 +1040,51 @@ class SpoolControllerPanel(QDialog):
 		@param    param_set_id - The ParamSet ID to execute.
 		@return   None
 		'''
+		# Clean up any previous execute handler for this param_set_id
+		self._cleanup_param_set_execute(param_set_id)
 
-		self._send_param_set_msg(param_set_id, 'OPERATION_EXECUTE')
+		# Disable the groupbox while waiting for the response
+		groupbox = self._param_set_groupboxes.get(param_set_id)
+		if groupbox is not None:
+			groupbox.setEnabled(False)
+
+		if not self._send_param_set_msg(param_set_id, 'OPERATION_EXECUTE'):
+			if groupbox is not None:
+				groupbox.setEnabled(True)
+			return
+
+		# Register the shared handler if this is the first pending execute
+		if not self._pending_param_set_executes and self._param_set_execute_response_handle is None:
+			try:
+				self._param_set_execute_response_handle = self._node.add_handler(
+					dronecan.flytrex.delcon.ParamSet,
+					self._on_param_set_execute_response,
+				)
+			except Exception as ex:
+				logger.exception('Could not register ParamSet execute handler: %s', ex)
+				if groupbox is not None:
+					groupbox.setEnabled(True)
+				return
+
+		# Start a per-ID timeout timer
+		timer = QTimer(self)
+		timer.setSingleShot(True)
+		timer.timeout.connect(
+			lambda _id=param_set_id: (
+				self._cleanup_param_set_execute(_id),
+				self._on_recall_timeout(
+					f'No ParamSet OPERATION_RESPONSE for ParamSet ID {_id} was received within {RESPONSE_TIMEOUT} seconds.\n\n'
+					f'The spool controller may be offline or not responding.'
+				),
+			),
+		)
+		self._pending_param_set_executes[param_set_id] = timer
+		timer.start(RESPONSE_TIMEOUT * 1000)
 
 	def _on_param_set_store(self, param_set_id):
 		'''
 		@brief    Handle Store button click: broadcast a flytrex.delcon.ParamSet message with OPERATION_STORE.
+		          Waits for a response to check error status before proceeding with recall.
 		@param    param_set_id - The ParamSet ID to store.
 		@return   None
 		'''
@@ -945,11 +1092,50 @@ class SpoolControllerPanel(QDialog):
 		if snapshot is None:
 			return
 
+		# Clean up any previous store handler for this param_set_id
+		self._cleanup_param_set_store(param_set_id)
+
+		# Disable the groupbox while waiting for the response
+		groupbox = self._param_set_groupboxes.get(param_set_id)
+		if groupbox is not None:
+			groupbox.setEnabled(False)
+
 		if not self._send_param_set_msg(param_set_id, 'OPERATION_STORE'):
+			if groupbox is not None:
+				groupbox.setEnabled(True)
 			return
 
-		self._pending_param_set_compare[param_set_id] = snapshot
-		self._on_param_set_recall(param_set_id)
+		# Store snapshot for later comparison
+		self._pending_param_set_store_snapshots[param_set_id] = snapshot
+
+		# Register the shared handler if this is the first pending store
+		if not self._pending_param_set_stores and self._param_set_store_response_handle is None:
+			try:
+				self._param_set_store_response_handle = self._node.add_handler(
+					dronecan.flytrex.delcon.ParamSet,
+					self._on_param_set_store_response,
+				)
+			except Exception as ex:
+				logger.exception('Could not register ParamSet store handler: %s', ex)
+				if groupbox is not None:
+					groupbox.setEnabled(True)
+				self._pending_param_set_store_snapshots.pop(param_set_id, None)
+				return
+
+		# Start a per-ID timeout timer
+		timer = QTimer(self)
+		timer.setSingleShot(True)
+		timer.timeout.connect(
+			lambda _id=param_set_id: (
+				self._cleanup_param_set_store(_id),
+				self._on_recall_timeout(
+					f'No ParamSet OPERATION_STORE response for ParamSet ID {_id} was received within {RESPONSE_TIMEOUT} seconds.\n\n'
+					f'The spool controller may be offline or not responding.'
+				),
+			)
+		)
+		self._pending_param_set_stores[param_set_id] = timer
+		timer.start(RESPONSE_TIMEOUT * 1000)
 
 	def _on_param_set_recall(self, param_set_id):
 		'''
@@ -1028,7 +1214,7 @@ class SpoolControllerPanel(QDialog):
 		msg.operation = msg.OPERATION_RECALL
 
 		try:
-			self._node.broadcast(msg)
+			self._node.broadcast(msg, priority=BROADCAST_PRIORITY)
 			logger.info('Broadcast DesignConstantsSet OPERATION_RECALL')
 		except Exception as ex:
 			logger.exception('Failed to broadcast DesignConstantsSet: %s', ex)
@@ -1055,6 +1241,7 @@ class SpoolControllerPanel(QDialog):
 		self._recall_constants_timeout_timer.timeout.connect(
 			lambda: (
 				self._cleanup_recall_handler(),
+				self._clear_pending_design_constants_compare(),
 				self._on_recall_timeout(
 					f'No DesignConstantsSet OPERATION_RESPONSE was received within {RESPONSE_TIMEOUT} seconds.\n\n'
 					f'The spool controller may be offline or not responding.'
@@ -1076,6 +1263,33 @@ class SpoolControllerPanel(QDialog):
 		# Check that the 'operation' field is OPERATION_RESPONSE
 		if msg.operation != msg.OPERATION_RESPONSE:
 			logger.warning('DesignConstantsSet received with unexpected operation: %s', msg.operation)
+			return
+
+		# Check for errors in the response
+		if hasattr(msg, 'error') and hasattr(msg.error, 'value'):
+			if msg.error.value != 0:  # STATUS_OK is 0
+				error_info = self._parse_error_msg(msg.error, 'recall DesignConstantsSet')
+				if error_info:
+					title, message, log_msg = error_info
+					self._show_ok_dialog(title, message)
+					logger.warning(log_msg)
+				return
+
+		compare_snapshot = self._pending_design_constants_compare
+		self._pending_design_constants_compare = None
+		if compare_snapshot is not None:
+			for field_name, textbox in self._field_inputs.items():
+				if not hasattr(msg, field_name):
+					continue
+				recalled_value = getattr(msg, field_name, None)
+				if recalled_value is None:
+					continue
+				stored_value = compare_snapshot.get(field_name)
+				if not self._values_match(stored_value, recalled_value):
+					self._show_ok_dialog('Constants', 'Constants send failed!')
+					logger.warning('DesignConstants compare failed for field %s', field_name)
+					return
+			self._show_ok_dialog('Constants', 'Constants were set!')
 			return
 
 		for field_name, textbox in self._field_inputs.items():
@@ -1110,6 +1324,16 @@ class SpoolControllerPanel(QDialog):
 			logger.warning('ParamSet response received but no field inputs found for ParamSet ID %s', param_set_id)
 			return
 
+		# Check for errors in the response
+		if hasattr(msg, 'error') and hasattr(msg.error, 'value'):
+			if msg.error.value != 0:  # STATUS_OK is 0
+				error_info = self._parse_error_msg(msg.error, f'recall ParamSet {param_set_id}')
+				if error_info:
+					title, message, log_msg = error_info
+					self._show_ok_dialog(title, message)
+					logger.warning(log_msg)
+				return
+
 		if compare_snapshot is not None:
 			for field_name, (textbox, field_type) in field_inputs.items():
 				if not hasattr(msg, field_name):
@@ -1119,17 +1343,93 @@ class SpoolControllerPanel(QDialog):
 					continue
 				stored_value = compare_snapshot.get(field_name)
 				if not self._values_match(stored_value, recalled_value):
-					self._show_store_failed()
+					self._show_ok_dialog('ParamSet', f'ParamSet {param_set_id} store verification failed.')
 					logger.warning('Store compare failed for ParamSet %s field %s', param_set_id, field_name)
 					return
+			if not self._pending_param_set_compare_notified.pop(param_set_id, False):
+				self._show_ok_dialog('ParamSet', f'ParamSet {param_set_id} stored successfully.')
 			logger.info('Store compare matched for ParamSet %s', param_set_id)
+			self._param_set_dirty[param_set_id] = False
 			return
 
 		for field_name, (textbox, field_type) in field_inputs.items():
 			value = getattr(msg, field_name, None)
 			if value is not None:
+				textbox.blockSignals(True)
 				textbox.setText(str(value))
+				textbox.blockSignals(False)
+		self._param_set_dirty[param_set_id] = False
 		logger.info('ParamSet OPERATION_RESPONSE received — ParamSet %s fields populated', param_set_id)
+
+	def _on_param_set_store_response(self, event):
+		'''
+		@brief    Handle an incoming ParamSet response to OPERATION_STORE.
+		@param    event - DroneCAN transfer event containing the response message.
+		@return   None
+		'''
+		msg = event.message
+		# Check that the 'operation' field is OPERATION_RESPONSE
+		if msg.operation != msg.OPERATION_RESPONSE:
+			return
+
+		param_set_id = str(msg.param_id)
+		if param_set_id not in self._pending_param_set_stores:
+			logger.warning('ParamSet store response for param_id=%s but no pending store', param_set_id)
+			return
+
+		snapshot = self._pending_param_set_store_snapshots.get(param_set_id)
+		self._cleanup_param_set_store(param_set_id)
+
+		logger.info('ParamSet OPERATION_STORE response received for param_id=%s: error=%s', param_set_id, msg.error.value if hasattr(msg, 'error') else 'N/A')
+
+		# Check for errors in the response
+		if hasattr(msg, 'error') and hasattr(msg.error, 'value'):
+			if msg.error.value != 0:  # STATUS_OK is 0
+				error_info = self._parse_error_msg(msg.error, f'store ParamSet {param_set_id}')
+				if error_info:
+					title, message, log_msg = error_info
+					self._show_ok_dialog(title, message)
+					logger.warning(log_msg)
+				return
+
+		# Store successful - proceed with recall to verify
+		if snapshot is not None:
+			self._pending_param_set_compare[param_set_id] = snapshot
+			self._pending_param_set_compare_notified[param_set_id] = True
+			self._show_ok_dialog('ParamSet', f'ParamSet {param_set_id} stored successfully.')
+			logger.info('ParamSet store successful for param_id=%s, proceeding with recall', param_set_id)
+			self._on_param_set_recall(param_set_id)
+		else:
+			logger.warning('ParamSet store response received for param_id=%s but no snapshot found', param_set_id)
+
+	def _on_param_set_execute_response(self, event):
+		'''
+		@brief    Handle an incoming ParamSet response to OPERATION_EXECUTE.
+		@param    event - DroneCAN transfer event containing the response message.
+		@return   None
+		'''
+		msg = event.message
+		# Check that the 'operation' field is OPERATION_RESPONSE
+		if msg.operation != msg.OPERATION_RESPONSE:
+			return
+
+		param_set_id = str(msg.param_id)
+		if param_set_id not in self._pending_param_set_executes:
+			return
+
+		self._cleanup_param_set_execute(param_set_id)
+
+		# Check for errors in the response
+		if hasattr(msg, 'error') and hasattr(msg.error, 'value'):
+			if msg.error.value != 0:  # STATUS_OK is 0
+				error_info = self._parse_error_msg(msg.error, f'execute ParamSet {param_set_id}')
+				if error_info:
+					title, message, log_msg = error_info
+					self._show_ok_dialog(title, message)
+					logger.warning(log_msg)
+				return
+
+		self._show_ok_dialog('ParamSet', f'ParamSet {param_set_id} executed successfully.')
 
 	def _on_recall_timeout(self, message):
 		'''
@@ -1151,21 +1451,19 @@ class SpoolControllerPanel(QDialog):
 		self._cleanup_upload_handler()
 
 		msg = event.message
-		logger.info('WriteConfigFile response received: status=%s', msg.status)
+		logger.info('WriteConfigFile response received: error=%s', msg.error.value)
 
 		try:
-			if msg.status == msg.STATUS_OK:
+			if msg.error.value == msg.error.STATUS_OK:
 				logger.info('Upload successful. Spool controller is reading the config file.')
 				self._start_config_transfer_timeout()
 				self._show_ok_dialog('Upload Complete', 'Config file upload request accepted. The spool controller is reading the file.')
-			elif msg.status == msg.STATUS_BUSY:
-				self._show_ok_dialog('Upload Status', 'The spool controller is busy. Please try again later.')
-			elif msg.status == msg.STATUS_LOW_MEM:
-				self._show_ok_dialog('Upload Status', 'The spool controller has low memory. Please try again later.')
-			elif msg.status == msg.STATUS_UNKNOWN_ERR:
-				self._show_ok_dialog('Upload Error', 'An unknown error occurred during upload.')
 			else:
-				self._show_ok_dialog('Upload Error', f'Upload failed with status code: {msg.status}')
+				error_info = self._parse_error_msg(msg.error, 'upload')
+				if error_info:
+					title, message, log_msg = error_info
+					self._show_ok_dialog(title, message)
+					logger.warning(log_msg)
 		except Exception as ex:
 			logger.exception('Error processing upload response: %s', ex)
 			self._show_ok_dialog('Upload Error', f'Error processing upload response: {ex}')
@@ -1293,6 +1591,23 @@ class SpoolControllerPanel(QDialog):
 		if self._design_const_set_group is not None:
 			self._design_const_set_group.setEnabled(True)
 
+	def _cleanup_store_constants_handler(self):
+		'''
+		@brief    Remove the DesignConstantsSet store handler and stop the timeout timer.
+		@return   None
+		'''
+		if self._store_constants_timeout_timer is not None:
+			self._store_constants_timeout_timer.stop()
+			self._store_constants_timeout_timer = None
+		if self._store_constants_response_handle is not None:
+			try:
+				self._store_constants_response_handle.remove()
+			except Exception:
+				pass
+			self._store_constants_response_handle = None
+		if self._design_const_set_group is not None:
+			self._design_const_set_group.setEnabled(True)
+
 	def _cleanup_param_set_recall(self, param_set_id):
 		'''
 		@brief    Clean up a single pending ParamSet recall: stop its timer, re-enable
@@ -1304,6 +1619,7 @@ class SpoolControllerPanel(QDialog):
 		if timer is not None:
 			timer.stop()
 		self._pending_param_set_compare.pop(param_set_id, None)
+		self._pending_param_set_compare_notified.pop(param_set_id, None)
 		# Re-enable the groupbox
 		groupbox = self._param_set_groupboxes.get(param_set_id)
 		if groupbox is not None:
@@ -1324,14 +1640,92 @@ class SpoolControllerPanel(QDialog):
 		for pid in list(self._pending_param_set_recalls):
 			self._cleanup_param_set_recall(pid)
 
+	def _cleanup_param_set_store(self, param_set_id):
+		'''
+		@brief    Clean up a single pending ParamSet store: stop its timer, re-enable
+		          its groupbox, and remove the shared handler if no stores remain.
+		@param    param_set_id - The ParamSet ID whose store is being cleaned up.
+		@return   None
+		'''
+		timer = self._pending_param_set_stores.pop(param_set_id, None)
+		if timer is not None:
+			timer.stop()
+		self._pending_param_set_store_snapshots.pop(param_set_id, None)
+		# Re-enable the groupbox
+		groupbox = self._param_set_groupboxes.get(param_set_id)
+		if groupbox is not None:
+			groupbox.setEnabled(True)
+		# Remove the shared handler if no more pending stores
+		if not self._pending_param_set_stores and self._param_set_store_response_handle is not None:
+			try:
+				self._param_set_store_response_handle.remove()
+			except Exception:
+				pass
+			self._param_set_store_response_handle = None
+
+	def _cleanup_param_set_execute(self, param_set_id):
+		'''
+		@brief    Clean up a single pending ParamSet execute: stop its timer, re-enable
+		          its groupbox, and remove the shared handler if no executes remain.
+		@param    param_set_id - The ParamSet ID whose execute is being cleaned up.
+		@return   None
+		'''
+		timer = self._pending_param_set_executes.pop(param_set_id, None)
+		if timer is not None:
+			timer.stop()
+		# Re-enable the groupbox
+		groupbox = self._param_set_groupboxes.get(param_set_id)
+		if groupbox is not None:
+			groupbox.setEnabled(True)
+		# Remove the shared handler if no more pending executes
+		if not self._pending_param_set_executes and self._param_set_execute_response_handle is not None:
+			try:
+				self._param_set_execute_response_handle.remove()
+			except Exception:
+				pass
+			self._param_set_execute_response_handle = None
+
+	def _cleanup_param_set_store_handler(self):
+		'''
+		@brief    Clean up all pending ParamSet stores. Used during panel shutdown.
+		@return   None
+		'''
+		for pid in list(self._pending_param_set_stores):
+			self._cleanup_param_set_store(pid)
+
+	def _cleanup_param_set_execute_handler(self):
+		'''
+		@brief    Clean up all pending ParamSet executes. Used during panel shutdown.
+		@return   None
+		'''
+		for pid in list(self._pending_param_set_executes):
+			self._cleanup_param_set_execute(pid)
+
 	def _on_design_constants_store(self):
 		'''
 		@brief    Handle Store button click: broadcast a flytrex.delcon.DesignConstantsSet message with OPERATION_STORE.
+		          Waits for a response to check error status before proceeding with recall.
 		@return   None
 		'''
 		if not self._field_inputs:
 			show_error('Store Error', 'No design constant fields found.', '', parent=self, blocking=True)
 			return
+
+		snapshot = {}
+		for field_name, textbox in self._field_inputs.items():
+			raw_value = textbox.text().strip()
+			field_type = self._design_constants_fields.get(field_name, {}).get('type', 'float32')
+			try:
+				snapshot[field_name] = self._parse_value(field_type, raw_value)
+			except Exception as ex:
+				show_error(
+					'Invalid field value',
+					f'Could not parse field "{field_name}" for compare.',
+					f'Type: {field_type}\nValue: {raw_value}\nError: {ex}',
+					parent=self,
+					blocking=True,
+				)
+				return
 
 		try:
 			msg = dronecan.flytrex.delcon.DesignConstantsSet()
@@ -1367,12 +1761,94 @@ class SpoolControllerPanel(QDialog):
 				)
 				return
 
+		# Clean up any previous store handler
+		self._cleanup_store_constants_handler()
+
+		# Disable the groupbox while waiting for the response
+		if self._design_const_set_group is not None:
+			self._design_const_set_group.setEnabled(False)
+
 		try:
-			self._node.broadcast(msg)
+			self._node.broadcast(msg, priority=BROADCAST_PRIORITY)
 			logger.info('Broadcast DesignConstantsSet OPERATION_STORE')
 		except Exception as ex:
 			logger.exception('Failed to broadcast DesignConstantsSet: %s', ex)
 			show_error('Broadcast failed', 'Could not broadcast DesignConstantsSet.', str(ex), parent=self, blocking=True)
+			if self._design_const_set_group is not None:
+				self._design_const_set_group.setEnabled(True)
+			return
+
+		# Store snapshot for later comparison
+		self._pending_store_constants_snapshot = snapshot
+
+		# Register handler for the response message
+		try:
+			self._store_constants_response_handle = self._node.add_handler(
+				dronecan.flytrex.delcon.DesignConstantsSet,
+				self._on_design_constants_store_response,
+			)
+		except Exception as ex:
+			logger.exception('Could not register DesignConstantsSet store handler: %s', ex)
+			if self._design_const_set_group is not None:
+				self._design_const_set_group.setEnabled(True)
+			self._pending_store_constants_snapshot = None
+			return
+
+		# Start timeout timer
+		self._store_constants_timeout_timer = QTimer(self)
+		self._store_constants_timeout_timer.setSingleShot(True)
+		self._store_constants_timeout_timer.timeout.connect(
+			lambda: (
+				self._cleanup_store_constants_handler(),
+				self._on_recall_timeout(
+					f'No DesignConstantsSet OPERATION_STORE response was received within {RESPONSE_TIMEOUT} seconds.\n\n'
+					f'The spool controller may be offline or not responding.'
+				),
+			)
+		)
+		self._store_constants_timeout_timer.start(RESPONSE_TIMEOUT * 1000)
+
+	def _on_design_constants_store_response(self, event):
+		'''
+		@brief    Handle an incoming DesignConstantsSet response to OPERATION_STORE.
+		@param    event - DroneCAN transfer event containing the response message.
+		@return   None
+		'''
+		self._cleanup_store_constants_handler()
+
+		msg = event.message
+		# Check that the 'operation' field is OPERATION_RESPONSE
+		if msg.operation != msg.OPERATION_RESPONSE:
+			return
+
+		logger.info('DesignConstantsSet OPERATION_STORE response received: error=%s', msg.error.value if hasattr(msg, 'error') else 'N/A')
+
+		# Check for errors in the response
+		if hasattr(msg, 'error') and hasattr(msg.error, 'value'):
+			if msg.error.value != 0:  # STATUS_OK is 0
+				error_info = self._parse_error_msg(msg.error, 'store DesignConstantsSet')
+				if error_info:
+					title, message, log_msg = error_info
+					self._show_ok_dialog(title, message)
+					logger.warning(log_msg)
+				self._pending_store_constants_snapshot = None
+				return
+
+		# Store successful - proceed with recall to verify
+		if self._pending_store_constants_snapshot is not None:
+			self._pending_design_constants_compare = self._pending_store_constants_snapshot
+			self._pending_store_constants_snapshot = None
+			logger.info('DesignConstantsSet store successful, proceeding with recall')
+			self._on_design_constants_recall()
+		else:
+			logger.warning('DesignConstantsSet store response received but no snapshot found')
+
+	def _clear_pending_design_constants_compare(self):
+		'''
+		@brief    Clear pending DesignConstantsSet compare snapshot.
+		@return   None
+		'''
+		self._pending_design_constants_compare = None
 
 	def _on_download_browse_clicked(self):
 		'''
@@ -1403,19 +1879,17 @@ class SpoolControllerPanel(QDialog):
 		self._cleanup_download_handler()
 
 		msg = event.message
-		logger.info('ReadConfigFile response received: status=%s', msg.status)
+		logger.info('ReadConfigFile response received: error=%s', msg.error.value)
 
 		try:
-			if msg.status == msg.STATUS_OK:
+			if msg.error.value == msg.error.STATUS_OK:
 				self._show_ok_dialog('Download Started', 'ReadConfigFile request accepted.')
-			elif msg.status == msg.STATUS_BUSY:
-				self._show_ok_dialog('Download Status', 'The spool controller is busy. Please try again later.')
-			elif msg.status == msg.STATUS_LOW_MEM:
-				self._show_ok_dialog('Download Status', 'The spool controller has low memory. Please try again later.')
-			elif msg.status == msg.STATUS_UNKNOWN_ERR:
-				self._show_ok_dialog('Download Error', 'An unknown error occurred during download.')
 			else:
-				self._show_ok_dialog('Download Error', f'Download failed with status code: {msg.status}')
+				error_info = self._parse_error_msg(msg.error, 'download')
+				if error_info:
+					title, message, log_msg = error_info
+					self._show_ok_dialog(title, message)
+					logger.warning(log_msg)
 		except Exception as ex:
 			logger.exception('Error processing download response: %s', ex)
 			self._show_ok_dialog('Download Error', f'Error processing download response: {ex}')
@@ -1698,7 +2172,19 @@ class SpoolControllerPanel(QDialog):
 		except Exception:
 			pass
 		try:
+			self._cleanup_store_constants_handler()
+		except Exception:
+			pass
+		try:
 			self._cleanup_param_set_recall_handler()
+		except Exception:
+			pass
+		try:
+			self._cleanup_param_set_store_handler()
+		except Exception:
+			pass
+		try:
+			self._cleanup_param_set_execute_handler()
 		except Exception:
 			pass
 
