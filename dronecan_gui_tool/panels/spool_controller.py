@@ -248,7 +248,7 @@ class ParamSetFile:
 	@brief    Class representing a ParamSet definition file, responsible for parsing the file and providing field definitions.
 	'''
 
-	CRC_HEADER_INITIAL = 0xF00FF00F  # Initial CRC value for the header section, used to verify that the header CRC is calculated correctly (matches the C++ implementation)
+	CRC_HEADER_INITIAL = 0x560D5450  # Initial CRC value for the header section, used to verify that the header CRC is calculated correctly (matches the C++ implementation)
 	HEADER_FORMAT = '<BHII'
 	HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 	VERSION = 1
@@ -348,7 +348,7 @@ class ParamSetFile:
 		payload_bytes = self._design_constants_set_payload.serialize()
 		for param_set in self._param_sets:
 			payload_bytes += param_set.serialize()
-		self._payload_crc = calculate_crc32(payload_bytes)
+		self._payload_crc = calculate_crc32(payload_bytes, self.CRC_HEADER_INITIAL)
 
 		return self._payload_crc
 
@@ -528,9 +528,11 @@ class SpoolControllerPanel(QDialog):
 		self._upload_timeout_timer = None              # QTimer for WriteConfigFile upload timeout
 		self._download_response_handle = None          # DroneCAN handler handle for ReadConfigFile (active during download)
 		self._download_timeout_timer = None            # QTimer for ReadConfigFile download timeout
-		self._config_transfer_timer = None             # QTimer for config file transfer timeout
+		self._config_transfer_timer = None             # QTimer for config file transfer overall timeout
+		self._config_transfer_inactivity_timer = None  # QTimer for polling file server hit counters (inactivity detection)
 		self._config_transfer_key = None               # File server key used to track transfer activity
 		self._config_transfer_start_hits = 0           # Hit count at transfer start
+		self._config_transfer_last_hits = 0            # Hit count at last inactivity poll
 		self._store_constants_response_handle = None   # DroneCAN handler handle for DesignConstantsSet store response
 		self._store_constants_timeout_timer = None     # QTimer for DesignConstantsSet store timeout
 		self._pending_store_constants_snapshot = None  # Snapshot of values sent during OPERATION_STORE
@@ -649,37 +651,65 @@ class SpoolControllerPanel(QDialog):
 		param_line.setFrameShadow(QFrame.Sunken)
 		left_column.addWidget(param_line)
 
+		self._param_file_manage_group = QGroupBox(PARAM_FILE_MANAGE_NAME, parent)
+		param_file_manage_group = self._param_file_manage_group
+		param_file_manage_group.setMinimumHeight(200)
+		param_file_manage_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+		param_file_manage_group.setStyleSheet("""
+			QGroupBox {
+				border: 2px outset #b0b0b0;
+				border-radius: 3px;
+				margin-top: 0px;
+				padding-top: 15px;
+				background-color: palette(window);
+			}
+			QGroupBox::title {
+				subcontrol-origin: margin;
+				subcontrol-position: top left;
+				padding: 2px 5px;
+				background-color: palette(window);
+				border: 2px inset #b0b0b0;
+				font-weight: bold;
+				top: 3px;
+				left: 3px;
+			}
+		""")
+
+		group_layout = QVBoxLayout(param_file_manage_group)
+		group_layout.setSpacing(6)
+		group_layout.setContentsMargins(5, 15, 5, 5)
+
 		BUTTON_WIDTH = 110
 
 		upload_row = QHBoxLayout()
-		self._upload_button = QPushButton('Upload', parent)
+		self._upload_button = QPushButton('Upload', param_file_manage_group)
 		self._upload_button.setFixedWidth(BUTTON_WIDTH)
 		self._upload_button.clicked.connect(self._on_upload_clicked)
 		upload_row.addWidget(self._upload_button)
 
-		self._upload_textbox = QLineEdit(parent)
+		self._upload_textbox = QLineEdit(param_file_manage_group)
 		upload_row.addWidget(self._upload_textbox)
 
-		self._upload_browse_button = QPushButton('Browse', parent)
+		self._upload_browse_button = QPushButton('Browse', param_file_manage_group)
 		self._upload_browse_button.setFixedWidth(BUTTON_WIDTH)
 		self._upload_browse_button.clicked.connect(self._on_upload_browse_clicked)
 		upload_row.addWidget(self._upload_browse_button)
-		left_column.addLayout(upload_row)
+		group_layout.addLayout(upload_row)
 
 		download_row = QHBoxLayout()
-		self._download_button = QPushButton('Download', parent)
+		self._download_button = QPushButton('Download', param_file_manage_group)
 		self._download_button.setFixedWidth(BUTTON_WIDTH)
 		self._download_button.clicked.connect(self._on_download_clicked)
 		download_row.addWidget(self._download_button)
 
-		self._download_textbox = QLineEdit(parent)
+		self._download_textbox = QLineEdit(param_file_manage_group)
 		download_row.addWidget(self._download_textbox)
 
-		self._download_browse_button = QPushButton('Browse', parent)
+		self._download_browse_button = QPushButton('Browse', param_file_manage_group)
 		self._download_browse_button.setFixedWidth(BUTTON_WIDTH)
 		self._download_browse_button.clicked.connect(self._on_download_browse_clicked)
 		download_row.addWidget(self._download_browse_button)
-		left_column.addLayout(download_row)
+		group_layout.addLayout(download_row)
 
 		STATUS_LABEL_WIDTH = 60
 		STATUS_TEXTBOX_WIDTH = 80
@@ -687,46 +717,46 @@ class SpoolControllerPanel(QDialog):
 		status_row = QHBoxLayout()
 		status_row.setSpacing(0)
 
-		version_label = QLabel('Version:', parent)
+		version_label = QLabel('Version:', param_file_manage_group)
 		version_label.setFixedWidth(STATUS_LABEL_WIDTH)
 		status_row.addWidget(version_label)
 
-		self._version_textbox = QLineEdit(parent)
+		self._version_textbox = QLineEdit(param_file_manage_group)
 		self._version_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
 		self._version_textbox.setReadOnly(True)
 		status_row.addWidget(self._version_textbox)
 
 		status_row.addSpacing(23)
 
-		crc32_label = QLabel('CRC32:', parent)
+		crc32_label = QLabel('CRC32:', param_file_manage_group)
 		crc32_label.setFixedWidth(STATUS_LABEL_WIDTH)
 		status_row.addWidget(crc32_label)
 
-		self._crc32_textbox = QLineEdit(parent)
+		self._crc32_textbox = QLineEdit(param_file_manage_group)
 		self._crc32_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
 		self._crc32_textbox.setReadOnly(True)
 		status_row.addWidget(self._crc32_textbox)
 
 		status_row.addSpacing(23)
 
-		dirty_label = QLabel('Dirty:', parent)
+		dirty_label = QLabel('Dirty:', param_file_manage_group)
 		dirty_label.setFixedWidth(STATUS_LABEL_WIDTH)
 		status_row.addWidget(dirty_label)
 
-		self._dirty_textbox = QLineEdit(parent)
+		self._dirty_textbox = QLineEdit(param_file_manage_group)
 		self._dirty_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
 		self._dirty_textbox.setReadOnly(True)
 		status_row.addWidget(self._dirty_textbox)
 
 		status_row.addStretch(1)
 
-		left_column.addLayout(status_row)
+		group_layout.addLayout(status_row)
 
-		left_column.addStretch(1)
+		group_layout.addStretch(1)
 
 		progress_row = QHBoxLayout()
 		progress_row.setSpacing(0)
-		self._config_transfer_progress = QProgressBar(parent)
+		self._config_transfer_progress = QProgressBar(param_file_manage_group)
 		self._config_transfer_progress.setRange(0, 100)
 		self._config_transfer_progress.setValue(0)
 		self._config_transfer_progress.setAlignment(Qt.AlignCenter)
@@ -735,9 +765,11 @@ class SpoolControllerPanel(QDialog):
 		)
 		progress_row.addWidget(self._config_transfer_progress)
 		progress_row.addStretch(1)
-		left_column.addLayout(progress_row)
+		group_layout.addLayout(progress_row)
 
-		left_column.addSpacing(2)
+		group_layout.addSpacing(2)
+
+		left_column.addWidget(param_file_manage_group)
 
 		return left_column
 
@@ -764,6 +796,8 @@ class SpoolControllerPanel(QDialog):
 		if not upload_path or not os.path.isfile(upload_path):
 			self._show_ok_dialog('Upload', 'Choose a file to upload!')
 			return
+
+		upload_path = os.path.normcase(os.path.abspath(os.path.expanduser(upload_path)))
 
 		self._cleanup_config_transfer_timeout()
 
@@ -812,8 +846,10 @@ class SpoolControllerPanel(QDialog):
 		# Clean up any previous upload handler
 		self._cleanup_upload_handler()
 
-		# Disable the upload button while waiting for response
+		# Disable the upload and browse buttons while waiting for response
 		self._upload_button.setEnabled(False)
+		self._upload_browse_button.setEnabled(False)
+		self._download_browse_button.setEnabled(False)
 
 		try:
 			self._node.broadcast(msg, priority=BROADCAST_PRIORITY)
@@ -884,8 +920,10 @@ class SpoolControllerPanel(QDialog):
 		# Clean up any previous download handler
 		self._cleanup_download_handler()
 
-		# Disable the download button while waiting for response
+		# Disable the download and browse buttons while waiting for response
 		self._download_button.setEnabled(False)
+		self._upload_browse_button.setEnabled(False)
+		self._download_browse_button.setEnabled(False)
 
 		try:
 			self._node.broadcast(msg, priority=BROADCAST_PRIORITY)
@@ -1974,7 +2012,6 @@ class SpoolControllerPanel(QDialog):
 			if msg.error.value == msg.error.STATUS_OK:
 				logger.info('Upload successful. Spool controller is reading the config file.')
 				self._start_config_transfer_timeout()
-				self._show_ok_dialog('Upload Complete', 'Config file upload request accepted. The spool controller is reading the file.')
 			else:
 				error_info = self._parse_error_msg(msg.error, 'upload')
 				if error_info:
@@ -1987,34 +2024,49 @@ class SpoolControllerPanel(QDialog):
 
 	def _start_config_transfer_timeout(self):
 		'''
-		@brief    Start a timeout for config file transfer activity.
+		@brief    Start timeouts for config file transfer activity.
+		          Two timers are started:
+		          1. An overall deadline of CONFIG_FILE_TRANSFER_TIMEOUT seconds.
+		          2. A repeating inactivity poll every RESPONSE_TIMEOUT seconds that
+		             fires if no new file-read hits are observed between polls.
 		@return   None
 		'''
-		self._cleanup_config_transfer_timeout()
 		key = self._config_transfer_key
+		self._cleanup_config_transfer_timeout()
 		if not key:
 			return
 
+		self._config_transfer_key = key
 		self._config_transfer_start_hits = 0
+		self._config_transfer_last_hits = 0
 		try:
 			file_server_widget = self._get_file_server_widget()
 			file_server = getattr(file_server_widget, '_file_server', None)
 			if file_server is not None:
-				self._config_transfer_start_hits = file_server.path_hit_counters.get(key, 0)
+				current = file_server.path_hit_counters.get(key, 0)
+				self._config_transfer_start_hits = current
+				self._config_transfer_last_hits = current
 		except Exception:
 			logger.exception('Could not read file server hit counters')
 
+		# Overall deadline timer
 		self._config_transfer_timer = QTimer(self)
 		self._config_transfer_timer.setSingleShot(True)
 		self._config_transfer_timer.timeout.connect(self._on_config_transfer_timeout)
 		self._config_transfer_timer.start(CONFIG_FILE_TRANSFER_TIMEOUT * 1000)
 
-	def _on_config_transfer_timeout(self):
+		# Inactivity poll timer
+		self._config_transfer_inactivity_timer = QTimer(self)
+		self._config_transfer_inactivity_timer.setSingleShot(False)
+		self._config_transfer_inactivity_timer.timeout.connect(self._on_config_transfer_inactivity_check)
+		self._config_transfer_inactivity_timer.start(RESPONSE_TIMEOUT * 1000)
+
+	def _get_config_transfer_hits(self):
 		'''
-		@brief    Handle config file transfer timeout.
-		@return   None
+		@brief    Read the current file-server hit count for the active transfer key.
+		@return   Current hit count, or self._config_transfer_last_hits on error.
 		'''
-		hits = self._config_transfer_start_hits
+		hits = self._config_transfer_last_hits
 		try:
 			file_server_widget = self._get_file_server_widget()
 			file_server = getattr(file_server_widget, '_file_server', None)
@@ -2022,26 +2074,62 @@ class SpoolControllerPanel(QDialog):
 				hits = file_server.path_hit_counters.get(self._config_transfer_key, hits)
 		except Exception:
 			logger.exception('Could not read file server hit counters')
+		return hits
 
+	def _on_config_transfer_inactivity_check(self):
+		'''
+		@brief    Periodic check for file-read inactivity during config transfer.
+		          If the hit count has not increased since the last poll, the node
+		          has stopped reading — show a timeout dialog.
+		@return   None
+		'''
+		hits = self._get_config_transfer_hits()
+		if hits > self._config_transfer_last_hits:
+			# Activity detected — update baseline and keep waiting
+			self._config_transfer_last_hits = hits
+			return
+
+		# No new reads since last poll
+		if hits > self._config_transfer_start_hits:
+			message = (
+				f'The spool controller stopped reading the config file '
+				f'(no activity for {RESPONSE_TIMEOUT} seconds).'
+			)
+		else:
+			message = (
+				f'No file read activity was observed from the spool controller '
+				f'within {RESPONSE_TIMEOUT} seconds of the upload request.'
+			)
+
+		self._cleanup_config_transfer_timeout()
+		self._show_ok_dialog('Transfer Timeout', message)
+
+	def _on_config_transfer_timeout(self):
+		'''
+		@brief    Handle overall config file transfer timeout.
+		@return   None
+		'''
 		message = (
 			f'Config file transfer did not complete within {CONFIG_FILE_TRANSFER_TIMEOUT} seconds.'
 		)
-		if hits <= self._config_transfer_start_hits:
-			message += '\n\nNo file read activity was observed from the spool controller.'
 
-		self._show_ok_dialog('Transfer Timeout', message)
 		self._cleanup_config_transfer_timeout()
+		self._show_ok_dialog('Transfer Timeout', message)
 
 	def _cleanup_config_transfer_timeout(self):
 		'''
-		@brief    Stop the config file transfer timeout timer and reset state.
+		@brief    Stop both config file transfer timers and reset state.
 		@return   None
 		'''
 		if self._config_transfer_timer is not None:
 			self._config_transfer_timer.stop()
 			self._config_transfer_timer = None
+		if self._config_transfer_inactivity_timer is not None:
+			self._config_transfer_inactivity_timer.stop()
+			self._config_transfer_inactivity_timer = None
 		self._config_transfer_key = None
 		self._config_transfer_start_hits = 0
+		self._config_transfer_last_hits = 0
 
 	def _get_file_server_widget(self):
 		'''
@@ -2090,6 +2178,10 @@ class SpoolControllerPanel(QDialog):
 			self._upload_response_handle = None
 		if self._upload_button is not None:
 			self._upload_button.setEnabled(True)
+		if self._upload_browse_button is not None:
+			self._upload_browse_button.setEnabled(True)
+		if self._download_browse_button is not None:
+			self._download_browse_button.setEnabled(True)
 
 	def _cleanup_recall_handler(self):
 		'''
@@ -2400,7 +2492,7 @@ class SpoolControllerPanel(QDialog):
 
 		try:
 			if msg.error.value == msg.error.STATUS_OK:
-				self._show_ok_dialog('Download Started', 'ReadConfigFile request accepted.')
+				logger.info('Download request accepted. Spool controller is reading the config file.')
 			else:
 				error_info = self._parse_error_msg(msg.error, 'download')
 				if error_info:
@@ -2427,6 +2519,10 @@ class SpoolControllerPanel(QDialog):
 			self._download_response_handle = None
 		if self._download_button is not None:
 			self._download_button.setEnabled(True)
+		if self._upload_browse_button is not None:
+			self._upload_browse_button.setEnabled(True)
+		if self._download_browse_button is not None:
+			self._download_browse_button.setEnabled(True)
 
 	def _load_design_constants_fields(self):
 		'''
@@ -2586,8 +2682,7 @@ class SpoolControllerPanel(QDialog):
 		self._design_const_set_group = QGroupBox(DESIGN_CONSTANTS_SET_NAME, parent)
 		design_const_set_group = self._design_const_set_group
 		design_const_set_group.setMinimumHeight(200)
-		design_const_set_group.setMaximumHeight(320)
-		design_const_set_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+		design_const_set_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 		design_const_set_group.setStyleSheet("""
 			QGroupBox {
 				border: 2px outset #b0b0b0;
@@ -2650,9 +2745,7 @@ class SpoolControllerPanel(QDialog):
 		design_const_layout.addWidget(scroll_area, 1, 0)
 		design_const_layout.setRowStretch(1, 1)
 
-		right_column.addWidget(design_const_set_group, 0, Qt.AlignTop)
-
-		right_column.addStretch(1)
+		right_column.addWidget(design_const_set_group)
 
 		return right_column
 
