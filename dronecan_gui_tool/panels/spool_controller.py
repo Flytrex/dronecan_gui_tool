@@ -487,6 +487,7 @@ class _FlowContainer(QWidget):
 
 class SpoolControllerPanel(QDialog):
 	_file_download_finished_signal = pyqtSignal(bool, str, str)  # success, error_message, save_path
+	_file_download_progress_signal = pyqtSignal(int)             # percent 0-100
 
 	def __init__(self, parent, node):
 		super().__init__(parent)
@@ -546,6 +547,7 @@ class SpoolControllerPanel(QDialog):
 		self._file_download_stop = threading.Event()   # Event to signal the download thread to stop
 		self._file_download_timeout_timer = None        # QTimer for overall file download deadline
 		self._file_download_finished_signal.connect(self._on_file_download_finished)
+		self._file_download_progress_signal.connect(lambda pct: self._config_transfer_progress.setValue(pct))
 
 		self._setup_ui()
 
@@ -2766,6 +2768,11 @@ class SpoolControllerPanel(QDialog):
 					logger.debug('file.Read offset=%d, received=%d bytes, total=%d/%d',
 						offset - len(chunk), len(chunk), bytes_written, file_size)
 
+					# Update progress bar on the main thread
+					if file_size > 0:
+						percent = min(int(bytes_written * 100 / file_size), 100)
+						self._file_download_progress_signal.emit(percent)
+
 					# End of file: data shorter than capacity
 					if len(chunk) < READ_DATA_CAPACITY:
 						break
@@ -2798,9 +2805,50 @@ class SpoolControllerPanel(QDialog):
 		self._file_download_thread = None
 
 		if success:
-			self._show_ok_dialog('Download Complete', f'File downloaded successfully to:\n{save_path}')
+			try:
+				with open(save_path, 'rb') as f:
+					data = f.read()
+				param_set_file = ParamSetFile()
+				param_set_file.deserialize(data)
+
+				# Save original CRCs from the file before recalculation
+				orig_hdr_crc = param_set_file._hdr_crc
+				orig_payload_crc = param_set_file._payload_crc
+
+				# Recalculate CRCs
+				calc_payload_crc = param_set_file.calculate_payload_crc()
+				calc_hdr_crc = param_set_file.calculate_header_crc()
+
+				if orig_payload_crc != calc_payload_crc or orig_hdr_crc != calc_hdr_crc:
+					logger.warning('Downloaded file CRC mismatch: '
+						'hdr_crc file=0x%08X calc=0x%08X, payload_crc file=0x%08X calc=0x%08X',
+						orig_hdr_crc, calc_hdr_crc, orig_payload_crc, calc_payload_crc)
+					self._version_textbox.clear()
+					self._crc32_textbox.clear()
+					self._show_ok_dialog(
+						'Download CRC Error',
+						f'File downloaded to:\n{save_path}\n\n'
+						f'CRC verification failed.\n'
+						f'Header CRC: file=0x{orig_hdr_crc:08X}, calculated=0x{calc_hdr_crc:08X}\n'
+						f'Payload CRC: file=0x{orig_payload_crc:08X}, calculated=0x{calc_payload_crc:08X}'
+					)
+				else:
+					self._version_textbox.setText(str(param_set_file._version))
+					self._crc32_textbox.setText(f'{orig_hdr_crc:08X}')
+					self._show_ok_dialog('Download Complete', f'File downloaded successfully to:\n{save_path}')
+			except Exception as ex:
+				logger.exception('Failed to verify downloaded file: %s', ex)
+				self._version_textbox.clear()
+				self._crc32_textbox.clear()
+				self._show_ok_dialog(
+					'Download Verification Error',
+					f'File was downloaded to:\n{save_path}\n\n'
+					f'But verification failed: {ex}'
+				)
 		else:
 			self._show_ok_dialog('Download Failed', error_message)
+
+		self._config_transfer_progress.setValue(0)
 
 	def _on_file_download_timeout(self):
 		'''
@@ -2813,6 +2861,7 @@ class SpoolControllerPanel(QDialog):
 		self._cleanup_file_download_timeout()
 		self._cleanup_download_handler()
 		self._file_download_thread = None
+		self._config_transfer_progress.setValue(0)
 		self._show_ok_dialog(
 			'Download Timeout',
 			f'File download did not complete within {CONFIG_FILE_TRANSFER_TIMEOUT} seconds.\n\n'
