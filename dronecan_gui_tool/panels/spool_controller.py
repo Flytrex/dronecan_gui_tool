@@ -19,7 +19,7 @@ import random
 import xml.etree.ElementTree as ET
 import struct
 
-from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer
+from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer, pyqtSignal
 from PyQt5.QtGui import QIntValidator, QColor, QFont
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
 	QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy, QFrame, QScrollArea, QWidget, QLayout, QMessageBox, QProgressBar
@@ -46,6 +46,7 @@ PARAM_SET_GROUPBOX_WIDTH = 400                      # Fixed width (px) for each 
 RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
 CONFIG_FILE_TRANSFER_TIMEOUT = 30                   # Number of seconds to wait for a config file upload/download to complete before showing a timeout error dialog
 BROADCAST_PRIORITY = 16                             # DroneCAN message broadcast priority (lower number = higher priority)
+DOWNLOAD_CONFIG_FILE_NAME = 'delcon_param_set'      # Remote file name requested via GetInfo after a successful ReadConfigFile response
 
 _PARAM_SET_LIGHT_COLORS = [                         # Pool of light background colors assigned to ParamSet groupboxes
 	'#FFFFCC',  # light yellow
@@ -485,6 +486,8 @@ class _FlowContainer(QWidget):
 
 
 class SpoolControllerPanel(QDialog):
+	_file_download_finished_signal = pyqtSignal(bool, str, str)  # success, error_message, save_path
+
 	def __init__(self, parent, node):
 		super().__init__(parent)
 		self.setWindowTitle(PANEL_NAME)
@@ -528,14 +531,21 @@ class SpoolControllerPanel(QDialog):
 		self._upload_timeout_timer = None              # QTimer for WriteConfigFile upload timeout
 		self._download_response_handle = None          # DroneCAN handler handle for ReadConfigFile (active during download)
 		self._download_timeout_timer = None            # QTimer for ReadConfigFile download timeout
+		self._download_getinfo_timer = None            # QTimer for file.GetInfo timeout during download
 		self._config_transfer_timer = None             # QTimer for config file transfer overall timeout
 		self._config_transfer_inactivity_timer = None  # QTimer for polling file server hit counters (inactivity detection)
+		self._config_transfer_progress_timer = None    # QTimer for fast progress bar updates during transfer
 		self._config_transfer_key = None               # File server key used to track transfer activity
 		self._config_transfer_start_hits = 0           # Hit count at transfer start
 		self._config_transfer_last_hits = 0            # Hit count at last inactivity poll
 		self._store_constants_response_handle = None   # DroneCAN handler handle for DesignConstantsSet store response
 		self._store_constants_timeout_timer = None     # QTimer for DesignConstantsSet store timeout
 		self._pending_store_constants_snapshot = None  # Snapshot of values sent during OPERATION_STORE
+
+		self._file_download_thread = None              # Background thread for file.Read download
+		self._file_download_stop = threading.Event()   # Event to signal the download thread to stop
+		self._file_download_timeout_timer = None        # QTimer for overall file download deadline
+		self._file_download_finished_signal.connect(self._on_file_download_finished)
 
 		self._setup_ui()
 
@@ -790,8 +800,13 @@ class SpoolControllerPanel(QDialog):
 	def _on_upload_clicked(self):
 		'''
 		@brief    Handle upload button click: validate local file, configure file server, and send WriteConfigFile.
+		          If an upload is already in progress (button shows 'Cancel'), cancel the transfer.
 		@return   None
 		'''
+		if self._upload_button.text() == 'Cancel':
+			self._cancel_upload()
+			return
+
 		upload_path = self._upload_textbox.text().strip()
 		if not upload_path or not os.path.isfile(upload_path):
 			self._show_ok_dialog('Upload', 'Choose a file to upload!')
@@ -799,6 +814,7 @@ class SpoolControllerPanel(QDialog):
 
 		upload_path = os.path.normcase(os.path.abspath(os.path.expanduser(upload_path)))
 
+		self._config_transfer_progress.setValue(0)
 		self._cleanup_config_transfer_timeout()
 
 		# Get the file server widget from the main window
@@ -846,8 +862,8 @@ class SpoolControllerPanel(QDialog):
 		# Clean up any previous upload handler
 		self._cleanup_upload_handler()
 
-		# Disable the upload and browse buttons while waiting for response
-		self._upload_button.setEnabled(False)
+		# Switch button to Cancel mode and disable browse buttons while waiting for response
+		self._upload_button.setText('Cancel')
 		self._upload_browse_button.setEnabled(False)
 		self._download_browse_button.setEnabled(False)
 
@@ -857,7 +873,9 @@ class SpoolControllerPanel(QDialog):
 		except Exception as ex:
 			logger.exception('Failed to broadcast WriteConfigFile: %s', ex)
 			show_error('Broadcast failed', 'Could not broadcast WriteConfigFile.', str(ex), parent=self, blocking=True)
-			self._upload_button.setEnabled(True)
+			self._upload_button.setText('Upload')
+			self._upload_browse_button.setEnabled(True)
+			self._download_browse_button.setEnabled(True)
 			return
 
 		# Register handler for the response message
@@ -868,7 +886,7 @@ class SpoolControllerPanel(QDialog):
 			)
 		except Exception as ex:
 			logger.exception('Could not register WriteConfigFile handler: %s', ex)
-			self._upload_button.setEnabled(True)
+			self._upload_button.setText('Upload')
 			self._cleanup_upload_handler()
 			return
 
@@ -878,6 +896,7 @@ class SpoolControllerPanel(QDialog):
 		self._upload_timeout_timer.timeout.connect(
 			lambda: (
 				self._cleanup_upload_handler(),
+				self._config_transfer_progress.setValue(0),
 				self._on_recall_timeout(
 					f'No WriteConfigFile response was received within {RESPONSE_TIMEOUT} seconds.\n\n'
 					f'The spool controller may be offline or not responding.'
@@ -2011,15 +2030,18 @@ class SpoolControllerPanel(QDialog):
 		try:
 			if msg.error.value == msg.error.STATUS_OK:
 				logger.info('Upload successful. Spool controller is reading the config file.')
+				self._upload_button.setText('Cancel')
 				self._start_config_transfer_timeout()
 			else:
 				error_info = self._parse_error_msg(msg.error, 'upload')
 				if error_info:
 					title, message, log_msg = error_info
+					self._config_transfer_progress.setValue(0)
 					self._show_ok_dialog(title, message)
 					logger.warning(log_msg)
 		except Exception as ex:
 			logger.exception('Error processing upload response: %s', ex)
+			self._config_transfer_progress.setValue(0)
 			self._show_ok_dialog('Upload Error', f'Error processing upload response: {ex}')
 
 	def _start_config_transfer_timeout(self):
@@ -2061,6 +2083,12 @@ class SpoolControllerPanel(QDialog):
 		self._config_transfer_inactivity_timer.timeout.connect(self._on_config_transfer_inactivity_check)
 		self._config_transfer_inactivity_timer.start(RESPONSE_TIMEOUT * 1000)
 
+		# Fast progress update timer
+		self._config_transfer_progress_timer = QTimer(self)
+		self._config_transfer_progress_timer.setSingleShot(False)
+		self._config_transfer_progress_timer.timeout.connect(self._on_config_transfer_progress_tick)
+		self._config_transfer_progress_timer.start(100)
+
 	def _get_config_transfer_hits(self):
 		'''
 		@brief    Read the current file-server hit count for the active transfer key.
@@ -2071,18 +2099,38 @@ class SpoolControllerPanel(QDialog):
 			file_server_widget = self._get_file_server_widget()
 			file_server = getattr(file_server_widget, '_file_server', None)
 			if file_server is not None and self._config_transfer_key:
-				hits = file_server.path_hit_counters.get(self._config_transfer_key, hits)
+				hits = file_server.key_hit_counters.get(self._config_transfer_key, hits)
 		except Exception:
 			logger.exception('Could not read file server hit counters')
 		return hits
 
+	def _is_config_transfer_complete(self):
+		'''
+		@brief    Check whether the file server has finished serving the transfer key.
+		@return   True if the entire file has been read by the remote node.
+		'''
+		try:
+			file_server_widget = self._get_file_server_widget()
+			file_server = getattr(file_server_widget, '_file_server', None)
+			if file_server is not None and self._config_transfer_key:
+				return file_server.is_key_complete(self._config_transfer_key)
+		except Exception:
+			logger.exception('Could not check file server transfer completion')
+		return False
+
 	def _on_config_transfer_inactivity_check(self):
 		'''
 		@brief    Periodic check for file-read inactivity during config transfer.
+		          If the transfer completed (EOF reached), show success.
 		          If the hit count has not increased since the last poll, the node
 		          has stopped reading — show a timeout dialog.
 		@return   None
 		'''
+		# Check if the entire file has been served
+		if self._is_config_transfer_complete():
+			# Completion handled by the fast progress timer
+			return
+
 		hits = self._get_config_transfer_hits()
 		if hits > self._config_transfer_last_hits:
 			# Activity detected — update baseline and keep waiting
@@ -2102,7 +2150,25 @@ class SpoolControllerPanel(QDialog):
 			)
 
 		self._cleanup_config_transfer_timeout()
+		self._cleanup_upload_handler()
+		self._config_transfer_progress.setValue(0)
 		self._show_ok_dialog('Transfer Timeout', message)
+
+	def _update_config_transfer_progress(self):
+		'''
+		@brief    Update the progress bar based on bytes served by the file server.
+		@return   None
+		'''
+		try:
+			file_server_widget = self._get_file_server_widget()
+			file_server = getattr(file_server_widget, '_file_server', None)
+			if file_server is not None and self._config_transfer_key:
+				sent, total = file_server.get_key_progress(self._config_transfer_key)
+				if total > 0:
+					percent = int(sent * 100 / total)
+					self._config_transfer_progress.setValue(min(percent, 100))
+		except Exception:
+			logger.exception('Could not update transfer progress')
 
 	def _on_config_transfer_timeout(self):
 		'''
@@ -2114,7 +2180,23 @@ class SpoolControllerPanel(QDialog):
 		)
 
 		self._cleanup_config_transfer_timeout()
+		self._cleanup_upload_handler()
+		self._config_transfer_progress.setValue(0)
 		self._show_ok_dialog('Transfer Timeout', message)
+
+	def _on_config_transfer_progress_tick(self):
+		'''
+		@brief    Fast periodic callback to update the progress bar and detect completion.
+		@return   None
+		'''
+		if self._is_config_transfer_complete():
+			self._config_transfer_progress.setValue(100)
+			self._cleanup_config_transfer_timeout()
+			self._cleanup_upload_handler()
+			self._show_ok_dialog('Upload Complete', 'Config file was uploaded successfully.')
+			self._config_transfer_progress.setValue(0)
+			return
+		self._update_config_transfer_progress()
 
 	def _cleanup_config_transfer_timeout(self):
 		'''
@@ -2127,6 +2209,9 @@ class SpoolControllerPanel(QDialog):
 		if self._config_transfer_inactivity_timer is not None:
 			self._config_transfer_inactivity_timer.stop()
 			self._config_transfer_inactivity_timer = None
+		if self._config_transfer_progress_timer is not None:
+			self._config_transfer_progress_timer.stop()
+			self._config_transfer_progress_timer = None
 		self._config_transfer_key = None
 		self._config_transfer_start_hits = 0
 		self._config_transfer_last_hits = 0
@@ -2162,6 +2247,17 @@ class SpoolControllerPanel(QDialog):
 		except Exception:
 			pass
 
+	def _cancel_upload(self):
+		'''
+		@brief    Cancel an in-progress upload: stop all timers, reset UI.
+		@return   None
+		'''
+		logger.info('Upload cancelled by user')
+		self._cleanup_upload_handler()
+		self._cleanup_config_transfer_timeout()
+		self._config_transfer_progress.setValue(0)
+		self._show_ok_dialog('Upload Cancelled', 'The upload was cancelled.')
+
 	def _cleanup_upload_handler(self):
 		'''
 		@brief    Remove the WriteConfigFile handler and stop the timeout timer.
@@ -2177,7 +2273,7 @@ class SpoolControllerPanel(QDialog):
 				pass
 			self._upload_response_handle = None
 		if self._upload_button is not None:
-			self._upload_button.setEnabled(True)
+			self._upload_button.setText('Upload')
 		if self._upload_browse_button is not None:
 			self._upload_browse_button.setEnabled(True)
 		if self._download_browse_button is not None:
@@ -2482,18 +2578,30 @@ class SpoolControllerPanel(QDialog):
 	def _on_download_response(self, event):
 		'''
 		@brief    Handle an incoming ReadConfigFile response message.
+		          On success, sends a file.GetInfo request to the responding node.
 		@param    event - DroneCAN transfer event containing the response message.
 		@return   None
 		'''
-		self._cleanup_download_handler()
+		# Stop the ReadConfigFile timeout but keep buttons disabled
+		if self._download_timeout_timer is not None:
+			self._download_timeout_timer.stop()
+			self._download_timeout_timer = None
+		if self._download_response_handle is not None:
+			try:
+				self._download_response_handle.remove()
+			except Exception:
+				pass
+			self._download_response_handle = None
 
 		msg = event.message
 		logger.info('ReadConfigFile response received: error=%s', msg.error.value)
 
 		try:
 			if msg.error.value == msg.error.STATUS_OK:
-				logger.info('Download request accepted. Spool controller is reading the config file.')
+				logger.info('Download request accepted. Sending GetInfo for %s.', DOWNLOAD_CONFIG_FILE_NAME)
+				self._send_download_getinfo(event.transfer.source_node_id)
 			else:
+				self._cleanup_download_handler()
 				error_info = self._parse_error_msg(msg.error, 'download')
 				if error_info:
 					title, message, log_msg = error_info
@@ -2501,7 +2609,258 @@ class SpoolControllerPanel(QDialog):
 					logger.warning(log_msg)
 		except Exception as ex:
 			logger.exception('Error processing download response: %s', ex)
+			self._cleanup_download_handler()
 			self._show_ok_dialog('Download Error', f'Error processing download response: {ex}')
+
+	def _send_download_getinfo(self, target_node_id):
+		'''
+		@brief    Send a uavcan.protocol.file.GetInfo request to the target node
+		          for DOWNLOAD_CONFIG_FILE_NAME.
+		@param    target_node_id - Node ID to send the request to.
+		@return   None
+		'''
+		try:
+			req = dronecan.uavcan.protocol.file.GetInfo.Request()
+			req.path.path = DOWNLOAD_CONFIG_FILE_NAME
+		except Exception as ex:
+			logger.exception('Could not create GetInfo request: %s', ex)
+			self._cleanup_download_handler()
+			show_error('DSDL Error', 'Could not create file.GetInfo request.', str(ex), parent=self, blocking=True)
+			return
+
+		# Start a timeout timer for the GetInfo response
+		self._download_getinfo_timer = QTimer(self)
+		self._download_getinfo_timer.setSingleShot(True)
+		self._download_getinfo_timer.timeout.connect(self._on_download_getinfo_timeout)
+		self._download_getinfo_timer.start(RESPONSE_TIMEOUT * 1000)
+
+		try:
+			self._node.request(req, target_node_id, self._on_download_getinfo_response)
+			logger.info('Sent GetInfo request to node %d for %s', target_node_id, DOWNLOAD_CONFIG_FILE_NAME)
+		except Exception as ex:
+			logger.exception('Failed to send GetInfo request: %s', ex)
+			self._cleanup_download_getinfo()
+			self._cleanup_download_handler()
+			show_error('Request Failed', 'Could not send file.GetInfo request.', str(ex), parent=self, blocking=True)
+
+	def _on_download_getinfo_response(self, event):
+		'''
+		@brief    Handle the file.GetInfo response during download.
+		@param    event - DroneCAN transfer event, or None on timeout.
+		@return   None
+		'''
+		self._cleanup_download_getinfo()
+
+		if event is None:
+			self._cleanup_download_handler()
+			self._show_ok_dialog(
+				'Download Timeout',
+				f'No GetInfo response for "{DOWNLOAD_CONFIG_FILE_NAME}" was received.\n\n'
+				f'The spool controller may be offline or not responding.'
+			)
+			return
+
+		resp = event.response
+		logger.info('GetInfo response: error=%s, size=%s', resp.error.value, resp.size)
+
+		if resp.error.value != resp.error.OK:
+			self._cleanup_download_handler()
+			self._show_ok_dialog(
+				'Download Error',
+				f'GetInfo for "{DOWNLOAD_CONFIG_FILE_NAME}" failed with error code {resp.error.value}.'
+			)
+			return
+
+		# GetInfo succeeded — file exists on the remote node
+		file_size = resp.size
+		target_node_id = event.transfer.source_node_id
+		save_path = self._download_textbox.text().strip()
+		logger.info('GetInfo OK: file size = %d bytes, starting download from node %d to %s', file_size, target_node_id, save_path)
+
+		# Start the file download thread
+		self._file_download_stop.clear()
+		self._file_download_thread = threading.Thread(
+			target=self._file_download_thread_func,
+			args=(target_node_id, file_size, save_path),
+			daemon=True,
+		)
+		self._file_download_thread.start()
+
+		# Start overall download deadline timer on the main thread
+		self._file_download_timeout_timer = QTimer(self)
+		self._file_download_timeout_timer.setSingleShot(True)
+		self._file_download_timeout_timer.timeout.connect(self._on_file_download_timeout)
+		self._file_download_timeout_timer.start(CONFIG_FILE_TRANSFER_TIMEOUT * 1000)
+
+	def _file_download_thread_func(self, target_node_id, file_size, save_path):
+		'''
+		@brief    Background thread that reads a file from a remote node using
+		          uavcan.protocol.file.Read requests.
+		@param    target_node_id - Node ID to read from.
+		@param    file_size - Expected file size in bytes (from GetInfo).
+		@param    save_path - Local file path to save the downloaded data.
+		@return   None
+		'''
+		READ_DATA_CAPACITY = 256
+		offset = 0
+		bytes_written = 0
+		error_message = None
+
+		try:
+			with open(save_path, 'wb') as f:
+				while not self._file_download_stop.is_set():
+					read_event = threading.Event()
+					read_result = [None]  # [event_or_None]
+
+					def _on_read_response(evt, _result=read_result, _flag=read_event):
+						_result[0] = evt
+						_flag.set()
+
+					try:
+						req = dronecan.uavcan.protocol.file.Read.Request()
+						req.offset = offset
+						req.path.path = DOWNLOAD_CONFIG_FILE_NAME
+					except Exception as ex:
+						error_message = f'Could not create file.Read request: {ex}'
+						break
+
+					try:
+						self._node.request(req, target_node_id, _on_read_response, timeout=RESPONSE_TIMEOUT)
+					except Exception as ex:
+						error_message = f'Failed to send file.Read request: {ex}'
+						break
+
+					# Wait for the response callback. If neither the actual response nor
+					# the dronecan internal timeout fires within RESPONSE_TIMEOUT seconds,
+					# this wait itself acts as the per-packet timeout.
+					if not read_event.wait(timeout=RESPONSE_TIMEOUT):
+						logger.warning('file.Read per-packet timeout at offset %d '
+							'(no response within %d seconds)', offset, RESPONSE_TIMEOUT)
+						error_message = (
+							f'file.Read request timed out at offset {offset}.\n\n'
+							f'No response was received within {RESPONSE_TIMEOUT} seconds.\n'
+							f'The spool controller may be offline or not responding.'
+						)
+						break
+
+					evt = read_result[0]
+					if evt is None:
+						# dronecan internal timeout fired — callback was called with None
+						logger.warning('file.Read dronecan timeout at offset %d', offset)
+						error_message = (
+							f'file.Read request timed out at offset {offset}.\n\n'
+							f'No response was received within {RESPONSE_TIMEOUT} seconds.\n'
+							f'The spool controller may be offline or not responding.'
+						)
+						break
+
+					resp = evt.response
+					if resp.error.value != 0:
+						error_message = f'file.Read error at offset {offset}: error code {resp.error.value}'
+						break
+
+					chunk = bytes(resp.data)
+					f.write(chunk)
+					bytes_written += len(chunk)
+					offset += len(chunk)
+					logger.debug('file.Read offset=%d, received=%d bytes, total=%d/%d',
+						offset - len(chunk), len(chunk), bytes_written, file_size)
+
+					# End of file: data shorter than capacity
+					if len(chunk) < READ_DATA_CAPACITY:
+						break
+
+		except Exception as ex:
+			logger.exception('Unexpected error in file download thread: %s', ex)
+			error_message = f'Unexpected error during download: {ex}'
+
+		# Handle cancellation
+		if error_message is None and self._file_download_stop.is_set():
+			error_message = 'Download was cancelled.'
+
+		if error_message is None:
+			logger.info('File downloaded successfully: %d bytes written to %s', bytes_written, save_path)
+
+		# Signal the main thread to handle completion
+		success = error_message is None
+		self._file_download_finished_signal.emit(success, error_message or '', save_path)
+
+	def _on_file_download_finished(self, success, error_message, save_path):
+		'''
+		@brief    Called on the main thread when the file download thread finishes.
+		@param    success - True if the download succeeded.
+		@param    error_message - Error description string, or empty string on success.
+		@param    save_path - Local file path where data was saved.
+		@return   None
+		'''
+		self._cleanup_file_download_timeout()
+		self._cleanup_download_handler()
+		self._file_download_thread = None
+
+		if success:
+			self._show_ok_dialog('Download Complete', f'File downloaded successfully to:\n{save_path}')
+		else:
+			self._show_ok_dialog('Download Failed', error_message)
+
+	def _on_file_download_timeout(self):
+		'''
+		@brief    Handle overall file download timeout. Signals the download thread
+		          to stop and shows a timeout dialog.
+		@return   None
+		'''
+		logger.warning('File download timed out after %d seconds', CONFIG_FILE_TRANSFER_TIMEOUT)
+		self._file_download_stop.set()
+		self._cleanup_file_download_timeout()
+		self._cleanup_download_handler()
+		self._file_download_thread = None
+		self._show_ok_dialog(
+			'Download Timeout',
+			f'File download did not complete within {CONFIG_FILE_TRANSFER_TIMEOUT} seconds.\n\n'
+			f'The spool controller may be offline or not responding.'
+		)
+
+	def _cleanup_file_download_timeout(self):
+		'''
+		@brief    Stop the file download deadline timer.
+		@return   None
+		'''
+		if self._file_download_timeout_timer is not None:
+			self._file_download_timeout_timer.stop()
+			self._file_download_timeout_timer = None
+
+	def _stop_file_download_thread(self):
+		'''
+		@brief    Signal the file download thread to stop and wait for it to finish.
+		@return   None
+		'''
+		self._cleanup_file_download_timeout()
+		self._file_download_stop.set()
+		if self._file_download_thread is not None:
+			self._file_download_thread.join(timeout=5)
+			self._file_download_thread = None
+
+	def _on_download_getinfo_timeout(self):
+		'''
+		@brief    Handle timeout waiting for file.GetInfo response.
+		@return   None
+		'''
+		self._cleanup_download_getinfo()
+		self._cleanup_download_handler()
+		self._show_ok_dialog(
+			'Download Timeout',
+			f'No GetInfo response for "{DOWNLOAD_CONFIG_FILE_NAME}" was received '
+			f'within {RESPONSE_TIMEOUT} seconds.\n\n'
+			f'The spool controller may be offline or not responding.'
+		)
+
+	def _cleanup_download_getinfo(self):
+		'''
+		@brief    Stop the GetInfo timeout timer.
+		@return   None
+		'''
+		if self._download_getinfo_timer is not None:
+			self._download_getinfo_timer.stop()
+			self._download_getinfo_timer = None
 
 	def _cleanup_download_handler(self):
 		'''
@@ -2778,6 +3137,10 @@ class SpoolControllerPanel(QDialog):
 		except Exception:
 			pass
 		try:
+			self._cleanup_download_getinfo()
+		except Exception:
+			pass
+		try:
 			self._cleanup_recall_handler()
 		except Exception:
 			pass
@@ -2795,6 +3158,10 @@ class SpoolControllerPanel(QDialog):
 			pass
 		try:
 			self._cleanup_param_set_execute_handler()
+		except Exception:
+			pass
+		try:
+			self._stop_file_download_thread()
 		except Exception:
 			pass
 

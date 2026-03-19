@@ -114,6 +114,9 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         self._images = {}
         self._image_timestamps = {}
         self._key_to_path = {}
+        self._key_hit_counters = {}
+        self._key_complete = set()
+        self._key_max_offset = {}
 
     def _resolve_path(self, relative):
         rel = relative.path.decode().replace(chr(relative.SEPARATOR), os.path.sep)
@@ -149,6 +152,21 @@ class FileServerJson(dronecan.app.file_server.FileServer):
             self._images[path] = self._load_image(path)
             self._key_to_path[FileServer_PathKey(path)] = path
 
+    @property
+    def key_hit_counters(self):
+        return dict(self._key_hit_counters)
+
+    def is_key_complete(self, key):
+        return key in self._key_complete
+
+    def get_key_progress(self, key):
+        if key not in self._key_to_path:
+            return (0, 0)
+        path = self._key_to_path[key]
+        total = len(self._images.get(path, b''))
+        sent = min(self._key_max_offset.get(key, 0), total)
+        return (sent, total)
+
     def _read(self, e):
         logger.debug("[#{0:03d}:uavcan.protocol.file.Read] {1!r} @ offset {2:d}"
                      .format(e.transfer.source_node_id, e.request.path.path.decode(), e.request.offset))
@@ -156,6 +174,7 @@ class FileServerJson(dronecan.app.file_server.FileServer):
             key = e.request.path.path.decode()
             if key in self._key_to_path:
                 path = self._key_to_path[key]
+                self._key_hit_counters[key] = self._key_hit_counters.get(key, 0) + 1
             else:
                 path = self._resolve_path(e.request.path)
             self._check_path_change(path)
@@ -163,6 +182,13 @@ class FileServerJson(dronecan.app.file_server.FileServer):
             read_size = dronecan.get_dronecan_data_type(dronecan.get_fields(resp)['data']).max_size
             resp.data = self._images[path][e.request.offset:e.request.offset+read_size]
             resp.error.value = resp.error.OK
+            if key in self._key_to_path:
+                end_offset = e.request.offset + len(resp.data)
+                prev = self._key_max_offset.get(key, 0)
+                if end_offset > prev:
+                    self._key_max_offset[key] = end_offset
+                if len(resp.data) < read_size:
+                    self._key_complete.add(key)
         except Exception:
             logger.exception("[#{0:03d}:uavcan.protocol.file.Read] error")
             resp = uavcan.protocol.file.Read.Response()
