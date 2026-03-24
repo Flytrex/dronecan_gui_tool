@@ -6,10 +6,12 @@ from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayo
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 
 from dronecan_gui_tool.widgets.file_server import FileServer_PathKey
+from dronecan_gui_tool.AutoTests.firmware_binary_parser import FirmwareBinaryParser
 
 logger = getLogger(__name__)
 
 REQUEST_PRIORITY = 30
+POST_REBOOT_TIMEOUT = 20  # seconds to wait for node to come back after FW update
 
 
 class FirmwareUpdateTestDialog(QDialog):
@@ -39,7 +41,8 @@ class FirmwareUpdateTestDialog(QDialog):
         self._node = node
         self._target_node_id = target_node_id
         self._file_server_widget = file_server_widget
-        self._current_run = 0
+        self._current_step = 0
+        self._total_steps = 1
         self._deferred_request_handle = None
         self._node_status_handle = None
 
@@ -98,8 +101,11 @@ class FirmwareUpdateTestDialog(QDialog):
         # Firmware update completion tracking
         self._timeout_handle = None
         self._update_accepted = False
+        self._fw_file_path = None  # Normalized path added to file server, removed on close
         self._saw_software_update_mode = False
         self._last_target_uptime = None
+        self._verify_status_handle = None
+        self._verify_timeout_handle = None
 
     def _on_load_file1(self):
         """
@@ -129,26 +135,21 @@ class FirmwareUpdateTestDialog(QDialog):
         if self._test_started:
             return
 
-        fw_file = self._file1_textbox.text().strip()
-        if not fw_file:
-            return
+        self._has_file1 = bool(self._file1_textbox.text().strip())
+        self._has_file2 = bool(self._file2_textbox.text().strip())
 
-        if self._repeat > 1:
-            fw_file2 = self._file2_textbox.text().strip()
-            if not fw_file or not fw_file2:
-                msg = QMessageBox(self)
-                msg.setIcon(QMessageBox.Warning)
-                msg.setWindowTitle('Missing File')
-                msg.setText('Two files need to be selected when the number of tests is above 1')
-                msg.setStandardButtons(QMessageBox.Ok)
-                msg.exec_()
-                return
+        if not self._has_file1 and not self._has_file2:
+            return
 
         self._test_started = True
         self._ok_button.setEnabled(False)
         self._file1_load_button.setEnabled(False)
         self._file2_load_button.setEnabled(False)
-        self._current_run = 0
+        self._current_step = 0
+        if self._has_file1 and self._has_file2:
+            self._total_steps = self._repeat * 2
+        else:
+            self._total_steps = max(1, self._repeat)
         self._run_firmware_update()
 
     def _on_cancel(self):
@@ -162,23 +163,45 @@ class FirmwareUpdateTestDialog(QDialog):
     def _run_firmware_update(self):
         """
         @brief          Start (or continue) the firmware update sequence
-                        for the current run.
+                        for the current step.
+                        When repeat > 1 each repeat cycle consists of two
+                        FW updates: file 1 then file 2.  When repeat == 1
+                        only file 1 is used (single step).
         """
-        if self._current_run >= self._repeat:
-            logger.info('FW_TEST [node %s] All %d runs completed — finishing with success',
-                        self._target_node_id, self._repeat)
+        if self._current_step >= self._total_steps:
+            logger.info('FW_TEST [node %s] All %d steps completed — finishing with success',
+                        self._target_node_id, self._total_steps)
             self._finish_test(True)
             return
 
-        self._current_run += 1
-        self.setWindowTitle('Firmware Update Test (%d/%d)' % (self._current_run, self._repeat))
-        # Each run occupies an equal slice of the 0-100 bar
-        self._run_base = (self._current_run - 1) / self._repeat * 100  # start of this run's slice
-        self._run_size = 100.0 / self._repeat                         # width of each run's slice
+        self._current_step += 1
+        # Each step occupies an equal slice of the 0-100 bar
+        self._run_base = (self._current_step - 1) / self._total_steps * 100
+        self._run_size = 100.0 / self._total_steps
         self._progress_bar.setValue(int(self._run_base))
 
-        fw_path = self._file1_textbox.text().strip()
+        # Determine which file to use for this step
+        if self._has_file1 and self._has_file2:
+            # Both files: alternate (odd steps = file 1, even steps = file 2)
+            file_index = 1 if (self._current_step % 2 == 1) else 2
+        elif self._has_file1:
+            file_index = 1
+        else:
+            file_index = 2
+
+        fw_path = (self._file1_textbox.text().strip() if file_index == 1
+                   else self._file2_textbox.text().strip())
+
+        if self._has_file1 and self._has_file2:
+            repeat_num = (self._current_step + 1) // 2
+        else:
+            repeat_num = self._current_step
+        self.setWindowTitle('Firmware Update Test (step %d/%d — file %d, repeat %d/%d)'
+                           % (self._current_step, self._total_steps, file_index,
+                              repeat_num, self._repeat))
+
         if not fw_path:
+            logger.error('Firmware file %d path is empty', file_index)
             self._finish_test(False)
             return
 
@@ -209,14 +232,16 @@ class FirmwareUpdateTestDialog(QDialog):
             try:
                 self._file_server_widget.add_path(fw_file)
                 self._file_server_widget.force_start()
+                self._fw_file_path = fw_file
             except Exception:
                 logger.exception('Could not configure file server')
                 self._finish_test(False)
                 return
 
         remote_fw_file = FileServer_PathKey(fw_file)
-        logger.info('Firmware update run %d/%d  node=%d  file=%s',
-                    self._current_run, self._repeat, self._target_node_id, remote_fw_file)
+        logger.info('Firmware update step %d/%d  node=%d  file%d=%s',
+                    self._current_step, self._total_steps, self._target_node_id,
+                    file_index, remote_fw_file)
 
         # Set up file-transfer progress monitoring
         self._fw_file_size = os.path.getsize(fw_file)
@@ -262,24 +287,26 @@ class FirmwareUpdateTestDialog(QDialog):
             if self._closed:
                 logger.debug('on_run_complete: ignored (dialog closed)')
                 return
-            logger.info('FW_TEST [node %d] Run %d/%d COMPLETE — fw_max_offset=%d/%d',
-                        self._target_node_id, self._current_run, self._repeat,
-                        self._fw_max_offset, self._fw_file_size)
+            logger.info('FW_TEST [node %d] Step %d/%d COMPLETE — fw_max_offset=%d/%d, '
+                        'saw_sw_update=%s',
+                        self._target_node_id, self._current_step, self._total_steps,
+                        self._fw_max_offset, self._fw_file_size,
+                        self._saw_software_update_mode)
             self._uninstall_transfer_hook()
             self._progress_timer.stop()
             self._cleanup_handlers()
             progress_val = int(self._run_base + self._run_size)
             self._progress_bar.setValue(min(progress_val, 100))
-            self._run_firmware_update()  # advance to next run or finish
+            self._verify_post_reboot(fw_file)
 
         def on_timeout():
             if self._closed:
                 logger.debug('on_timeout: ignored (dialog closed)')
                 return
             self._timeout_handle = None
-            logger.error('FW_TEST [node %d] TIMEOUT run %d/%d — accepted=%s, saw_sw_update=%s, '
+            logger.error('FW_TEST [node %d] TIMEOUT step %d/%d — accepted=%s, saw_sw_update=%s, '
                          'last_uptime=%s, fw_offset=%d/%d',
-                         self._target_node_id, self._current_run, self._repeat,
+                         self._target_node_id, self._current_step, self._total_steps,
                          self._update_accepted, self._saw_software_update_mode,
                          self._last_target_uptime, self._fw_max_offset, self._fw_file_size)
             self._finish_test(False)
@@ -340,6 +367,17 @@ class FirmwareUpdateTestDialog(QDialog):
                 left_update_mode = (self._saw_software_update_mode
                                     and current_mode != e.message.MODE_SOFTWARE_UPDATE)
                 if rebooted or left_update_mode:
+                    # Only treat as completion if we actually saw firmware
+                    # transfer or SOFTWARE_UPDATE mode.  Otherwise the node
+                    # just rebooted into its bootloader and the real transfer
+                    # hasn't started yet — keep waiting.
+                    if not self._saw_software_update_mode and self._fw_max_offset == 0:
+                        logger.info('FW_TEST [node %d] Reboot detected (uptime %s->%d) but no '
+                                    'transfer yet — assuming bootloader entry, continuing…',
+                                    self._target_node_id,
+                                    self._last_target_uptime, current_uptime)
+                        self._last_target_uptime = current_uptime
+                        return
                     logger.info('FW_TEST [node %d] Reboot detected! uptime %s->%d, mode=%d, '
                                 'rebooted=%s, left_update_mode=%s',
                                 self._target_node_id,
@@ -433,6 +471,19 @@ class FirmwareUpdateTestDialog(QDialog):
 
     # --- DroneCAN handler cleanup ---
 
+    def _remove_fw_from_file_server(self):
+        """
+        @brief          Remove the firmware file from the file server so the
+                        remote node can no longer download it.
+        """
+        if self._fw_file_path is not None and self._file_server_widget is not None:
+            try:
+                self._file_server_widget.remove_path(self._fw_file_path)
+                logger.info('FW_TEST removed firmware path from file server: %s', self._fw_file_path)
+            except Exception:
+                logger.exception('FW_TEST could not remove firmware path from file server')
+            self._fw_file_path = None
+
     def _cleanup_handlers(self):
         """
         @brief          Remove any pending DroneCAN handlers.
@@ -446,6 +497,122 @@ class FirmwareUpdateTestDialog(QDialog):
         if self._timeout_handle is not None:
             self._timeout_handle.try_remove()
             self._timeout_handle = None
+        if self._verify_status_handle is not None:
+            self._verify_status_handle.remove()
+            self._verify_status_handle = None
+        if self._verify_timeout_handle is not None:
+            self._verify_timeout_handle.try_remove()
+            self._verify_timeout_handle = None
+
+    def _verify_post_reboot(self, fw_file_path: str):
+        """
+        @brief          After a firmware update step completes, verify that
+                        the node comes back online and reports the correct
+                        firmware version in its name.
+        @param[in]      fw_file_path    Path to the .bin file that was just
+                                        sent to the node.
+        """
+        logger.info('FW_TEST [node %d] Starting post-reboot verification (timeout=%ds, fw=%s)',
+                    self._target_node_id, POST_REBOOT_TIMEOUT, fw_file_path)
+
+        parser = FirmwareBinaryParser(fw_file_path)
+        if not parser.match_found:
+            logger.warning('FW_TEST [node %d] Could not parse version from firmware file %s — skipping version check',
+                           self._target_node_id, fw_file_path)
+
+        def on_verify_timeout():
+            if self._closed:
+                return
+            self._verify_timeout_handle = None
+            logger.error('FW_TEST [node %d] Post-reboot verification TIMEOUT — '
+                         'no NodeStatus received within %d s',
+                         self._target_node_id, POST_REBOOT_TIMEOUT)
+            self._finish_test(False)
+
+        def on_verify_node_status(e):
+            if self._closed:
+                return
+            if e.transfer.source_node_id != self._target_node_id:
+                return
+            # Ignore if node is still in software update mode — it hasn't finished yet
+            if e.message.mode == e.message.MODE_SOFTWARE_UPDATE:
+                logger.debug('FW_TEST [node %d] Post-reboot: ignoring NodeStatus still in MODE_SOFTWARE_UPDATE',
+                             self._target_node_id)
+                return
+            # Node is alive and out of update mode — cancel timeout
+            logger.info('FW_TEST [node %d] Post-reboot NodeStatus received (uptime=%d, mode=%d)',
+                        self._target_node_id, e.message.uptime_sec, e.message.mode)
+            # Clean up verification handlers
+            if self._verify_status_handle is not None:
+                self._verify_status_handle.remove()
+                self._verify_status_handle = None
+            if self._verify_timeout_handle is not None:
+                self._verify_timeout_handle.try_remove()
+                self._verify_timeout_handle = None
+
+            if not parser.match_found:
+                logger.info('FW_TEST [node %d] No version to verify — advancing',
+                            self._target_node_id)
+                self._advance_to_next_step()
+                return
+
+            # Send GetNodeInfo to check the node's name contains the expected version
+            def on_node_info(msg):
+                if self._closed:
+                    return
+                if msg is None:
+                    logger.error('FW_TEST [node %d] GetNodeInfo request timed out',
+                                 self._target_node_id)
+                    self._finish_test(False)
+                    return
+
+                node_name = msg.response.name
+                if isinstance(node_name, (bytes, bytearray)):
+                    node_name = node_name.decode('utf-8', errors='replace')
+                else:
+                    node_name = str(node_name)
+                node_name = node_name.rstrip('\x00').strip()
+
+                logger.info('FW_TEST [node %d] GetNodeInfo name: "%s"',
+                            self._target_node_id, node_name)
+
+                if parser.is_match(node_name):
+                    logger.info('FW_TEST [node %d] Version verification PASSED — '
+                                'node name matches expected "%s"',
+                                self._target_node_id, parser.full_match)
+                    self._advance_to_next_step()
+                else:
+                    logger.error('FW_TEST [node %d] Version verification FAILED — '
+                                 'node name "%s" does not match expected "%s"',
+                                 self._target_node_id, node_name, parser.full_match)
+                    self._finish_test(False)
+
+            try:
+                req = dronecan.uavcan.protocol.GetNodeInfo.Request()
+                self._node.request(req, self._target_node_id, on_node_info,
+                                   priority=REQUEST_PRIORITY)
+            except Exception:
+                logger.exception('FW_TEST [node %d] Could not send GetNodeInfo',
+                                 self._target_node_id)
+                self._finish_test(False)
+
+        self._verify_timeout_handle = self._node.defer(POST_REBOOT_TIMEOUT, on_verify_timeout)
+        self._verify_status_handle = self._node.add_handler(
+            dronecan.uavcan.protocol.NodeStatus, on_verify_node_status)
+
+    def _advance_to_next_step(self):
+        """
+        @brief          Advance to the next firmware update step, or finish
+                        if all steps are complete.
+        """
+        if self._closed:
+            return
+        if self._current_step < self._total_steps:
+            logger.info('FW_TEST [node %d] Waiting %d s for node to stabilize before next step…',
+                        self._target_node_id, POST_REBOOT_TIMEOUT)
+            QTimer.singleShot(POST_REBOOT_TIMEOUT * 1000, self._run_firmware_update)
+        else:
+            self._run_firmware_update()  # will see current_step >= total_steps and finish
 
     def _finish_test(self, success: bool):
         """
@@ -455,8 +622,8 @@ class FirmwareUpdateTestDialog(QDialog):
         if self._closed:
             logger.debug('_finish_test(%s): ignored (dialog already closed)', success)
             return
-        logger.info('FW_TEST [node %s] _finish_test(%s) — run=%d/%d, fw_offset=%d/%d',
-                    self._target_node_id, success, self._current_run, self._repeat,
+        logger.info('FW_TEST [node %s] _finish_test(%s) — step=%d/%d, fw_offset=%d/%d',
+                    self._target_node_id, success, self._current_step, self._total_steps,
                     self._fw_max_offset, self._fw_file_size)
         self._progress_timer.stop()
         self._uninstall_transfer_hook()
@@ -477,6 +644,7 @@ class FirmwareUpdateTestDialog(QDialog):
         self._progress_timer.stop()
         self._uninstall_transfer_hook()
         self._cleanup_handlers()
+        self._remove_fw_from_file_server()
         # If closed without a result (e.g. the X button), treat as cancel.
         if self._result is None:
             logger.info('FW_TEST closeEvent: no result set — treating as cancel (emitting False)')

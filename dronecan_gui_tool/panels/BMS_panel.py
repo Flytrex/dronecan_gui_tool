@@ -9,7 +9,7 @@
 import datetime
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Lock
 from typing import Callable, List, Optional, Sequence
 
@@ -488,6 +488,10 @@ class BmsNodeTable(NodeTable):
             self.insertRow(row)
             self.set_row(row, known_nodes[nid])
 
+        # Auto-select the first row when nothing is selected
+        if self.rowCount() > 0 and not self.selectedItems():
+            self.selectRow(0)
+
 class BMSAutoCheckPanel(QDialog):
     """
     @brief          Main panel dialog for BMS automated testing.
@@ -737,7 +741,8 @@ class BMSAutoCheckPanel(QDialog):
         self._set_test_row(test, 'Pending', '')
 
         self._single_test_running = test
-        self._suite.set_tests([test] * repeat)
+        scaled_test = replace(test, timeout_sec=test.timeout_sec * repeat) if repeat > 1 else test
+        self._suite.set_tests([scaled_test] * repeat)
         self._tests.reset()
         self._tests._firmware_update_repeat = repeat
 
@@ -783,6 +788,11 @@ class BMSAutoCheckPanel(QDialog):
         @param[in]      repeat      Number of firmware update cycles.
         """
         if not self._is_running:
+            return
+
+        if self._selected_node_id is None:
+            logger.error('Cannot start firmware update test: no node selected')
+            self._tests._set_firmware_update_result(False)
             return
 
         # Access file_server_widget from the main window (same pattern as other panels)
@@ -877,6 +887,15 @@ class BMSAutoCheckPanel(QDialog):
             # QueuedConnection won't work here because the worker's run()
             # never returns to the thread's event loop.
             self._runner_worker._stop_requested = True
+
+        # Force-close any open firmware update dialog so the file server
+        # stops serving the firmware file and the node can no longer download it.
+        if self._tests._firmware_update_dialog is not None:
+            try:
+                self._tests._firmware_update_dialog.close()
+            except Exception:
+                logger.exception('Could not close firmware update dialog')
+            self._tests._firmware_update_dialog = None
 
         # Synchronously clean up so the next Start works immediately
         self._cleanup_runner()
