@@ -238,6 +238,7 @@ class _BmsAutoCheckTests:
         self._firmware_update_result: Optional[bool] = None
         self._firmware_update_repeat: int = 1
         self._firmware_update_dialog: Optional[FirmwareUpdateTestDialog] = None
+        self._firmware_update_continue_on_failure: bool = False
 
     def _set_batteries_toggle_answer(self, answer: bool) -> None:
         """
@@ -266,6 +267,7 @@ class _BmsAutoCheckTests:
             self._firmware_update_result = None
             self._firmware_update_repeat = 1
             self._firmware_update_dialog = None
+            self._firmware_update_continue_on_failure = False
 
     def critical_tests(self):
         """
@@ -686,20 +688,23 @@ class BMSAutoCheckPanel(QDialog):
 
         menu.exec_(table.viewport().mapToGlobal(pos))
 
-    def _show_run_count_dialog(self) -> Optional[int]:
+    def _show_run_count_dialog(self):
         """
-        @brief          Show a dialog asking for the number of test runs.
-        @return         The requested count, or None if cancelled.
+        @brief          Show a dialog asking for the number of test repeats.
+        @return         A tuple (count, continue_on_failure), or None if cancelled.
         """
         dialog = QDialog(self)
         dialog.setWindowTitle('Run Test')
         layout = QVBoxLayout(dialog)
 
-        label = QLabel('Number Of Runs:', dialog)
+        label = QLabel('Repeats:', dialog)
         layout.addWidget(label)
 
         text_box = QLineEdit('1', dialog)
         layout.addWidget(text_box)
+
+        continue_cb = QCheckBox('Continue on failure', dialog)
+        layout.addWidget(continue_cb)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dialog)
         button_box.accepted.connect(dialog.accept)
@@ -710,7 +715,7 @@ class BMSAutoCheckPanel(QDialog):
             try:
                 count = int(text_box.text())
                 if count > 0:
-                    return count
+                    return count, continue_cb.isChecked()
             except ValueError:
                 pass
         return None
@@ -722,17 +727,19 @@ class BMSAutoCheckPanel(QDialog):
         """
         if self._is_running:
             return
-        count = self._show_run_count_dialog()
-        if count is None:
+        result = self._show_run_count_dialog()
+        if result is None:
             return
-        self._run_single_test(test, repeat=count)
+        count, continue_on_failure = result
+        self._run_single_test(test, repeat=count, continue_on_failure=continue_on_failure)
 
-    def _run_single_test(self, test: BmsTest, repeat: int = 1) -> None:
+    def _run_single_test(self, test: BmsTest, repeat: int = 1, continue_on_failure: bool = False) -> None:
         """
         @brief          Run a test (optionally repeated) using a dedicated
                         worker thread.
-        @param[in]      test    The BmsTest to run.
-        @param[in]      repeat  Number of times to repeat the test.
+        @param[in]      test                The BmsTest to run.
+        @param[in]      repeat              Number of times to repeat the test.
+        @param[in]      continue_on_failure  If True, don't stop on failure.
         """
         if self._is_running:
             return
@@ -745,6 +752,7 @@ class BMSAutoCheckPanel(QDialog):
         self._suite.set_tests([scaled_test] * repeat)
         self._tests.reset()
         self._tests._firmware_update_repeat = repeat
+        self._tests._firmware_update_continue_on_failure = continue_on_failure
 
         self._is_running = True
         self._start_button.setText('Stop')
@@ -804,6 +812,7 @@ class BMSAutoCheckPanel(QDialog):
             node=self._node,
             target_node_id=self._selected_node_id,
             file_server_widget=file_server_widget,
+            continue_on_failure=self._tests._firmware_update_continue_on_failure,
             parent=self,
         )
         dialog.test_finished.connect(self._tests._set_firmware_update_result)

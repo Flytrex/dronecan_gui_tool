@@ -1,8 +1,11 @@
+import datetime
 import os
 from logging import getLogger
 
 import dronecan
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QLineEdit, QFileDialog, QProgressBar, QMessageBox
+from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QLineEdit,
+                              QFileDialog, QProgressBar, QMessageBox, QTableWidget,
+                              QTableWidgetItem, QHeaderView)
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 
 from dronecan_gui_tool.widgets.file_server import FileServer_PathKey
@@ -25,7 +28,7 @@ class FirmwareUpdateTestDialog(QDialog):
 
     test_finished = pyqtSignal(bool)  # True = pass, False = fail
 
-    def __init__(self, repeat: int = 1, node=None, target_node_id=None, file_server_widget=None, parent=None):
+    def __init__(self, repeat: int = 1, node=None, target_node_id=None, file_server_widget=None, continue_on_failure: bool = False, parent=None):
         """
         @brief          Initialise the firmware update test dialog.
         @param[in]      repeat              Number of firmware update cycles to run.
@@ -107,6 +110,12 @@ class FirmwareUpdateTestDialog(QDialog):
         self._verify_status_handle = None
         self._verify_timeout_handle = None
 
+        # Continue-on-failure tracking
+        self._continue_on_failure = continue_on_failure
+        self._step_results = []
+        self._current_step_fw_file = ''
+        self._current_step_start_time = ''
+
     def _on_load_file1(self):
         """
         @brief          Open a file dialog to select firmware file 1.
@@ -171,10 +180,14 @@ class FirmwareUpdateTestDialog(QDialog):
         if self._current_step >= self._total_steps:
             logger.info('FW_TEST [node %s] All %d steps completed — finishing with success',
                         self._target_node_id, self._total_steps)
-            self._finish_test(True)
+            if self._continue_on_failure and self._step_results:
+                self._complete_all_steps()
+            else:
+                self._finish_test(True)
             return
 
         self._current_step += 1
+        self._current_step_start_time = datetime.datetime.now().strftime('%H:%M:%S')
         # Each step occupies an equal slice of the 0-100 bar
         self._run_base = (self._current_step - 1) / self._total_steps * 100
         self._run_size = 100.0 / self._total_steps
@@ -191,6 +204,7 @@ class FirmwareUpdateTestDialog(QDialog):
 
         fw_path = (self._file1_textbox.text().strip() if file_index == 1
                    else self._file2_textbox.text().strip())
+        self._current_step_fw_file = fw_path or ('File %d' % file_index)
 
         if self._has_file1 and self._has_file2:
             repeat_num = (self._current_step + 1) // 2
@@ -297,6 +311,14 @@ class FirmwareUpdateTestDialog(QDialog):
             self._cleanup_handlers()
             progress_val = int(self._run_base + self._run_size)
             self._progress_bar.setValue(min(progress_val, 100))
+            # If the firmware transfer was clearly incomplete, fail immediately
+            if (self._fw_file_size > 0
+                    and self._fw_max_offset + 256 < self._fw_file_size):
+                logger.error('FW_TEST [node %d] Firmware transfer incomplete: '
+                             'max_offset=%d, file_size=%d — treating as failure',
+                             self._target_node_id, self._fw_max_offset, self._fw_file_size)
+                self._finish_test(False)
+                return
             self._verify_post_reboot(fw_file)
 
         def on_timeout():
@@ -605,6 +627,7 @@ class FirmwareUpdateTestDialog(QDialog):
         @brief          Advance to the next firmware update step, or finish
                         if all steps are complete.
         """
+        self._record_step_result(True)
         if self._closed:
             return
         if self._current_step < self._total_steps:
@@ -612,16 +635,89 @@ class FirmwareUpdateTestDialog(QDialog):
                         self._target_node_id, POST_REBOOT_TIMEOUT)
             QTimer.singleShot(POST_REBOOT_TIMEOUT * 1000, self._run_firmware_update)
         else:
-            self._run_firmware_update()  # will see current_step >= total_steps and finish
+            if self._continue_on_failure:
+                self._complete_all_steps()
+            else:
+                self._run_firmware_update()  # will see current_step >= total_steps and finish
+
+    def _record_step_result(self, success: bool):
+        """
+        @brief          Record the result of the current firmware update step.
+        @param[in]      success     True if the step passed, False if failed.
+        """
+        self._step_results.append({
+            'fw_file': self._current_step_fw_file or 'N/A',
+            'status': 'Pass' if success else 'Failed',
+            'start_time': self._current_step_start_time or 'N/A',
+        })
+
+    def _complete_all_steps(self):
+        """
+        @brief          Finalize when all steps are done in continue-on-failure
+                        mode. Shows a report dialog, then finishes the test.
+        """
+        if self._closed:
+            return
+        all_passed = all(r['status'] == 'Pass' for r in self._step_results)
+        if not all_passed:
+            self._show_report_dialog()
+        self._continue_on_failure = False
+        self._finish_test(all_passed)
+
+    def _show_report_dialog(self):
+        """
+        @brief          Show a modal report dialog with results of all
+                        firmware update steps.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Firmware Update Report')
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+
+        table = QTableWidget(len(self._step_results), 3, dialog)
+        table.setHorizontalHeaderLabels(['FW File', 'Status', 'Start Time'])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+
+        for row, result in enumerate(self._step_results):
+            for col, value in enumerate([result['fw_file'], result['status'], result['start_time']]):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                table.setItem(row, col, item)
+
+        table.setSelectionMode(QTableWidget.ContiguousSelection)
+        layout.addWidget(table)
+
+        ok_button = QPushButton('OK', dialog)
+        ok_button.clicked.connect(dialog.accept)
+        layout.addWidget(ok_button)
+
+        dialog.resize(600, 400)
+        dialog.exec_()
 
     def _finish_test(self, success: bool):
         """
-        @brief          Finalise the firmware update test.
+        @brief          Finalize the firmware update test.
         @param[in]      success     True if the test passed, False otherwise.
         """
         if self._closed:
             logger.debug('_finish_test(%s): ignored (dialog already closed)', success)
             return
+        # Continue-on-failure: record failure and advance instead of stopping
+        if not success and self._continue_on_failure:
+            self._record_step_result(False)
+            self._progress_timer.stop()
+            self._uninstall_transfer_hook()
+            self._cleanup_handlers()
+            progress_val = int(self._run_base + self._run_size)
+            self._progress_bar.setValue(min(progress_val, 100))
+            if self._current_step < self._total_steps:
+                QTimer.singleShot(2000, self._run_firmware_update)
+            else:
+                self._complete_all_steps()
+            return
+
         logger.info('FW_TEST [node %s] _finish_test(%s) — step=%d/%d, fw_offset=%d/%d',
                     self._target_node_id, success, self._current_step, self._total_steps,
                     self._fw_max_offset, self._fw_file_size)
