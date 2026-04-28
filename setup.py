@@ -10,10 +10,14 @@
 import os
 import sys
 import shutil
-import pkg_resources
 import glob
 from setuptools import setup, find_packages
 from setuptools.archive_util import unpack_archive
+
+# pkg_resources is only needed for the cx_Freeze MSI build path. Modern
+# setuptools (>= 81) no longer ships it by default, and pip's build isolation
+# uses the latest setuptools, which would otherwise break `pip install .` in
+# CI. Import it lazily inside the bdist_msi/build_exe branch instead.
 
 PACKAGE_NAME = 'dronecan_gui_tool'
 HUMAN_FRIENDLY_NAME = 'DroneCAN GUI Tool'
@@ -115,6 +119,7 @@ if os.name == 'nt':
 
 if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
     import cx_Freeze
+    import pkg_resources  # only needed for MSI builds; provided by setuptools<81
 
     # cx_Freeze can't handle 3rd-party packages packed in .egg files, so we have to extract them for it
     dependency_eggs_to_unpack = [
