@@ -12,6 +12,11 @@ import os
 import sys
 import time
 import tempfile
+import re
+import glob
+import io
+import shutil
+import zipfile
 
 assert sys.version[0] == '3'
 
@@ -70,11 +75,11 @@ from serial import SerialException
 
 import dronecan
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QSplitter, QAction
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QSplitter, QAction, QMessageBox
 from PyQt5.QtGui import QKeySequence, QDesktopServices
 from PyQt5.QtCore import QTimer, Qt, QUrl
 
-from .version import __version__
+from .version import __version__, __flytrex_version__
 from .setup_window import run_setup_window
 from .active_data_type_detector import ActiveDataTypeDetector
 
@@ -94,10 +99,19 @@ from .widgets.plotter import PlotterManager
 from .widgets.about_window import AboutWindow
 from .widgets.can_adapter_control_panel import spawn_window as spawn_can_adapter_control_panel
 
+from urllib.request import Request, urlopen
+
 from .panels import PANELS
 
 
 NODE_NAME = 'org.dronecan.gui_tool'
+
+# DSDL update source: public Flytrex fork of public_regulated_data_types
+DSDL_REPO = 'Flytrex/public_regulated_data_types'
+DSDL_BRANCH = 'Flyhawk-5.0'
+# Top-level archive entries that are not DSDL trees and must not be synced.
+DSDL_SYNC_EXCLUDES = {'.github', '.gitignore', 'tests', 'LICENSE', 'README.md',
+                     'test.py', '.flytrex_dsdl_version'}
 
 
 class MainWindow(QMainWindow):
@@ -214,12 +228,17 @@ class MainWindow(QMainWindow):
         show_log_directory_action.triggered.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(log_file.name))))
 
+        check_for_updates_action = QAction(get_icon('fa6s.cloud-arrow-down'), 'Check for &Updates', self)
+        check_for_updates_action.setStatusTip('Check GitHub for a newer release of the DroneCAN GUI Tool')
+        check_for_updates_action.triggered.connect(self._check_for_updates)
+
         about_action = QAction(get_icon('fa6s.info'), '&About', self)
         about_action.triggered.connect(lambda: AboutWindow(self).show())
 
         help_menu = self.menuBar().addMenu('&Help')
         help_menu.addAction(dronecan_website_action)
         help_menu.addAction(show_log_directory_action)
+        help_menu.addAction(check_for_updates_action)
         help_menu.addAction(about_action)
 
         #
@@ -252,11 +271,313 @@ class MainWindow(QMainWindow):
                                                           make_vbox(self._dynamic_node_id_allocation_widget,
                                                                     stretch_index=1))))
 
+        # Run an update check shortly after the window is shown.
+        QTimer.singleShot(2000, lambda: self._check_for_updates(silent=True))
+
     def _try_spawn_can_adapter_control_panel(self):
         try:
             spawn_can_adapter_control_panel(self, self._node, self._iface_name)
         except Exception as ex:
             show_error('CAN Adapter Control Panel error', 'Could not spawn CAN Adapter Control Panel', ex, self)
+
+    def _check_for_updates(self, silent=False):
+        updates_dir = r'G:\Shared drives\Engineering\Lab Tools\DroneCAN GUI Tool, Flytrex Version'
+        current_version = '.'.join(map(str, __version__))
+        current_flytrex = '.'.join(map(str, __flytrex_version__))
+        current_combo = (tuple(__version__), tuple(__flytrex_version__))
+
+        if not os.path.isdir(updates_dir):
+            if silent:
+                logger.info('Update check skipped: %s not accessible', updates_dir)
+                return
+            QMessageBox.warning(self, 'Check for Updates',
+                                'Could not access the updates directory:\n{}\n\n'
+                                'Make sure the shared drive is mounted.'.format(updates_dir))
+            return
+
+        pattern = re.compile(
+            r'^dronecan_gui_tool-(\d+(?:\.\d+)*)-win64-flytrex-(\d+(?:\.\d+)*)\.msi$',
+            re.IGNORECASE)
+
+        latest = None  # ((version_tuple, flytrex_tuple), version_str, flytrex_str, filename)
+        try:
+            entries = os.listdir(updates_dir)
+        except OSError as ex:
+            logger.warning('Update check failed', exc_info=True)
+            if silent:
+                return
+            QMessageBox.warning(self, 'Check for Updates',
+                                'Could not list the updates directory:\n{}'.format(ex))
+            return
+
+        for name in entries:
+            m = pattern.match(name)
+            if not m:
+                continue
+            v = tuple(int(x) for x in m.group(1).split('.'))
+            fv = tuple(int(x) for x in m.group(2).split('.'))
+            key = (v, fv)
+            if latest is None or key > latest[0]:
+                latest = (key, m.group(1), m.group(2), name)
+
+        if latest is None:
+            if silent:
+                return
+            QMessageBox.warning(self, 'Check for Updates',
+                                'No installation files were found in:\n{}'.format(updates_dir))
+            return
+
+        if latest[0] > current_combo:
+            installer_path = os.path.join(updates_dir, latest[3])
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle('Check for Updates')
+            msg.setTextFormat(Qt.RichText)
+            msg.setText(
+                'A new version is available.<br><br>'
+                'Installed: <b>{cur} (flytrex {curf})</b><br>'
+                'Latest: <b>{latest} (flytrex {latestf})</b><br><br>'
+                'File: <code>{name}</code><br><br>'
+                'Press <b>Install Now</b> to close the application and run the installer, '
+                'or open the <a href="file:///{url}">updates folder</a> to install manually.'.format(
+                    cur=current_version, curf=current_flytrex,
+                    latest=latest[1], latestf=latest[2],
+                    name=latest[3],
+                    url=updates_dir.replace('\\', '/')))
+            msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            install_btn = msg.addButton('Install Now', QMessageBox.AcceptRole)
+            msg.addButton('Later', QMessageBox.RejectRole)
+            msg.setDefaultButton(install_btn)
+            msg.exec_()
+            if msg.clickedButton() is install_btn:
+                self._launch_installer_and_quit(installer_path)
+        elif not silent:
+            QMessageBox.information(
+                self, 'Check for Updates',
+                'You are running the latest version ({} flytrex {}).'.format(
+                    current_version, current_flytrex))
+
+        # Also check whether the bundled DSDL is behind the public Flytrex branch.
+        self._check_for_dsdl_updates(silent=silent)
+
+    def _dsdl_specs_dir(self):
+        # Installed (MSI) layout: dsdl files live next to the dronecan package.
+        installed = os.path.join(os.path.dirname(dronecan.__file__), 'dsdl_specs')
+        if os.path.isdir(installed):
+            return installed
+        # Dev layout: dronecan loads DSDL from <repo>/public_regulated_data_types
+        # (see pydronecan/dronecan/__init__.py).
+        dev = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(dronecan.__file__))),
+            '..', 'public_regulated_data_types'))
+        if os.path.isdir(dev):
+            return dev
+        return installed  # report the canonical path even if missing
+
+    def _read_local_dsdl_sha(self):
+        marker = os.path.join(self._dsdl_specs_dir(), '.flytrex_dsdl_version')
+        try:
+            with open(marker, 'r', encoding='utf-8') as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
+
+    def _write_local_dsdl_sha(self, sha):
+        marker = os.path.join(self._dsdl_specs_dir(), '.flytrex_dsdl_version')
+        try:
+            with open(marker, 'w', encoding='utf-8') as f:
+                f.write(sha)
+        except OSError:
+            logger.warning('Could not write DSDL version marker', exc_info=True)
+
+    def _check_for_dsdl_updates(self, silent=False):
+        import json
+        from urllib.request import Request, urlopen
+
+        target = self._dsdl_specs_dir()
+        if not os.path.isdir(target):
+            logger.info('DSDL update check skipped: %s does not exist', target)
+            return
+
+        # Refuse to touch a real git working tree (e.g. the source submodule
+        # in dev). The installed MSI may have a stray .git file/folder copied
+        # in from the source tree -- that's a packaging artifact, not a real
+        # checkout, so we still want to update it. Only skip when we're
+        # running under the workspace layout (i.e. dronecan is imported from
+        # a "pydronecan" sibling, not from the frozen `lib/`).
+        dronecan_dir = os.path.dirname(os.path.abspath(dronecan.__file__))
+        is_dev = os.path.basename(os.path.dirname(dronecan_dir)).lower() == 'pydronecan'
+        if is_dev and os.path.exists(os.path.join(target, '.git')):
+            logger.info('DSDL update check skipped: %s is a git working tree', target)
+            return
+
+        api_url = 'https://api.github.com/repos/{}/branches/{}'.format(DSDL_REPO, DSDL_BRANCH)
+        try:
+            req = Request(api_url, headers={'Accept': 'application/vnd.github+json',
+                                            'User-Agent': 'dronecan_gui_tool'})
+            with urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+            remote_sha = data['commit']['sha']
+        except Exception as ex:
+            logger.warning('DSDL update check failed', exc_info=True)
+            if silent:
+                return
+            QMessageBox.warning(self, 'Check for DSDL Updates',
+                                'Could not check for DSDL updates:\n{}'.format(ex))
+            return
+
+        local_sha = self._read_local_dsdl_sha()
+        if local_sha == remote_sha:
+            if not silent:
+                QMessageBox.information(
+                    self, 'Check for DSDL Updates',
+                    'DSDL definitions are up to date.\n'
+                    'Branch: {}\nCommit: {}'.format(DSDL_BRANCH, remote_sha[:7]))
+            return
+
+        short_local = local_sha[:7] if local_sha else '(unknown)'
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle('DSDL Update Available')
+        msg.setTextFormat(Qt.RichText)
+        msg.setText(
+            'Newer DSDL definitions are available on branch <b>{branch}</b> of '
+            '<a href="https://github.com/{repo}/tree/{branch}">{repo}</a>.<br><br>'
+            'Local commit: <b>{local}</b><br>'
+            'Remote commit: <b>{remote}</b><br><br>'
+            'Update the DSDL files in:<br><code>{path}</code>?'.format(
+                repo=DSDL_REPO, branch=DSDL_BRANCH,
+                local=short_local, remote=remote_sha[:7],
+                path=target))
+        msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        update_btn = msg.addButton('Update', QMessageBox.AcceptRole)
+        msg.addButton('Later', QMessageBox.RejectRole)
+        msg.setDefaultButton(update_btn)
+        msg.exec_()
+        if msg.clickedButton() is update_btn:
+            self._apply_dsdl_update(remote_sha)
+
+    def _apply_dsdl_update(self, remote_sha):
+
+        target = self._dsdl_specs_dir()
+        archive_url = 'https://github.com/{}/archive/{}.zip'.format(DSDL_REPO, remote_sha)
+
+        try:
+            req = Request(archive_url, headers={'User-Agent': 'dronecan_gui_tool'})
+            with urlopen(req, timeout=60) as resp:
+                blob = resp.read()
+            zf = zipfile.ZipFile(io.BytesIO(blob))
+            names = zf.namelist()
+            if not names:
+                raise RuntimeError('Archive is empty')
+            # Archive root is e.g. 'public_regulated_data_types-<sha>/'
+            root = names[0].split('/', 1)[0] + '/'
+
+            # Remove existing top-level entries (other than our marker / excluded
+            # files), so stale folders disappear and renames are handled.
+            os.makedirs(target, exist_ok=True)
+            for entry in os.listdir(target):
+                if entry in DSDL_SYNC_EXCLUDES:
+                    continue
+                full = os.path.join(target, entry)
+                try:
+                    if os.path.isdir(full):
+                        shutil.rmtree(full)
+                    else:
+                        os.remove(full)
+                except OSError:
+                    logger.warning('Failed to remove %s', full, exc_info=True)
+
+            # Extract everything except known non-DSDL top-level items.
+            extracted = 0
+            for n in names:
+                if not n.startswith(root):
+                    continue
+                rel = n[len(root):]
+                if not rel:
+                    continue
+                top = rel.split('/', 1)[0]
+                if top in DSDL_SYNC_EXCLUDES:
+                    continue
+                dest = os.path.join(target, rel)
+                if n.endswith('/'):
+                    os.makedirs(dest, exist_ok=True)
+                    continue
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with zf.open(n) as src, open(dest, 'wb') as out:
+                    shutil.copyfileobj(src, out)
+                extracted += 1
+            logger.info('DSDL update: %d files written to %s', extracted, target)
+            self._write_local_dsdl_sha(remote_sha)
+        except PermissionError as ex:
+            logger.error('DSDL update failed (permissions)', exc_info=True)
+            QMessageBox.critical(
+                self, 'DSDL Update Failed',
+                'Permission denied while writing to:\n{}\n\n'
+                'Try running the application as Administrator, or '
+                'check folder permissions.\n\nDetails: {}'.format(target, ex))
+            return
+        except Exception as ex:
+            logger.error('DSDL update failed', exc_info=True)
+            QMessageBox.critical(self, 'DSDL Update Failed',
+                                 'Failed to update DSDL files:\n{}'.format(ex))
+            return
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle('DSDL Updated')
+        msg.setText(
+            'DSDL files updated successfully to commit {}.\n\n'
+            'The application must restart for the changes to take effect.'
+            .format(remote_sha[:7]))
+        restart_btn = msg.addButton('Restart Now', QMessageBox.AcceptRole)
+        msg.addButton('Later', QMessageBox.RejectRole)
+        msg.setDefaultButton(restart_btn)
+        msg.exec_()
+        if msg.clickedButton() is restart_btn:
+            self._restart_application()
+
+    def _restart_application(self):
+        import subprocess
+        try:
+            # sys.argv[0] is the launcher script in dev, or the frozen exe path
+            # when packaged with cx_Freeze. sys.executable points at the
+            # interpreter (dev) or the same frozen exe (frozen).
+            if getattr(sys, 'frozen', False):
+                args = [sys.executable] + sys.argv[1:]
+            else:
+                args = [sys.executable] + sys.argv
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            subprocess.Popen(args, close_fds=True,
+                             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        except Exception as ex:
+            logger.warning('Failed to restart application', exc_info=True)
+            QMessageBox.critical(self, 'Restart Failed',
+                                 'Failed to restart the application:\n{}'.format(ex))
+            return
+        logger.info('Restart requested, closing current instance')
+        QApplication.quit()
+
+    def _launch_installer_and_quit(self, installer_path):
+        import subprocess
+        try:
+            # Launch MSI via msiexec, fully detached so it survives our exit.
+            # The Windows Installer will handle uninstalling the previous version
+            # (provided the MSI was authored with a matching UpgradeCode).
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            subprocess.Popen(
+                ['msiexec', '/i', installer_path],
+                close_fds=True,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        except Exception as ex:
+            logger.warning('Failed to launch installer', exc_info=True)
+            QMessageBox.critical(self, 'Check for Updates',
+                                 'Failed to launch the installer:\n{}'.format(ex))
+            return
+        logger.info('Installer launched, closing application: %s', installer_path)
+        QApplication.quit()
 
     def _make_console_context(self):
         default_transfer_priority = 30

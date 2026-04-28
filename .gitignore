@@ -32,8 +32,13 @@ ENV/
 env.bak/
 venv.bak/
 
-# VS Code
-.vscode/
+# VS Code -- track shared task/launch configs, ignore per-user state
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/deploy.ps1
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
