@@ -1,5 +1,6 @@
 import re
 from logging import getLogger
+from typing import Optional
 
 logger = getLogger(__name__)
 
@@ -84,7 +85,7 @@ class FirmwareBinaryParser:
         return self._match_found
 
     @property
-    def full_match(self) -> str:
+    def full_match(self) -> Optional[str]:
         """
         @brief          Get the full matched version string.
         @return         The matched string (e.g. "com.flytrex.bms-g3.v0.8.2-rc5-2"),
@@ -92,28 +93,28 @@ class FirmwareBinaryParser:
         """
         return self._full_match
 
-    def hardware_type(self) -> str:
+    def hardware_type(self) -> Optional[str]:
         """
         @brief          Get the hardware type string.
         @return         Hardware type (e.g. "g3"), or None if not found.
         """
         return self._hw_type
 
-    def version(self) -> str:
+    def version(self) -> Optional[str]:
         """
         @brief          Get the version string.
         @return         Version (e.g. "v0.8.2"), or None if not found.
         """
         return self._version
 
-    def rc(self) -> int:
+    def rc(self) -> Optional[int]:
         """
         @brief          Get the release candidate number.
         @return         RC number (e.g. 5), or None if official or not found.
         """
         return self._rc
 
-    def sub_rc(self) -> int:
+    def sub_rc(self) -> Optional[int]:
         """
         @brief          Get the sub release candidate number.
         @return         Sub-RC number (e.g. 2), or None if official or not found.

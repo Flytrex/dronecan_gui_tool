@@ -6,21 +6,18 @@
 # Author: Ilan Graidy
 # Date:   2026-01-19
 #
-import datetime
-import os
 import time
 from dataclasses import dataclass, replace
 from threading import Lock
 from typing import Callable, List, Optional, Sequence
 
-import dronecan
 from functools import partial
 from PyQt5.QtWidgets import QVBoxLayout, QLabel, QDialog, \
-    QGridLayout, QPushButton, QComboBox, QHBoxLayout, QGroupBox, QCheckBox, QFileDialog, QApplication, QMessageBox, \
-    QSizePolicy, QMenu, QAction, QLineEdit, QDialogButtonBox
+    QPushButton, QGroupBox, QCheckBox, QMessageBox, \
+    QMenu, QAction, QLineEdit, QDialogButtonBox
 from PyQt5.QtCore import QTimer, Qt, QObject, QThread, pyqtSignal, pyqtSlot, QMetaObject
 from logging import getLogger
-from ..widgets import BasicTable, make_icon_button, get_icon, node_properties
+from ..widgets import BasicTable, get_icon
 from ..widgets.node_monitor import NodeTable
 from ..AutoTests.firmware_update_test import FirmwareUpdateTestDialog
 
@@ -45,6 +42,9 @@ class BmsTest:
                                     - Return False -> test failed
                                     - Return None  -> test still running / not completed yet
                                     Exceptions are treated as failure.
+                                    Repeated runs ("Run Test... x N") are
+                                    handled inside the callback or its dialog,
+                                    not by adding multiple suite entries.
     @param[in]      critical        Whether the test is critical.
     """
     idx: str
@@ -329,9 +329,11 @@ class _BmsAutoCheckTests:
     def _test_critical_2_bq_comms(self):
         """
         @brief          Critical test 2: BQ communications work.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_critical_3_firmware_update(self):
         """
@@ -353,79 +355,101 @@ class _BmsAutoCheckTests:
     def _test_critical_4a_board_id(self):
         """
         @brief          Critical test 4a: Board identification works.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_critical_4b_battery_id(self):
         """
         @brief          Critical test 4b: Battery identification works.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_critical_5_param_check(self):
         """
         @brief          Critical test 5: DroneCAN Parameters Check.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_critical_6_backcompat(self):
         """
         @brief          Critical test 6: Backwards Compatibility Check.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_critical_7_lifetime_tracker(self):
         """
         @brief          Critical test 7: Lifetime Charge Tracker Validation.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_noncritical_1_smart_charger(self):
         """
         @brief          Non-critical test 1: Smart Charger.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_noncritical_1a_pre08_full_charge(self):
         """
         @brief          Non-critical test 1a: Pre-0.8 Full Charge.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_noncritical_1b_post08_initial_reset(self):
         """
         @brief          Non-critical test 1b: Post-0.8 Initial Charge Reset.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_noncritical_1c_post08_alt_control(self):
         """
         @brief          Non-critical test 1c: Post-0.8 Alternate Charging Control.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_noncritical_2_atp_complete(self):
         """
         @brief          Non-critical test 2: ATP can be completed.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
     def _test_noncritical_3_voltage_protection(self):
         """
         @brief          Non-critical test 3: Voltage protection works.
-        @return         True if passed, False if failed, None if pending.
+                        Not yet implemented; fails deterministically so the
+                        runner does not stall on a None result.
+        @return         False (placeholder).
         """
-        pass
+        return False
 
 
 class BmsNodeTable(NodeTable):
@@ -748,8 +772,11 @@ class BMSAutoCheckPanel(QDialog):
         self._set_test_row(test, 'Pending', '')
 
         self._single_test_running = test
-        scaled_test = replace(test, timeout_sec=test.timeout_sec * repeat) if repeat > 1 else test
-        self._suite.set_tests([scaled_test] * repeat)
+        # Repetition is handled inside the test's dialog/callback; the suite
+        # holds a single entry whose timeout covers the whole batch.
+        scaled_test = (replace(test, timeout_sec=test.timeout_sec * repeat)
+                       if repeat > 1 else test)
+        self._suite.set_tests([scaled_test])
         self._tests.reset()
         self._tests._firmware_update_repeat = repeat
         self._tests._firmware_update_continue_on_failure = continue_on_failure
@@ -767,6 +794,15 @@ class BMSAutoCheckPanel(QDialog):
         self._runner_worker.test_started.connect(self._on_test_started)
         self._runner_worker.test_updated.connect(self._on_test_updated)
         self._runner_worker.run_finished.connect(self._on_run_finished)
+        # When the worker emits run_finished, ask the thread to leave its
+        # (event-less) run() and shut down. Without this the thread's quit()
+        # would have nothing to do and wait() would always block.
+        self._runner_worker.run_finished.connect(self._runner_thread.quit)
+        # Self-clean both objects after the thread has actually finished, so
+        # late-arriving queued signals can't land on the panel after it has
+        # dropped its references to them.
+        self._runner_thread.finished.connect(self._runner_worker.deleteLater)
+        self._runner_thread.finished.connect(self._runner_thread.deleteLater)
 
         self._runner_thread.start()
 
@@ -782,7 +818,7 @@ class BMSAutoCheckPanel(QDialog):
         result = QMessageBox.question(
             self,
             'BMS Auto Check',
-            'Did the batteries turned on and off?',
+            'Did the batteries turn on and off?',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
@@ -881,12 +917,21 @@ class BMSAutoCheckPanel(QDialog):
         self._runner_worker.test_started.connect(self._on_test_started)
         self._runner_worker.test_updated.connect(self._on_test_updated)
         self._runner_worker.run_finished.connect(self._on_run_finished)
+        # See note in _run_single_test: route worker shutdown through the
+        # thread's event loop and clean up the QObjects only after the
+        # thread has truly finished.
+        self._runner_worker.run_finished.connect(self._runner_thread.quit)
+        self._runner_thread.finished.connect(self._runner_worker.deleteLater)
+        self._runner_thread.finished.connect(self._runner_thread.deleteLater)
 
         self._runner_thread.start()
 
     def _stop_runner(self) -> None:
         """
-        @brief          Request the worker to stop and clean up the thread.
+        @brief          Ask the worker to stop. Actual cleanup happens
+                        asynchronously in _on_run_finished once the worker
+                        thread has truly exited, so we can't leak signals
+                        into a half-destroyed panel.
         """
         if not self._is_running:
             return
@@ -906,18 +951,53 @@ class BMSAutoCheckPanel(QDialog):
                 logger.exception('Could not close firmware update dialog')
             self._tests._firmware_update_dialog = None
 
-        # Synchronously clean up so the next Start works immediately
-        self._cleanup_runner()
+        # Reflect the in-progress shutdown in the UI; final cleanup happens
+        # when run_finished arrives.
+        self._start_button.setText('Stopping...')
+        self._start_button.setEnabled(False)
 
-    def _cleanup_runner(self) -> None:
+    def _cleanup_runner(self, wait_for_thread: bool = False) -> None:
         """
-        @brief          Terminate the worker thread and restore UI state.
+        @brief          Drop references to the worker thread and restore UI
+                        state. Should be called from _on_run_finished (in
+                        which case the thread has already exited) or from
+                        closeEvent with wait_for_thread=True as a last
+                        resort.
+        @param[in]      wait_for_thread     If True, synchronously block on
+                                            QThread.wait() before dropping
+                                            references. If wait() times out
+                                            we leave the thread alone --
+                                            the deleteLater hooked to
+                                            QThread.finished will eventually
+                                            collect it once run() returns.
         """
-        if self._runner_thread is not None:
-            self._runner_thread.quit()
-            self._runner_thread.wait(1500)
-            self._runner_thread = None
+        thread = self._runner_thread
+        worker = self._runner_worker
+        self._runner_thread = None
         self._runner_worker = None
+
+        if worker is not None:
+            # Detach signals so any belated emissions don't reach a panel
+            # whose state we're already tearing down.
+            try:
+                worker.test_started.disconnect(self._on_test_started)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                worker.test_updated.disconnect(self._on_test_updated)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                worker.run_finished.disconnect(self._on_run_finished)
+            except (TypeError, RuntimeError):
+                pass
+
+        if wait_for_thread and thread is not None and thread.isRunning():
+            thread.quit()
+            if not thread.wait(5000):
+                logger.warning('BMS runner thread did not finish within 5s; '
+                               'leaving it to be collected via deleteLater')
+
         self._is_running = False
         self._single_test_running = None
         # Restore the full test list in case a single test was run
@@ -1010,7 +1090,7 @@ class BMSAutoCheckPanel(QDialog):
             pass
 
         try:
-            self._cleanup_runner()
+            self._cleanup_runner(wait_for_thread=True)
         except Exception:
             pass
 

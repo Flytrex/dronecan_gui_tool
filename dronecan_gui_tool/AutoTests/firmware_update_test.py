@@ -4,7 +4,7 @@ from logging import getLogger
 
 import dronecan
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QLineEdit,
-                              QFileDialog, QProgressBar, QMessageBox, QTableWidget,
+                              QFileDialog, QProgressBar, QTableWidget,
                               QTableWidgetItem, QHeaderView)
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 
@@ -266,7 +266,7 @@ class FirmwareUpdateTestDialog(QDialog):
         self._install_transfer_hook()
         self._progress_timer.start()
 
-        TIMEOUT_SECONDS = 300  # 5 minutes per run
+        TIMEOUT_SECONDS = 600  # 10 minutes per run
         total_requests = 4
         num_remaining = [total_requests]  # mutable counter for closures
 

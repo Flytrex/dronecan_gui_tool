@@ -26,6 +26,14 @@ rem Install the bundled pydronecan submodule first so 'dronecan' is
 rem registered as a distribution (bdist_msi calls pkg_resources.require).
 rem --no-build-isolation forces pip to use the venv's pinned setuptools
 rem (instead of fetching the latest, which has removed pkg_resources).
+if not exist ".\pydronecan\setup.py" if not exist ".\pydronecan\pyproject.toml" (
+    echo.
+    echo ERROR: Missing pydronecan submodule or package metadata.
+    echo ERROR: Expected .\pydronecan\setup.py or .\pydronecan\pyproject.toml
+    echo ERROR: Please run: git submodule update --init --recursive
+    echo.
+    exit /b 1
+)
 python -m pip install --no-build-isolation -U .\pydronecan
 python -m pip install --no-build-isolation -U .
 
