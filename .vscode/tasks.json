@@ -1,0 +1,133 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run DroneCAN GUI Tool",
+			"type": "shell",
+			"command": ".venv\\Scripts\\python.exe",
+			"args": [
+				"bin/dronecan_gui_tool",
+				"--debug"
+			],
+			"group": "build",
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Build DroneCAN GUI Tool",
+			"type": "shell",
+			"command": ".venv\\Scripts\\python.exe",
+			"args": [
+                "-m",
+                "PyInstaller",
+                "--name", "DroneCAN_GUI_Tool_with_XML",
+                "--windowed",
+                "--onedir",
+                "--icon=${workspaceFolder}/icons/logo.ico",
+                "--distpath", "artifacts/dist",
+                "--workpath", "artifacts/build",
+                "--specpath", "artifacts",
+                "--clean",
+                "--hidden-import", "dronecan",
+                "--hidden-import", "dronecan.app",
+                "--hidden-import", "dronecan.app.dynamic_node_id",
+                "--hidden-import", "dronecan.app.node_monitor",
+                "--hidden-import", "dronecan.app.file_server",
+                "--hidden-import", "dronecan.driver",
+                "--hidden-import", "dronecan.driver.common",
+                "--hidden-import", "dronecan.driver.slcan",
+                "--hidden-import", "dronecan.driver.socketcan",
+				"--hidden-import", "serial",
+				"--hidden-import", "qtwidgets",
+				"--hidden-import", "pyqtgraph",
+				"--paths=${workspaceFolder}/bin",
+				"--paths=${workspaceFolder}",
+				"--paths=${workspaceFolder}/pydronecan",
+                "--add-data=${workspaceFolder}/public_regulated_data_types:dronecan/dsdl_specs",
+                "--add-data=${workspaceFolder}/.venv/Lib/site-packages/pymavlink/message_definitions:message_definitions",
+                "--add-data=${workspaceFolder}/.venv/Lib/site-packages/pymavlink/dialects:pymavlink/dialects",
+				"--add-data=${workspaceFolder}/.venv/Lib/site-packages/notebook:notebook",
+				"--add-data=${workspaceFolder}/.venv/Lib/site-packages/nbformat:nbformat",
+				"--add-data=${workspaceFolder}/.venv/Lib/site-packages/ipython_genutils:ipython_genutils",
+				"--add-data=${workspaceFolder}/.venv/Lib/site-packages/pygments:pygments",
+				"--add-data=${workspaceFolder}/.venv/Lib/site-packages/numpy:numpy",
+				"--add-data=${workspaceFolder}/.venv/Lib/site-packages/qtawesome:qtawesome",
+				"--add-data=${workspaceFolder}/.venv/Lib/site-packages/PyQt5:PyQt5",
+				"--add-data=${workspaceFolder}/dronecan_gui_tool:dronecan_gui_tool",
+				"--collect-all", "IPython",
+				"--collect-all", "jupyter_client",
+				"--collect-all", "jupyter_console",
+				"--collect-all", "qtconsole",
+				"--collect-all", "ipykernel",
+				"--collect-all", "traitlets",
+				"--collect-all", "zmq",
+				"--collect-all", "tornado",
+                "bin/dronecan_gui_tool"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared",
+				"showReuseMessage": true,
+				"clear": false
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Clean Build Artifacts",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-Command",
+				"if (Test-Path artifacts) { Remove-Item -Recurse -Force artifacts }"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared",
+				"showReuseMessage": true,
+				"clear": false
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Deploy DroneCAN GUI Tool",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy", "Bypass",
+				"-File", "${workspaceFolder}\\.vscode\\deploy.ps1"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared",
+				"showReuseMessage": true,
+				"clear": false
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
