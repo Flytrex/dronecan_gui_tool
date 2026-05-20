@@ -122,7 +122,11 @@ def list_ifaces():
                     pythoncom.CoInitialize()
                 except Exception:
                     pass
-                for interface in detect_available_configs():
+                # Limit detection to the backends we actually care about.
+                # The 'usb2can' detector in python-can has a bug where it
+                # crashes on USB devices whose WMI 'Name' is None, which
+                # otherwise floods the log on every refresh.
+                for interface in detect_available_configs(['pcan']):
                     if interface['interface'] == "pcan":
                         out[interface['channel']] = interface['channel']
         except Exception as ex:

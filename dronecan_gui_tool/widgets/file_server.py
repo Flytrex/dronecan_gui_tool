@@ -152,6 +152,13 @@ class FileServerJson(dronecan.app.file_server.FileServer):
             self._images[path] = self._load_image(path)
             self._key_to_path[FileServer_PathKey(path)] = path
 
+    def purge_path(self, path):
+        """Remove all cached data for a path so file.Read requests for it will fail."""
+        key = FileServer_PathKey(path)
+        self._key_to_path.pop(key, None)
+        self._images.pop(path, None)
+        self._image_timestamps.pop(path, None)
+
     @property
     def key_hit_counters(self):
         return dict(self._key_hit_counters)
@@ -251,6 +258,10 @@ class FileServerWidget(QGroupBox):
             paths = self._get_paths()
             logger.info('Updating lookup paths: %r', paths)
             self._file_server.lookup_paths = paths
+            # Purge cached images for paths no longer in the list
+            for cached_path in list(self._file_server._images.keys()):
+                if cached_path not in paths:
+                    self._file_server.purge_path(cached_path)
             flash(self, 'File server lookup paths: %r', paths, duration=3)
             for p in paths:
                 self._file_server._check_path_change(p)
@@ -300,4 +311,12 @@ class FileServerWidget(QGroupBox):
     def force_start(self):
         if not self._file_server:
             self._on_start_stop()
+
+    def remove_path(self, path):
+        path = os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+
+        for it in list(self._path_widgets):
+            if it.path == path:
+                self._on_remove_path(it)
+                return
 

@@ -18,6 +18,7 @@ from . import RemoteID_panel
 from . import hobbywing_esc
 from . import rc_panel
 from . import flytrex_esc
+from . import BMS_panel
 from . import delivery_controller
 from . import spool_controller
 
@@ -47,6 +48,7 @@ PANELS = [
     PanelDescriptor(serial_panel),
     PanelDescriptor(stats_panel),
     PanelDescriptor(RemoteID_panel),
+    PanelDescriptor(BMS_panel),
     PanelDescriptor(hobbywing_esc),
     PanelDescriptor(rc_panel),
     PanelDescriptor(flytrex_esc),

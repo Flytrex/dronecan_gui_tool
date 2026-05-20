@@ -10,10 +10,14 @@
 import os
 import sys
 import shutil
-import pkg_resources
 import glob
 from setuptools import setup, find_packages
 from setuptools.archive_util import unpack_archive
+
+# pkg_resources is only needed for the cx_Freeze MSI build path. Modern
+# setuptools (>= 81) no longer ships it by default, and pip's build isolation
+# uses the latest setuptools, which would otherwise break `pip install .` in
+# CI. Import it lazily inside the bdist_msi/build_exe branch instead.
 
 PACKAGE_NAME = 'dronecan_gui_tool'
 HUMAN_FRIENDLY_NAME = 'DroneCAN GUI Tool'
@@ -24,7 +28,7 @@ SOURCE_DIR = os.path.abspath(os.path.dirname(__file__))
 upgrade_code = '{D5CD6E19-2545-32C7-A62A-4595B28BCDC3}'
 
 sys.path.append(os.path.join(SOURCE_DIR, PACKAGE_NAME))
-from version import __version__
+from version import __version__, __flytrex_version__  # type: ignore[import-not-found]  # noqa: E402  pyright: ignore[reportMissingImports]
 
 assert sys.version_info[0] == 3, 'Python 3 is required'
 
@@ -115,6 +119,7 @@ if os.name == 'nt':
 
 if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
     import cx_Freeze
+    import pkg_resources  # only needed for MSI builds; provided by setuptools<81
 
     # cx_Freeze can't handle 3rd-party packages packed in .egg files, so we have to extract them for it
     dependency_eggs_to_unpack = [
@@ -149,6 +154,39 @@ if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
     missing_dlls = glob.glob(os.path.join(os.path.dirname(numpy.core.__file__), '*.dll'))
     print('Missing DLL:', missing_dlls)
 
+    # Stage a clean copy of public_regulated_data_types without git/CI metadata
+    # so the frozen MSI ships only the DSDL files (the runtime updater would
+    # otherwise refuse to touch a tree that has a stray .git file in it).
+    dsdl_src = os.path.join(SOURCE_DIR, 'public_regulated_data_types')
+    dsdl_staged = os.path.join('build', 'dsdl_specs_staged')
+    try:
+        shutil.rmtree(dsdl_staged)
+    except Exception:
+        pass
+    if os.path.isdir(dsdl_src):
+        def _ignore_dsdl(_dir, names):
+            return [n for n in names if n in ('.git', '.github', '.gitignore',
+                                              '.gitattributes', 'tests',
+                                              '__pycache__')]
+        shutil.copytree(dsdl_src, dsdl_staged, ignore=_ignore_dsdl)
+
+        # Ship a baseline .flytrex_dsdl_version marker matching the local
+        # submodule HEAD. This file becomes a tracked MSI component, so the
+        # Windows Installer overwrites/removes it on upgrade or uninstall --
+        # otherwise the runtime-created marker would survive uninstall and
+        # mislead the next install into thinking the DSDL is current.
+        try:
+            import subprocess
+            head_sha = subprocess.check_output(
+                ['git', '-C', dsdl_src, 'rev-parse', 'HEAD'],
+                stderr=subprocess.DEVNULL).decode('ascii').strip()
+            with open(os.path.join(dsdl_staged, '.flytrex_dsdl_version'),
+                      'w', encoding='utf-8') as _f:
+                _f.write(head_sha)
+            print('Bundled DSDL marker:', head_sha)
+        except Exception as _ex:
+            print('Could not capture submodule HEAD for DSDL marker:', _ex)
+
     # My reverence for you, I hope, will help control my inborn instability; we are accustomed to a zigzag way of life.
     args['options'] = {
         'build_exe': {
@@ -161,6 +199,14 @@ if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
             'include_msvcr': True,
             'include_files': [
                 PACKAGE_NAME,
+                # Bundle DSDL definitions as dronecan/dsdl_specs so the frozen
+                # `dronecan` package can find them via get_resource_path().
+                # The local pydronecan submodule has no dsdl_specs folder of
+                # its own; we ship the workspace's public_regulated_data_types
+                # tree (Flytrex Flyhawk-5.0 branch) instead. We use the staged
+                # copy so .git / .github metadata is stripped.
+                (dsdl_staged,
+                 os.path.join('lib', 'dronecan', 'dsdl_specs')),
                 # These packages don't work properly when packed in .zip, so here we have another bunch of ugly hacks
                 os.path.join(unpacked_eggs_dir, os.path.dirname(PyQt5.__file__)),
                 os.path.join(unpacked_eggs_dir, os.path.dirname(qtawesome.__file__)),
@@ -177,6 +223,12 @@ if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
         'bdist_msi': {
             'upgrade_code' : upgrade_code,
             'initial_target_dir': '[ProgramFilesFolder]\\DroneCAN\\' + HUMAN_FRIENDLY_NAME,
+            # Embed the Flytrex sub-version in the MSI filename, e.g.
+            # dronecan_gui_tool-1.2.28-win64-flytrex-0.0.3.msi
+            'target_name': '{name}-{ver}-win64-flytrex-{fver}.msi'.format(
+                name=PACKAGE_NAME,
+                ver='.'.join(map(str, __version__)),
+                fver='.'.join(map(str, __flytrex_version__))),
         },
     }
     args['executables'] = [
