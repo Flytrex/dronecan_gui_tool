@@ -117,32 +117,41 @@ DSDL_SYNC_EXCLUDES = {'.github', '.gitignore', 'tests', 'LICENSE', 'README.md',
                      'test.py', '.flytrex_dsdl_version'}
 
 
-def _config_file_path():
+def _bundled_config_file_path():
     if getattr(sys, 'frozen', False):
         return os.path.join(os.path.dirname(sys.executable), 'config.xml')
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.xml')
 
+def _user_config_file_path():
+    app_name = NODE_NAME.rsplit('.', 1)[-1]
+    if os.name == 'nt':
+        config_root = os.environ.get('APPDATA') or os.path.expanduser('~')
+    else:
+        config_root = os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('~'), '.config')
+    return os.path.join(config_root, app_name, 'config.xml')
 
 def _read_config():
-    try:
-        tree = ET.parse(_config_file_path())
-        root = tree.getroot()
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        logger.warning('Could not read config file: %s', _config_file_path(), exc_info=True)
-        return {}
-
-    dsdl_repo = root.findtext('dsdl_repo')
-    return {'dsdl_repo': dsdl_repo.strip()} if dsdl_repo and dsdl_repo.strip() else {}
-
+    for config_path in (_user_config_file_path(), _bundled_config_file_path()):
+        try:
+            tree = ET.parse(config_path)
+            root = tree.getroot()
+            dsdl_branch = root.findtext('dsdl_branch')
+            return {'dsdl_branch': dsdl_branch.strip()} if dsdl_branch and dsdl_branch.strip() else {}
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.warning('Could not read config file: %s', config_path, exc_info=True)
+            return {}
+    return {}
 
 def _write_config(config):
     root = ET.Element('config')
-    dsdl_repo = config.get('dsdl_repo')
-    if dsdl_repo:
-        ET.SubElement(root, 'dsdl_repo').text = dsdl_repo
-    ET.ElementTree(root).write(_config_file_path(), encoding='utf-8', xml_declaration=True)
+    dsdl_branch = config.get('dsdl_branch')
+    if dsdl_branch:
+        ET.SubElement(root, 'dsdl_branch').text = dsdl_branch
+    config_path = _user_config_file_path()
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    ET.ElementTree(root).write(config_path, encoding='utf-8', xml_declaration=True)
 
 
 class _DsdlBranchListWorker(QObject):
@@ -279,13 +288,13 @@ class MainWindow(QMainWindow):
         self._dsdl_branch_thread = None
         self._dsdl_branch_worker = None
         self._config = _read_config()
-        self._selected_dsdl_branch = self._config.get('dsdl_repo') or DEFAULT_DSDL_REPO_BRANCH
-        if not self._config.get('dsdl_repo'):
-            self._config['dsdl_repo'] = self._selected_dsdl_branch
+        self._selected_dsdl_branch = self._config.get('dsdl_branch') or DEFAULT_DSDL_REPO_BRANCH
+        if not self._config.get('dsdl_branch'):
+            self._config['dsdl_branch'] = self._selected_dsdl_branch
             try:
                 _write_config(self._config)
             except Exception:
-                logger.warning('Could not write default config file: %s', _config_file_path(), exc_info=True)
+                logger.warning('Could not write default config file: %s', _user_config_file_path(), exc_info=True)
 
         self._node_monitor_widget = NodeMonitorWidget(self, node)
         self._node_monitor_widget.on_info_window_requested = self._show_node_window
@@ -372,14 +381,14 @@ class MainWindow(QMainWindow):
         # Configurations menu
         #
         configurations_menu = self.menuBar().addMenu('&Configurations')
-        self._set_dsdl_repo_menu = configurations_menu.addMenu('Set &DSDL Repo')
-        self._dsdl_repo_action_group = QActionGroup(self)
-        self._dsdl_repo_action_group.setExclusive(True)
-        self._dsdl_repo_action_group.triggered.connect(
-            lambda action: self._set_dsdl_repo(action.data()))
-        self._populate_dsdl_repo_menu(
+        self._set_dsdl_branch_menu = configurations_menu.addMenu('Set &DSDL Branch')
+        self._dsdl_branch_action_group = QActionGroup(self)
+        self._dsdl_branch_action_group.setExclusive(True)
+        self._dsdl_branch_action_group.triggered.connect(
+            lambda action: self._set_dsdl_branch(action.data()))
+        self._populate_dsdl_branch_menu(
             [self._selected_dsdl_branch] if self._selected_dsdl_branch else [])
-        self._load_dsdl_repo_branches()
+        self._load_dsdl_branches()
 
         #
         # Help menu
@@ -443,10 +452,10 @@ class MainWindow(QMainWindow):
         except Exception as ex:
             show_error('CAN Adapter Control Panel error', 'Could not spawn CAN Adapter Control Panel', ex, self)
 
-    def _populate_dsdl_repo_menu(self, branches):
-        self._set_dsdl_repo_menu.clear()
-        for action in self._dsdl_repo_action_group.actions():
-            self._dsdl_repo_action_group.removeAction(action)
+    def _populate_dsdl_branch_menu(self, branches):
+        self._set_dsdl_branch_menu.clear()
+        for action in self._dsdl_branch_action_group.actions():
+            self._dsdl_branch_action_group.removeAction(action)
 
         branches = [branch for branch in branches if branch]
         if self._selected_dsdl_branch and self._selected_dsdl_branch not in branches:
@@ -455,7 +464,7 @@ class MainWindow(QMainWindow):
         if not branches:
             action = QAction('No branches available', self)
             action.setEnabled(False)
-            self._set_dsdl_repo_menu.addAction(action)
+            self._set_dsdl_branch_menu.addAction(action)
             return
 
         for branch in branches:
@@ -463,10 +472,10 @@ class MainWindow(QMainWindow):
             action.setCheckable(True)
             action.setData(branch)
             action.setChecked(branch == self._selected_dsdl_branch)
-            self._dsdl_repo_action_group.addAction(action)
-            self._set_dsdl_repo_menu.addAction(action)
+            self._dsdl_branch_action_group.addAction(action)
+            self._set_dsdl_branch_menu.addAction(action)
 
-    def _load_dsdl_repo_branches(self):
+    def _load_dsdl_branches(self):
         if self._dsdl_branch_thread is not None:
             return
 
@@ -475,38 +484,38 @@ class MainWindow(QMainWindow):
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
-        worker.finished.connect(self._handle_dsdl_repo_branches)
+        worker.finished.connect(self._handle_dsdl_branch_results)
         worker.finished.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_dsdl_repo_branches_finished)
+        thread.finished.connect(self._on_dsdl_branch_finished)
 
         self._dsdl_branch_thread = thread
         self._dsdl_branch_worker = worker
         thread.start()
 
-    def _handle_dsdl_repo_branches(self, result):
+    def _handle_dsdl_branch_results(self, result):
         if result['error']:
             logger.warning('Could not load DSDL repo branches: %s', result['error'])
             return
-        self._populate_dsdl_repo_menu(result['branches'])
+        self._populate_dsdl_branch_menu(result['branches'])
 
-    def _on_dsdl_repo_branches_finished(self):
+    def _on_dsdl_branch_finished(self):
         self._dsdl_branch_thread = None
         self._dsdl_branch_worker = None
 
-    def _set_dsdl_repo(self, dsdl_repo):
-        self._selected_dsdl_branch = dsdl_repo
-        self._config['dsdl_repo'] = dsdl_repo
+    def _set_dsdl_branch(self, dsdl_branch):
+        self._selected_dsdl_branch = dsdl_branch
+        self._config['dsdl_branch'] = dsdl_branch
         try:
             _write_config(self._config)
         except Exception as ex:
-            logger.warning('Could not write config file: %s', _config_file_path(), exc_info=True)
+            logger.warning('Could not write config file: %s', _user_config_file_path(), exc_info=True)
             QMessageBox.warning(self, 'Configuration Error',
                                 'Could not save configuration to:\n{}\n\n{}'.format(
-                                    _config_file_path(), ex))
+                                    _user_config_file_path(), ex))
             return
-        self.statusBar().showMessage('DSDL repo set to {}'.format(dsdl_repo), 3000)
+        self.statusBar().showMessage('DSDL branch set to {}'.format(dsdl_branch), 3000)
 
     def _check_for_updates(self, silent=False):
         """

@@ -235,7 +235,7 @@ if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
     os.makedirs(os.path.dirname(config_staged), exist_ok=True)
     with open(config_staged, 'w', encoding='utf-8') as _f:
         _f.write("<?xml version='1.0' encoding='utf-8'?>\n")
-        _f.write('<config><dsdl_repo>{}</dsdl_repo></config>\n'.format(DEFAULT_DSDL_REPO_BRANCH))
+        _f.write('<config><dsdl_branch>{}</dsdl_branch></config>\n'.format(DEFAULT_DSDL_REPO_BRANCH))
 
     # My reverence for you, I hope, will help control my inborn instability; we are accustomed to a zigzag way of life.
     args['options'] = {
