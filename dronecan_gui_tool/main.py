@@ -17,6 +17,7 @@ import glob
 import io
 import shutil
 import zipfile
+import xml.etree.ElementTree as ET
 
 assert sys.version[0] == '3'
 
@@ -75,7 +76,7 @@ from serial import SerialException
 
 import dronecan
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QSplitter, QAction, QMessageBox
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QSplitter, QAction, QActionGroup, QMessageBox
 from PyQt5.QtGui import QKeySequence, QDesktopServices
 from PyQt5.QtCore import QTimer, Qt, QUrl, QThread, QObject, pyqtSignal, pyqtSlot
 
@@ -108,10 +109,74 @@ NODE_NAME = 'org.dronecan.gui_tool'
 
 # DSDL update source: public Flytrex fork of public_regulated_data_types
 DSDL_REPO = 'Flytrex/public_regulated_data_types'
-DSDL_BRANCH = 'Flyhawk-5.0'
+DEFAULT_DSDL_REPO_BRANCH = 'Flyhawk-5.0'
+DSDL_LOAD_NAMESPACES = ('uavcan', 'dronecan', 'ardupilot', 'com', 'cuav', 'flytrex')
+DSDL_MANIFEST = '.flytrex_dsdl_manifest'
 # Top-level archive entries that are not DSDL trees and must not be synced.
 DSDL_SYNC_EXCLUDES = {'.github', '.gitignore', 'tests', 'LICENSE', 'README.md',
                      'test.py', '.flytrex_dsdl_version'}
+
+
+def _bundled_config_file_path():
+    if getattr(sys, 'frozen', False):
+        return os.path.join(os.path.dirname(sys.executable), 'config.xml')
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.xml')
+
+def _user_config_file_path():
+    app_name = NODE_NAME.rsplit('.', 1)[-1]
+    if os.name == 'nt':
+        config_root = os.environ.get('APPDATA') or os.path.expanduser('~')
+    else:
+        config_root = os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('~'), '.config')
+    return os.path.join(config_root, app_name, 'config.xml')
+
+def _read_config():
+    for config_path in (_user_config_file_path(), _bundled_config_file_path()):
+        try:
+            tree = ET.parse(config_path)
+            root = tree.getroot()
+            dsdl_branch = root.findtext('dsdl_branch')
+            return {'dsdl_branch': dsdl_branch.strip()} if dsdl_branch and dsdl_branch.strip() else {}
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.warning('Could not read config file: %s', config_path, exc_info=True)
+            return {}
+    return {}
+
+def _write_config(config):
+    root = ET.Element('config')
+    dsdl_branch = config.get('dsdl_branch')
+    if dsdl_branch:
+        ET.SubElement(root, 'dsdl_branch').text = dsdl_branch
+    config_path = _user_config_file_path()
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    ET.ElementTree(root).write(config_path, encoding='utf-8', xml_declaration=True)
+
+
+class _DsdlBranchListWorker(QObject):
+    finished = pyqtSignal(dict)
+
+    def __init__(self, repo):
+        super().__init__()
+        self._repo = repo
+
+    @pyqtSlot()
+    def run(self):
+        result = {'branches': [], 'error': None}
+        try:
+            import json
+            api_url = 'https://api.github.com/repos/{}/branches?per_page=100'.format(self._repo)
+            req = Request(api_url,
+                          headers={'Accept': 'application/vnd.github+json',
+                                   'User-Agent': 'dronecan_gui_tool'})
+            with urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+            result['branches'] = [item['name'] for item in data]
+        except Exception as ex:
+            result['error'] = str(ex)
+
+        self.finished.emit(result)
 
 
 class _UpdateCheckWorker(QObject):
@@ -138,7 +203,8 @@ class _UpdateCheckWorker(QObject):
         result = {
             'msi': {'unreachable': False, 'error': None, 'latest': None},
             'dsdl': {'skipped': False, 'reason': None, 'error': None,
-                     'remote_sha': None},
+                     'remote_sha': None, 'branch': self._branch,
+                     'git_working_tree': False},
         }
 
         # --- MSI scan on the shared drive (can hang on disconnected SMB) ---
@@ -165,13 +231,16 @@ class _UpdateCheckWorker(QObject):
 
         # --- DSDL: GitHub API request (up to 10 s) -------------------------
         try:
-            if not os.path.isdir(self._dsdl_target):
+            if not self._branch:
+                result['dsdl']['skipped'] = True
+                result['dsdl']['reason'] = 'no_branch'
+            elif not os.path.isdir(self._dsdl_target):
                 result['dsdl']['skipped'] = True
                 result['dsdl']['reason'] = 'no_target'
             elif self._dsdl_skip_marker and os.path.exists(self._dsdl_skip_marker):
-                result['dsdl']['skipped'] = True
-                result['dsdl']['reason'] = 'git_working_tree'
-            else:
+                result['dsdl']['git_working_tree'] = True
+
+            if not result['dsdl']['skipped']:
                 import json
                 api_url = 'https://api.github.com/repos/{}/branches/{}'.format(
                     self._repo, self._branch)
@@ -194,7 +263,9 @@ class MainWindow(QMainWindow):
     def __init__(self, node, iface_name, iface_kwargs):
         # Parent
         super(MainWindow, self).__init__()
-        self.setWindowTitle('DroneCAN GUI Tool')
+        self.setWindowTitle('DroneCAN GUI Tool v{} (Flytrex v{})'.format(
+            '.'.join(map(str, __version__)),
+            '.'.join(map(str, __flytrex_version__))))
         self.setWindowIcon(get_app_icon())
 
         self._node = node
@@ -214,6 +285,16 @@ class MainWindow(QMainWindow):
         # See _check_for_updates / _UpdateCheckWorker.
         self._update_check_thread = None
         self._update_check_worker = None
+        self._dsdl_branch_thread = None
+        self._dsdl_branch_worker = None
+        self._config = _read_config()
+        self._selected_dsdl_branch = self._config.get('dsdl_branch') or DEFAULT_DSDL_REPO_BRANCH
+        if not self._config.get('dsdl_branch'):
+            self._config['dsdl_branch'] = self._selected_dsdl_branch
+            try:
+                _write_config(self._config)
+            except Exception:
+                logger.warning('Could not write default config file: %s', _user_config_file_path(), exc_info=True)
 
         self._node_monitor_widget = NodeMonitorWidget(self, node)
         self._node_monitor_widget.on_info_window_requested = self._show_node_window
@@ -297,6 +378,19 @@ class MainWindow(QMainWindow):
             panels_menu.addAction(action)
 
         #
+        # Configurations menu
+        #
+        configurations_menu = self.menuBar().addMenu('&Configurations')
+        self._set_dsdl_branch_menu = configurations_menu.addMenu('Set &DSDL Branch')
+        self._dsdl_branch_action_group = QActionGroup(self)
+        self._dsdl_branch_action_group.setExclusive(True)
+        self._dsdl_branch_action_group.triggered.connect(
+            lambda action: self._set_dsdl_branch(action.data()))
+        self._populate_dsdl_branch_menu(
+            [self._selected_dsdl_branch] if self._selected_dsdl_branch else [])
+        self._load_dsdl_branches()
+
+        #
         # Help menu
         #
         dronecan_website_action = QAction(get_icon('fa6s.globe'), 'Open DroneCAN &Website', self)
@@ -358,6 +452,71 @@ class MainWindow(QMainWindow):
         except Exception as ex:
             show_error('CAN Adapter Control Panel error', 'Could not spawn CAN Adapter Control Panel', ex, self)
 
+    def _populate_dsdl_branch_menu(self, branches):
+        self._set_dsdl_branch_menu.clear()
+        for action in self._dsdl_branch_action_group.actions():
+            self._dsdl_branch_action_group.removeAction(action)
+
+        branches = [branch for branch in branches if branch]
+        if self._selected_dsdl_branch and self._selected_dsdl_branch not in branches:
+            branches.insert(0, self._selected_dsdl_branch)
+
+        if not branches:
+            action = QAction('No branches available', self)
+            action.setEnabled(False)
+            self._set_dsdl_branch_menu.addAction(action)
+            return
+
+        for branch in branches:
+            action = QAction(branch, self)
+            action.setCheckable(True)
+            action.setData(branch)
+            action.setChecked(branch == self._selected_dsdl_branch)
+            self._dsdl_branch_action_group.addAction(action)
+            self._set_dsdl_branch_menu.addAction(action)
+
+    def _load_dsdl_branches(self):
+        if self._dsdl_branch_thread is not None:
+            return
+
+        thread = QThread(self)
+        worker = _DsdlBranchListWorker(DSDL_REPO)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._handle_dsdl_branch_results)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_dsdl_branch_finished)
+
+        self._dsdl_branch_thread = thread
+        self._dsdl_branch_worker = worker
+        thread.start()
+
+    def _handle_dsdl_branch_results(self, result):
+        if result['error']:
+            logger.warning('Could not load DSDL repo branches: %s', result['error'])
+            return
+        self._populate_dsdl_branch_menu(result['branches'])
+
+    def _on_dsdl_branch_finished(self):
+        self._dsdl_branch_thread = None
+        self._dsdl_branch_worker = None
+
+    def _set_dsdl_branch(self, dsdl_branch):
+        self._selected_dsdl_branch = dsdl_branch
+        self._config['dsdl_branch'] = dsdl_branch
+        try:
+            _write_config(self._config)
+        except Exception as ex:
+            logger.warning('Could not write config file: %s', _user_config_file_path(), exc_info=True)
+            QMessageBox.warning(self, 'Configuration Error',
+                                'Could not save configuration to:\n{}\n\n{}'.format(
+                                    _user_config_file_path(), ex))
+            return
+        self.statusBar().showMessage('DSDL branch set to {}'.format(dsdl_branch), 3000)
+
     def _check_for_updates(self, silent=False):
         """
         Schedule an update check on a background thread.
@@ -387,7 +546,7 @@ class MainWindow(QMainWindow):
 
         thread = QThread(self)
         worker = _UpdateCheckWorker(updates_dir, dsdl_target, dsdl_skip_marker,
-                                    DSDL_REPO, DSDL_BRANCH)
+                                    DSDL_REPO, self._selected_dsdl_branch)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -467,6 +626,7 @@ class MainWindow(QMainWindow):
 
         # --- DSDL part ------------------------------------------------------
         dsdl = result['dsdl']
+        dsdl_branch = dsdl.get('branch')
         if dsdl['skipped']:
             logger.info('DSDL update check skipped (%s)', dsdl['reason'])
             return
@@ -487,11 +647,25 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self, 'Check for DSDL Updates',
                     'DSDL definitions are up to date.\n'
-                    'Branch: {}\nCommit: {}'.format(DSDL_BRANCH, remote_sha[:7]))
+                    'Branch: {}\nCommit: {}'.format(dsdl_branch, remote_sha[:7]))
             return
 
         target = self._dsdl_specs_dir()
         short_local = local_sha[:7] if local_sha else '(unknown)'
+        if dsdl.get('git_working_tree'):
+            logger.info('DSDL update available for %s, but target is a git working tree: %s',
+                        dsdl_branch, target)
+            if not silent:
+                QMessageBox.information(
+                    self, 'DSDL Update Available',
+                    'Newer DSDL definitions are available on branch {}.\n\n'
+                    'Local commit: {}\n'
+                    'Remote commit: {}\n\n'
+                    'The DSDL directory is a git working tree, so it will not be overwritten:\n{}\n\n'
+                    'Use git to switch or update this checkout.'.format(
+                        dsdl_branch, short_local, remote_sha[:7], target))
+            return
+
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle('DSDL Update Available')
@@ -502,7 +676,7 @@ class MainWindow(QMainWindow):
             'Local commit: <b>{local}</b><br>'
             'Remote commit: <b>{remote}</b><br><br>'
             'Update the DSDL files in:<br><code>{path}</code>?'.format(
-                repo=DSDL_REPO, branch=DSDL_BRANCH,
+                repo=DSDL_REPO, branch=dsdl_branch,
                 local=short_local, remote=remote_sha[:7],
                 path=target))
         msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
@@ -543,10 +717,37 @@ class MainWindow(QMainWindow):
         except OSError:
             logger.warning('Could not write DSDL version marker', exc_info=True)
 
+    def _write_dsdl_manifest(self):
+        dsdl_dir = self._dsdl_specs_dir()
+        manifest = os.path.join(dsdl_dir, DSDL_MANIFEST)
+        try:
+            entries = []
+            for dirpath, _dirnames, filenames in os.walk(dsdl_dir):
+                for filename in filenames:
+                    full = os.path.join(dirpath, filename)
+                    rel = os.path.relpath(full, dsdl_dir).replace(os.sep, '/')
+                    if rel != DSDL_MANIFEST:
+                        entries.append(rel)
+            entries.sort()
+            entries.append(DSDL_MANIFEST)
+            with open(manifest, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(entries))
+                f.write('\n')
+        except OSError:
+            logger.warning('Could not write DSDL manifest', exc_info=True)
+
+    def _validate_dsdl_dir(self, dsdl_dir):
+        paths = [os.path.join(dsdl_dir, name) for name in DSDL_LOAD_NAMESPACES
+                 if os.path.isdir(os.path.join(dsdl_dir, name))]
+        if not paths:
+            raise RuntimeError('Archive contains no supported DSDL namespaces')
+        dronecan.dsdl.parse_namespaces(paths)
+
     def _apply_dsdl_update(self, remote_sha):
 
         target = self._dsdl_specs_dir()
         archive_url = 'https://github.com/{}/archive/{}.zip'.format(DSDL_REPO, remote_sha)
+        staging_dir = None
 
         try:
             req = Request(archive_url, headers={'User-Agent': 'dronecan_gui_tool'})
@@ -558,6 +759,30 @@ class MainWindow(QMainWindow):
                 raise RuntimeError('Archive is empty')
             # Archive root is e.g. 'public_regulated_data_types-<sha>/'
             root = names[0].split('/', 1)[0] + '/'
+
+            staging_dir = tempfile.mkdtemp(prefix='dronecan-dsdl-update-')
+
+            # Extract and validate before touching the installed DSDL tree.
+            extracted = 0
+            for n in names:
+                if not n.startswith(root):
+                    continue
+                rel = n[len(root):]
+                if not rel:
+                    continue
+                top = rel.split('/', 1)[0]
+                if top in DSDL_SYNC_EXCLUDES:
+                    continue
+                dest = os.path.join(staging_dir, rel)
+                if n.endswith('/'):
+                    os.makedirs(dest, exist_ok=True)
+                    continue
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with zf.open(n) as src, open(dest, 'wb') as out:
+                    shutil.copyfileobj(src, out)
+                extracted += 1
+
+            self._validate_dsdl_dir(staging_dir)
 
             # Remove existing top-level entries (other than our marker / excluded
             # files), so stale folders disappear and renames are handled.
@@ -574,27 +799,16 @@ class MainWindow(QMainWindow):
                 except OSError:
                     logger.warning('Failed to remove %s', full, exc_info=True)
 
-            # Extract everything except known non-DSDL top-level items.
-            extracted = 0
-            for n in names:
-                if not n.startswith(root):
-                    continue
-                rel = n[len(root):]
-                if not rel:
-                    continue
-                top = rel.split('/', 1)[0]
-                if top in DSDL_SYNC_EXCLUDES:
-                    continue
-                dest = os.path.join(target, rel)
-                if n.endswith('/'):
-                    os.makedirs(dest, exist_ok=True)
-                    continue
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                with zf.open(n) as src, open(dest, 'wb') as out:
-                    shutil.copyfileobj(src, out)
-                extracted += 1
+            for entry in os.listdir(staging_dir):
+                src = os.path.join(staging_dir, entry)
+                dest = os.path.join(target, entry)
+                if os.path.isdir(src):
+                    shutil.copytree(src, dest)
+                else:
+                    shutil.copy2(src, dest)
             logger.info('DSDL update: %d files written to %s', extracted, target)
             self._write_local_dsdl_sha(remote_sha)
+            self._write_dsdl_manifest()
         except PermissionError as ex:
             logger.error('DSDL update failed (permissions)', exc_info=True)
             QMessageBox.critical(
@@ -608,6 +822,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, 'DSDL Update Failed',
                                  'Failed to update DSDL files:\n{}'.format(ex))
             return
+        finally:
+            if staging_dir:
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Information)

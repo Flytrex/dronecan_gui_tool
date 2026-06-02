@@ -10,6 +10,50 @@
 import os
 import sys
 import multiprocessing
+import shutil
+
+
+DSDL_MANIFEST = '.flytrex_dsdl_manifest'
+
+
+def _prune_installed_dsdl_specs():
+    candidates = []
+    try:
+        candidates.append(os.path.dirname(os.path.abspath(sys.executable)))
+    except Exception:
+        pass
+    try:
+        candidates.append(os.path.dirname(os.path.abspath(__file__)))
+        candidates.append(os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+    except Exception:
+        pass
+
+    for base in candidates:
+        dsdl_dir = os.path.join(base, 'lib', 'dronecan', 'dsdl_specs')
+        manifest = os.path.join(dsdl_dir, DSDL_MANIFEST)
+        if not os.path.isfile(manifest):
+            continue
+
+        try:
+            with open(manifest, 'r', encoding='utf-8') as f:
+                keep = set(line.strip().replace('\\', '/') for line in f if line.strip())
+            keep.add(DSDL_MANIFEST)
+
+            for dirpath, _dirnames, filenames in os.walk(dsdl_dir):
+                for filename in filenames:
+                    full = os.path.join(dirpath, filename)
+                    rel = os.path.relpath(full, dsdl_dir).replace(os.sep, '/')
+                    if rel not in keep:
+                        os.remove(full)
+
+            for dirpath, _dirnames, _filenames in os.walk(dsdl_dir, topdown=False):
+                if dirpath == dsdl_dir:
+                    continue
+                if not os.listdir(dirpath):
+                    shutil.rmtree(dirpath, ignore_errors=True)
+        except Exception:
+            pass
+        return
 
 #
 # When frozen, stdout/stderr are None, causing nasty exceptions. This workaround silences them.
@@ -57,5 +101,6 @@ except NameError:
 #
 if __name__ == '__main__':
     multiprocessing.freeze_support()
+    _prune_installed_dsdl_specs()
     from dronecan_gui_tool.main import main
     main()

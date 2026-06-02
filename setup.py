@@ -23,6 +23,9 @@ PACKAGE_NAME = 'dronecan_gui_tool'
 HUMAN_FRIENDLY_NAME = 'DroneCAN GUI Tool'
 
 SOURCE_DIR = os.path.abspath(os.path.dirname(__file__))
+DSDL_LOAD_NAMESPACES = ('uavcan', 'dronecan', 'ardupilot', 'com', 'cuav', 'flytrex')
+DSDL_MANIFEST = '.flytrex_dsdl_manifest'
+DEFAULT_DSDL_REPO_BRANCH = 'Flyhawk-5.0'
 
 # unique code so the package can be upgraded as an MSI
 upgrade_code = '{D5CD6E19-2545-32C7-A62A-4595B28BCDC3}'
@@ -159,6 +162,7 @@ if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
     # otherwise refuse to touch a tree that has a stray .git file in it).
     dsdl_src = os.path.join(SOURCE_DIR, 'public_regulated_data_types')
     dsdl_staged = os.path.join('build', 'dsdl_specs_staged')
+    config_staged = os.path.join('build', 'config.xml')
     try:
         shutil.rmtree(dsdl_staged)
     except Exception:
@@ -168,6 +172,44 @@ if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
             return [n for n in names if n in ('.git', '.github', '.gitignore',
                                               '.gitattributes', 'tests',
                                               '__pycache__')]
+
+        def _iter_dsdl_files(root):
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for filename in filenames:
+                    full = os.path.join(dirpath, filename)
+                    rel = os.path.relpath(full, root).replace(os.sep, '/')
+                    yield full, rel
+
+        def _validate_staged_dsdl(root):
+            import re
+            namespace_dirs = [os.path.join(root, namespace) for namespace in DSDL_LOAD_NAMESPACES
+                              if os.path.isdir(os.path.join(root, namespace))]
+            if not namespace_dirs:
+                raise RuntimeError('Bundled DSDL has no supported namespaces')
+
+            used_ids = {}
+            for namespace_dir in namespace_dirs:
+                for full, rel in _iter_dsdl_files(namespace_dir):
+                    m = re.match(r'^(\d+)\..+\.uavcan$', os.path.basename(full))
+                    if not m:
+                        continue
+                    with open(full, 'r', encoding='utf-8') as f:
+                        kind = 'service' if '\n---\n' in '\n{}\n'.format(f.read()) else 'message'
+                    key = kind, int(m.group(1))
+                    if key in used_ids:
+                        raise RuntimeError(
+                            'Bundled DSDL has duplicate {} data type ID {}: {} and {}'.format(
+                                kind, key[1], used_ids[key], rel))
+                    used_ids[key] = rel
+
+        def _write_dsdl_manifest(root):
+            rels = sorted(rel for _full, rel in _iter_dsdl_files(root)
+                          if rel != DSDL_MANIFEST)
+            rels.append(DSDL_MANIFEST)
+            with open(os.path.join(root, DSDL_MANIFEST), 'w', encoding='utf-8') as _f:
+                _f.write('\n'.join(rels))
+                _f.write('\n')
+
         shutil.copytree(dsdl_src, dsdl_staged, ignore=_ignore_dsdl)
 
         # Ship a baseline .flytrex_dsdl_version marker matching the local
@@ -187,6 +229,14 @@ if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
         except Exception as _ex:
             print('Could not capture submodule HEAD for DSDL marker:', _ex)
 
+        _validate_staged_dsdl(dsdl_staged)
+        _write_dsdl_manifest(dsdl_staged)
+
+    os.makedirs(os.path.dirname(config_staged), exist_ok=True)
+    with open(config_staged, 'w', encoding='utf-8') as _f:
+        _f.write("<?xml version='1.0' encoding='utf-8'?>\n")
+        _f.write('<config><dsdl_branch>{}</dsdl_branch></config>\n'.format(DEFAULT_DSDL_REPO_BRANCH))
+
     # My reverence for you, I hope, will help control my inborn instability; we are accustomed to a zigzag way of life.
     args['options'] = {
         'build_exe': {
@@ -199,6 +249,7 @@ if ('bdist_msi' in sys.argv) or ('build_exe' in sys.argv):
             'include_msvcr': True,
             'include_files': [
                 PACKAGE_NAME,
+                (config_staged, 'config.xml'),
                 # Bundle DSDL definitions as dronecan/dsdl_specs so the frozen
                 # `dronecan` package can find them via get_resource_path().
                 # The local pydronecan submodule has no dsdl_specs folder of

@@ -37,6 +37,10 @@ if not exist ".\pydronecan\setup.py" if not exist ".\pydronecan\pyproject.toml" 
 python -m pip install --no-build-isolation -U .\pydronecan
 python -m pip install --no-build-isolation -U .
 
+rem Clean stale cx_Freeze outputs so changed launcher/package files are included.
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
+
 rem show pip sizes for debug
 python pip_sizes.py
 
