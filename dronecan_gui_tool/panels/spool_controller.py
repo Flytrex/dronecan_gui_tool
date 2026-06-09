@@ -42,11 +42,18 @@ PARAM_SET_NAME = 'ParamSet'                         # Prefix for individual Para
 
 BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) between buttons in button rows
 PARAM_SET_GROUPBOX_HEIGHT = 200                     # Fixed height (px) for each ParamSet editing groupbox
-PARAM_SET_GROUPBOX_WIDTH = 400                      # Fixed width (px) for each ParamSet editing groupbox
+PARAM_SET_GROUPBOX_WIDTH = 410                      # Fixed width (px) for each ParamSet editing groupbox
 RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
 CONFIG_FILE_TRANSFER_TIMEOUT = 30                   # Number of seconds to wait for a config file upload/download to complete before showing a timeout error dialog
 BROADCAST_PRIORITY = 16                             # DroneCAN message broadcast priority (lower number = higher priority)
 DOWNLOAD_CONFIG_FILE_NAME = 'delcon_param_set'      # Remote file name requested via GetInfo after a successful ReadConfigFile response
+
+BOOL_MIN = 0
+BOOL_MAX = 1
+FLOAT32_MIN = float(np.finfo(np.float32).min)
+FLOAT32_MAX = float(np.finfo(np.float32).max)
+FLOAT64_MIN = float(np.finfo(np.float64).min)
+FLOAT64_MAX = float(np.finfo(np.float64).max)
 
 _PARAM_SET_LIGHT_COLORS = [                         # Pool of light background colors assigned to ParamSet groupboxes
 	'#FFFFCC',  # light yellow
@@ -502,7 +509,7 @@ class SpoolControllerPanel(QDialog):
 		self._param_set_color_map = {}         # param_set_id -> background color string assigned to its groupbox
 		self._available_colors = list(_PARAM_SET_LIGHT_COLORS)  # Colors from the palette not currently assigned to any groupbox
 		self._param_set_dirty = {}             # param_set_id -> bool indicating whether any field was edited since opening
-		self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLineEdit, type_str)} for each ParamSet groupbox
+		self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLineEdit, type_str, min_val, max_val)} for each ParamSet groupbox
 		self._param_set_groupboxes = {}        # param_set_id -> QGroupBox widget for each ParamSet editing groupbox
 
 		self._param_set_file: ParamSetFile = ParamSetFile()          # Currently loaded ParamSetFile object, used for editing and uploading
@@ -603,11 +610,16 @@ class SpoolControllerPanel(QDialog):
 
 		self._text_box_param_set_id = QLineEdit(header_group)
 		self._text_box_param_set_id.setFixedWidth(120)
+		self._text_box_param_set_id.setToolTip('Enter a single ID (e.g., 5), range (e.g., 1-10), comma-separated IDs (e.g., 1, 5, 3), or any combination (e.g., 1, 3-6, 9, 15-17)')
 		param_set_id_row.addWidget(self._text_box_param_set_id)
 
 		self._edit_button = QPushButton('Edit', header_group)
 		self._edit_button.clicked.connect(self._on_edit_clicked)
 		param_set_id_row.addWidget(self._edit_button)
+
+		self._delete_button = QPushButton('Delete', header_group)
+		self._delete_button.clicked.connect(self._on_delete_clicked)
+		param_set_id_row.addWidget(self._delete_button)
 
 		self._create_config_file_button = QPushButton('Create Config File', header_group)
 		self._create_config_file_button.clicked.connect(self._on_create_config_file_clicked)
@@ -981,17 +993,124 @@ class SpoolControllerPanel(QDialog):
 		)
 		self._download_timeout_timer.start(RESPONSE_TIMEOUT * 1000)
 
+	@staticmethod
+	def _parse_param_set_id_input(input_str: str) -> list[str]:
+		'''
+		@brief    Parse ParamSet ID input that can be a single ID, range, comma-separated IDs, or any combination.
+		@param    input_str - User input string (e.g., '5' or '1-10' or '1, 5, 3' or '1, 3-6, 9, 15-17').
+		@return   List of ID strings to process, or empty list on error.
+		'''
+		input_str = input_str.strip()
+		if not input_str:
+			return []
+
+		# Split by comma and process each part (single ID or range)
+		ids = []
+		for part in input_str.split(','):
+			part = part.strip()
+			if not part:
+				logger.warning('Empty part in input')
+				return []
+
+			# Check if this part is a range (contains hyphen)
+			if '-' in part:
+				parts = part.split('-')
+				if len(parts) != 2:
+					logger.warning('Invalid range format: %s', part)
+					return []
+				try:
+					start = int(parts[0].strip())
+					end = int(parts[1].strip())
+					if start < 0 or end < 0 or start > end:
+						logger.warning('Invalid range values: start=%d, end=%d', start, end)
+						return []
+					ids.extend([str(i) for i in range(start, end + 1)])
+				except ValueError:
+					logger.warning('Could not parse range: %s', part)
+					return []
+			else:
+				# Single ID
+				try:
+					id_val = int(part)
+					if id_val < 0:
+						logger.warning('Invalid ParamSet ID: %d', id_val)
+						return []
+					ids.append(str(id_val))
+				except ValueError:
+					logger.warning('Could not parse ParamSet ID: %s', part)
+					return []
+
+		return ids
+
 	def _on_edit_clicked(self):
 		'''
 		@brief    Handle Edit button click for ParamSet editing.
 		@return   None
 		'''
-		param_set_id = self._text_box_param_set_id.text().strip()
-		if not param_set_id:
-			show_error('Edit Error', 'Please enter a ParamSet ID.', '', parent=self, blocking=True)
+		input_str = self._text_box_param_set_id.text().strip()
+		if not input_str:
+			show_error('Edit Error', 'Please enter a ParamSet ID, range, or combination.', '', parent=self, blocking=True)
 			return
-		logger.info('Edit clicked for ParamSet ID: %s', param_set_id)
-		self._add_param_set_editing_content(param_set_id)
+
+		param_set_ids = self._parse_param_set_id_input(input_str)
+		if not param_set_ids:
+			show_error(
+				'Edit Error',
+				'Invalid ParamSet ID format.',
+				'Enter a single ID (e.g., 5), range (e.g., 1-10), comma-separated IDs (e.g., 1, 5, 3), or combination (e.g., 1, 3-6, 9, 15-17).',
+				parent=self,
+				blocking=True
+			)
+			return
+
+		# Check for duplicate IDs (already being edited) before adding any
+		duplicate_ids = [pid for pid in param_set_ids if pid in self._param_set_id_list]
+		if duplicate_ids:
+			show_error(
+				'Duplicate ParamSet ID',
+				f'ParamSet ID(s) already being edited: {", ".join(duplicate_ids)}',
+				'Aborting operation.',
+				parent=self,
+				blocking=True
+			)
+			return
+
+		logger.info('Edit clicked for ParamSet IDs: %s', param_set_ids)
+		for param_set_id in param_set_ids:
+			self._add_param_set_editing_content(param_set_id)
+
+	def _on_delete_clicked(self):
+		'''
+		@brief    Handle Delete button click for ParamSet deletion.
+		@return   None
+		'''
+		input_str = self._text_box_param_set_id.text().strip()
+		if not input_str:
+			show_error('Delete Error', 'Please enter a ParamSet ID, range, or combination.', '', parent=self, blocking=True)
+			return
+
+		param_set_ids = self._parse_param_set_id_input(input_str)
+		if not param_set_ids:
+			show_error(
+				'Delete Error',
+				'Invalid ParamSet ID format.',
+				'Enter a single ID (e.g., 5), range (e.g., 1-10), comma-separated IDs (e.g., 1, 5, 3), or combination (e.g., 1, 3-6, 9, 15-17).',
+				parent=self,
+				blocking=True
+			)
+			return
+
+		logger.info('Delete clicked for ParamSet IDs: %s', param_set_ids)
+		deleted_count = 0
+		for param_set_id in param_set_ids:
+			# Only delete if the ID exists (no error if it doesn't)
+			if param_set_id in self._param_set_groupboxes:
+				groupbox = self._param_set_groupboxes[param_set_id]
+				self._delete_param_set_groupbox(param_set_id, groupbox)
+				deleted_count += 1
+
+		if deleted_count > 0:
+			logger.info('Deleted %d ParamSet groupbox(es)', deleted_count)
 
 	def _on_create_config_file_clicked(self):
 		'''
@@ -1057,7 +1176,7 @@ class SpoolControllerPanel(QDialog):
 				return
 
 			# Extract and set field values
-			for field_name, (textbox, field_type) in field_inputs.items():
+			for field_name, (textbox, field_type, *_) in field_inputs.items():
 				raw_value = textbox.text().strip()
 				fields[field_name] = {
 					'value': raw_value,
@@ -1139,7 +1258,7 @@ class SpoolControllerPanel(QDialog):
 			param_set_id = str(param_set_payload.param_set_id)
 			self._add_param_set_editing_content(param_set_id)
 			field_inputs = self._param_set_field_inputs.get(param_set_id, {})
-			for field_name, (textbox, _field_type) in field_inputs.items():
+			for field_name, (textbox, _field_type, *_) in field_inputs.items():
 				if not hasattr(param_set_payload, field_name):
 					continue
 				textbox.blockSignals(True)
@@ -1241,6 +1360,14 @@ class SpoolControllerPanel(QDialog):
 		buttons_layout.setSpacing(BUTTON_HORIZONTAL_SPACING)
 		buttons_layout.addStretch(1)
 
+		clear_button = QPushButton('Clear', groupbox)
+		clear_button.clicked.connect(lambda: self._on_param_set_clear(param_set_id))
+		buttons_layout.addWidget(clear_button)
+
+		randomize_button = QPushButton('Randomize', groupbox)
+		randomize_button.clicked.connect(lambda: self._on_param_set_randomize(param_set_id))
+		buttons_layout.addWidget(randomize_button)
+
 		execute_button = QPushButton('Execute', groupbox)
 		execute_button.clicked.connect(lambda: self._on_param_set_execute(param_set_id))
 		buttons_layout.addWidget(execute_button)
@@ -1252,10 +1379,6 @@ class SpoolControllerPanel(QDialog):
 		recall_button = QPushButton('Recall', groupbox)
 		recall_button.clicked.connect(lambda: self._on_param_set_recall(param_set_id))
 		buttons_layout.addWidget(recall_button)
-
-		close_button = QPushButton('Close', groupbox)
-		close_button.clicked.connect(lambda: self._on_param_set_groupbox_close(param_set_id, groupbox))
-		buttons_layout.addWidget(close_button)
 
 		groupbox_layout.addLayout(buttons_layout, 0, 0)
 
@@ -1329,6 +1452,15 @@ class SpoolControllerPanel(QDialog):
 			if result != QMessageBox.Yes:
 				return
 
+		self._delete_param_set_groupbox(param_set_id, groupbox)
+
+	def _delete_param_set_groupbox(self, param_set_id, groupbox):
+		'''
+		@brief    Delete and deregister a ParamSet editing groupbox without prompting.
+		@param    param_set_id - The ID of the ParamSet to delete.
+		@param    groupbox - The QGroupBox widget to remove.
+		@return   None
+		'''
 		self._param_set_dirty.pop(param_set_id, None)
 		self._param_set_field_inputs.pop(param_set_id, None)
 		self._param_set_groupboxes.pop(param_set_id, None)
@@ -1374,6 +1506,132 @@ class SpoolControllerPanel(QDialog):
 		except Exception:
 			return float(raw)
 
+	@staticmethod
+	def _get_type_range(field_type):
+		'''
+		@brief    Return the (min_val, max_val) bounds for a given field type.
+		@param    field_type - Type string (e.g. 'float32', 'uint16', 'bool').
+		@return   Tuple of (min_val, max_val).
+		'''
+		ft = (field_type or '').strip().lower()
+		if ft == 'bool':
+			return (BOOL_MIN, BOOL_MAX)
+		if ft == 'float32' or ft == 'float':
+			return (FLOAT32_MIN, FLOAT32_MAX)
+		if ft in ('float64', 'double'):
+			return (FLOAT64_MIN, FLOAT64_MAX)
+		match = re.fullmatch(r'(u?int)(\d+)', ft) or re.fullmatch(r'(u?int)(\d+)_t', ft)
+		if match:
+			is_unsigned = match.group(1).startswith('u')
+			bit_width = int(match.group(2))
+			if is_unsigned:
+				return (0, (1 << bit_width) - 1)
+			else:
+				return (-(1 << (bit_width - 1)), (1 << (bit_width - 1)) - 1)
+		return (None, None)
+
+	@staticmethod
+	def _clear_value_for_type(field_type):
+		'''
+		@brief    Return the default clear value text for a field type.
+		@param    field_type - Type string (e.g. 'float32', 'uint16', 'bool').
+		@return   String value to place in a textbox when clearing.
+		'''
+		ft = (field_type or '').strip().lower()
+
+		if ft == 'bool':
+			return 'False'
+
+		if ft.startswith('float') or ft in ('float', 'double'):
+			return '0.0'
+
+		if re.fullmatch(r'(u?int)(\d+)', ft) or re.fullmatch(r'(u?int)(\d+)_t', ft):
+			return '0'
+
+		return '0'
+
+	@staticmethod
+	def _randomize_value_for_type(field_type, min_val, max_val):
+		'''
+		@brief    Return a random value string for a field type within [min_val, max_val].
+		@param    field_type - Type string (e.g. 'float32', 'uint16', 'bool').
+		@param    min_val - Minimum allowed value.
+		@param    max_val - Maximum allowed value.
+		@return   String value to place in a textbox when randomizing.
+		'''
+		ft = (field_type or '').strip().lower()
+
+		if ft == 'bool':
+			return str(random.choice([True, False]))
+
+		if ft.startswith('float') or ft in ('float', 'double'):
+			return str(round(random.uniform(float(min_val), float(max_val)), 6))
+
+		# Integer types
+		return str(random.randint(int(min_val), int(max_val)))
+
+	def _on_param_set_clear(self, param_set_id):
+		'''
+		@brief    Clear all fields in the specified ParamSet groupbox.
+		@param    param_set_id - The ParamSet ID to clear.
+		@return   None
+		'''
+		field_inputs = self._param_set_field_inputs.get(param_set_id)
+		if not field_inputs:
+			show_error('Clear Error', 'No fields found for this ParamSet.', '', parent=self, blocking=True)
+			return
+
+		for _field_name, (textbox, field_type, *_) in field_inputs.items():
+			textbox.setText(self._clear_value_for_type(field_type))
+
+		self._param_set_dirty[param_set_id] = True
+
+	def _on_param_set_randomize(self, param_set_id):
+		'''
+		@brief    Randomize all fields in the specified ParamSet groupbox.
+		@param    param_set_id - The ParamSet ID to randomize.
+		@return   None
+		'''
+		field_inputs = self._param_set_field_inputs.get(param_set_id)
+		if not field_inputs:
+			show_error('Randomize Error', 'No fields found for this ParamSet.', '', parent=self, blocking=True)
+			return
+
+		for _field_name, (textbox, field_type, min_val, max_val) in field_inputs.items():
+			textbox.setText(self._randomize_value_for_type(field_type, min_val, max_val))
+
+		self._param_set_dirty[param_set_id] = True
+
+	def _on_design_constants_clear(self):
+		'''
+		@brief    Clear all DesignConstantsSet fields in the groupbox.
+		@return   None
+		'''
+		if not self._field_inputs:
+			show_error('Clear Error', 'No design constant fields found.', '', parent=self, blocking=True)
+			return
+
+		for field_name, textbox in self._field_inputs.items():
+			field_type = self._design_constants_fields.get(field_name, {}).get('type', '')
+			textbox.setText(self._clear_value_for_type(field_type))
+
+	def _on_design_constants_randomize(self):
+		'''
+		@brief    Randomize all DesignConstantsSet fields in the groupbox.
+		@return   None
+		'''
+		if not self._field_inputs:
+			show_error('Randomize Error', 'No design constant fields found.', '', parent=self, blocking=True)
+			return
+
+		for field_name, textbox in self._field_inputs.items():
+			field_data = self._design_constants_fields.get(field_name, {})
+			field_type = field_data.get('type', '')
+			type_min, type_max = self._get_type_range(field_type)
+			min_val = field_data.get('min_val', type_min)
+			max_val = field_data.get('max_val', type_max)
+			textbox.setText(self._randomize_value_for_type(field_type, min_val, max_val))
+
 	def _send_param_set_msg(self, param_set_id, operation_name):
 		'''
 		@brief    Helper function to send a ParamSet message with the given operation.
@@ -1412,7 +1670,7 @@ class SpoolControllerPanel(QDialog):
 		if operation_name == 'OPERATION_RECALL':
 			msg.param_values = []
 			msg.param_value_types = []
-			for field_name, (textbox, field_type) in field_inputs.items():
+			for field_name, (textbox, field_type, *_) in field_inputs.items():
 				if not hasattr(msg, field_name):
 					logger.warning('Field "%s" not found on ParamSet message, skipping', field_name)
 					continue
@@ -1420,7 +1678,7 @@ class SpoolControllerPanel(QDialog):
 				msg.param_value_types.append(field_type)
 
 		else:
-			for field_name, (textbox, field_type) in field_inputs.items():
+			for field_name, (textbox, field_type, *_) in field_inputs.items():
 				raw_value = textbox.text().strip()
 				if not hasattr(msg, field_name):
 					logger.warning('Field "%s" not found on ParamSet message, skipping', field_name)
@@ -1460,7 +1718,7 @@ class SpoolControllerPanel(QDialog):
 			return None
 
 		snapshot = {}
-		for field_name, (textbox, field_type) in field_inputs.items():
+		for field_name, (textbox, field_type, *_) in field_inputs.items():
 			raw_value = textbox.text().strip()
 			try:
 				snapshot[field_name] = self._parse_value(field_type, raw_value)
@@ -1911,7 +2169,7 @@ class SpoolControllerPanel(QDialog):
 				return
 
 		if compare_snapshot is not None:
-			for field_name, (textbox, field_type) in field_inputs.items():
+			for field_name, (textbox, field_type, *_) in field_inputs.items():
 				if not hasattr(msg, field_name):
 					continue
 				recalled_value = getattr(msg, field_name, None)
@@ -1928,7 +2186,7 @@ class SpoolControllerPanel(QDialog):
 			self._param_set_dirty[param_set_id] = False
 			return
 
-		for field_name, (textbox, field_type) in field_inputs.items():
+		for field_name, (textbox, field_type, *_) in field_inputs.items():
 			value = getattr(msg, field_name, None)
 			if value is not None:
 				textbox.blockSignals(True)
@@ -3010,11 +3268,19 @@ class SpoolControllerPanel(QDialog):
 				default_value = field_data.get('default', '')
 				textbox.setText(str(default_value))
 				field_type = field_data.get('type', '')
+				type_min, type_max = self._get_type_range(field_type)
+				min_val = field_data.get('min_val', type_min)
+				max_val = field_data.get('max_val', type_max)
+				tip_parts = []
 				if field_type:
-					textbox.setToolTip(f'{field_type} type')
+					tip_parts.append(f'{field_type} type')
+				if min_val is not None and max_val is not None:
+					tip_parts.append(f'Range: [{min_val}, {max_val}]')
+				if tip_parts:
+					textbox.setToolTip('\n'.join(tip_parts))
 				fields_layout.addWidget(textbox, row, 1)
 
-				field_inputs[field_name] = (textbox, field_type)
+				field_inputs[field_name] = (textbox, field_type, min_val, max_val)
 
 				fields_layout.setRowMinimumHeight(row, 0)
 				row += 1
@@ -3053,8 +3319,16 @@ class SpoolControllerPanel(QDialog):
 			default_value = field_data.get('default', '')
 			textbox.setText(str(default_value))
 			field_type = field_data.get('type', '')
+			type_min, type_max = self._get_type_range(field_type)
+			min_val = field_data.get('min_val', type_min)
+			max_val = field_data.get('max_val', type_max)
+			tip_parts = []
 			if field_type:
-				textbox.setToolTip(f'{field_type} type')
+				tip_parts.append(f'{field_type} type')
+			if min_val is not None and max_val is not None:
+				tip_parts.append(f'Range: [{min_val}, {max_val}]')
+			if tip_parts:
+				textbox.setToolTip('\n'.join(tip_parts))
 			fields_layout.addWidget(textbox, row, 1)
 
 			self._field_inputs[field_name] = textbox
@@ -3122,6 +3396,14 @@ class SpoolControllerPanel(QDialog):
 		buttons_layout = QHBoxLayout()
 		buttons_layout.setSpacing(BUTTON_HORIZONTAL_SPACING)
 		buttons_layout.addStretch(1)
+
+		clear_button = QPushButton('Clear', design_const_set_group)
+		clear_button.clicked.connect(self._on_design_constants_clear)
+		buttons_layout.addWidget(clear_button)
+
+		randomize_button = QPushButton('Randomize', design_const_set_group)
+		randomize_button.clicked.connect(self._on_design_constants_randomize)
+		buttons_layout.addWidget(randomize_button)
 
 		self._store_button = QPushButton('Store', design_const_set_group)
 		self._store_button.clicked.connect(self._on_design_constants_store)

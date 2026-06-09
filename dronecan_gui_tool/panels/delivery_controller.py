@@ -16,7 +16,7 @@ import os
 import re
 import xml.etree.ElementTree as ET
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIntValidator, QColor
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
 	QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy
@@ -36,9 +36,9 @@ _singleton = None
 class DeliveryControllerPanel(QDialog):
 	REQUEST_PRIORITY = 30
 
-	REQ_MODE = 'REQ_MODE'
-	SET_WIRE_LENGTH_LOWER = 'SET_WIRE_LENGTH_LOWER'
-	SET_WIRE_LENGTH_LIFT = 'SET_WIRE_LENGTH_LIFT'
+	SET_MODE = 'Set Mode'
+	SET_WIRE_LENGTH_LOWER = 'Set Wire Length Lower'
+	SET_WIRE_LENGTH_LIFT = 'Set Wire Length Lift'
 
 	def show_message(self, text, *fmt) -> None:
 		"""Best-effort status reporting (main window status bar if available)."""
@@ -71,6 +71,8 @@ class DeliveryControllerPanel(QDialog):
 
 		super(DeliveryControllerPanel, self).__init__(parent)
 		self._handlers = []
+		self._field_rows = {}
+		self._field_types = {}
 
 		self.setWindowTitle(PANEL_NAME)
 		self.setAttribute(Qt.WA_DeleteOnClose)
@@ -83,6 +85,7 @@ class DeliveryControllerPanel(QDialog):
 		self._live_param_read_thread: threading.Thread | None = None
 		self._live_param_read_stop_event: threading.Event | None = None
 		self._live_param_read_node_id: int | None = None
+		self._auto_node_id_timer: QTimer | None = None
 
 		layout = QVBoxLayout(self)
 
@@ -201,6 +204,7 @@ class DeliveryControllerPanel(QDialog):
 		self._set_wire_length_lift_btn.clicked.connect(self._on_set_wire_length_lift_clicked)
 
 		self._load_fields_into_table(self._xml_path)
+		self._start_auto_node_id_lookup()
 
 	def _stop_live_param_read_thread(self) -> None:
 		"""Stop any background work related to live param read.
@@ -225,6 +229,67 @@ class DeliveryControllerPanel(QDialog):
 			self._live_param_read_thread = None
 			self._live_param_read_stop_event = None
 			self._live_param_read_node_id = None
+
+	def _find_delcon_node_id(self) -> int | None:
+		'''
+		@brief    Search online nodes for a node whose name contains "delcon".
+		@return   Matching node ID or None.
+		'''
+		parent = self.parent()
+		while parent is not None:
+			node_monitor_widget = getattr(parent, '_node_monitor_widget', None)
+			if node_monitor_widget is not None and hasattr(node_monitor_widget, 'monitor'):
+				try:
+					entries = list(node_monitor_widget.monitor.find_all(lambda _: True))
+					for entry in sorted(entries, key=lambda e: int(e.node_id)):
+						name = ''
+						if getattr(entry, 'info', None) is not None:
+							name = getattr(entry.info, 'name', '')
+						if isinstance(name, bytes):
+							name = name.decode('utf-8', errors='ignore')
+						name = str(name).strip()
+						if 'delcon' in name.lower():
+							return int(entry.node_id)
+				except Exception:
+					logger.exception('Failed to scan node monitor entries for delcon node')
+				return None
+			parent = parent.parent()
+		return None
+
+	def _try_auto_fill_node_id(self) -> None:
+		'''
+		@brief    Auto-fill Node ID when a delcon node is detected online.
+		@return   None
+		'''
+		if self._node_id_edit.text().strip():
+			if self._auto_node_id_timer is not None and self._auto_node_id_timer.isActive():
+				self._auto_node_id_timer.stop()
+			return
+
+		node_id = self._find_delcon_node_id()
+		if node_id is None:
+			return
+
+		self._node_id_edit.setText(str(node_id))
+		self.show_message('Auto-selected Delcon node ID %d', node_id)
+		if self._auto_node_id_timer is not None and self._auto_node_id_timer.isActive():
+			self._auto_node_id_timer.stop()
+
+	def _start_auto_node_id_lookup(self) -> None:
+		'''
+		@brief    Start periodic lookup for a delcon node and auto-fill Node ID.
+		@return   None
+		'''
+		if self._auto_node_id_timer is not None:
+			self._auto_node_id_timer.stop()
+
+		self._auto_node_id_timer = QTimer(self)
+		self._auto_node_id_timer.setSingleShot(False)
+		self._auto_node_id_timer.timeout.connect(self._try_auto_fill_node_id)
+		self._auto_node_id_timer.start(500)
+
+		# Attempt immediately so users don't wait for the first timer tick.
+		self._try_auto_fill_node_id()
 
 	@staticmethod
 	def _type_to_num_bits(field_type: str) -> str:
@@ -533,7 +598,7 @@ class DeliveryControllerPanel(QDialog):
 		try:
 			mode = int(self._active_mode_combo.currentData())
 			msg = dronecan.uavcan.protocol.param.GetSet.Request(
-				name=self._encode_param_name(self.REQ_MODE),
+				name=self._encode_param_name(self.SET_MODE),
 				value=dronecan.uavcan.protocol.param.Value(integer_value=mode),
 			)
 		except Exception as ex:
@@ -542,10 +607,10 @@ class DeliveryControllerPanel(QDialog):
 
 		try:
 			self._node.request(msg, node_id, _on_response, priority=self.REQUEST_PRIORITY, canfd=True)
-			logger.info('Send REQ_MODE for target node %s', node_id)
+			logger.info('Send %s for target node %s', self.SET_MODE, node_id)
 		except Exception as ex:
-			logger.exception('Failed to broadcast SetActiveMode: %s', ex)
-			show_error('Send failed', 'Could not broadcast SetActiveMode.', ex, parent=self)
+			logger.exception('Failed to broadcast %s: %s', self.SET_MODE, ex)
+			show_error('Send failed', f'Could not broadcast {self.SET_MODE}.', ex, parent=self)
 
 	def _on_set_wire_length_lower_clicked(self) -> None:
 		'''
@@ -917,6 +982,13 @@ class DeliveryControllerPanel(QDialog):
 		except Exception:
 			pass
 
+		try:
+			if self._auto_node_id_timer is not None:
+				self._auto_node_id_timer.stop()
+				self._auto_node_id_timer = None
+		except Exception:
+			pass
+
 		# Remove any remaining DroneCAN handlers registered by this panel.
 		try:
 			for h in list(getattr(self, '_handlers', []) or []):
@@ -942,6 +1014,11 @@ class DeliveryControllerPanel(QDialog):
 			self._stop_live_param_read_thread()
 		except Exception:
 			logger.exception('Failed to stop live param read')
+		try:
+			if self._auto_node_id_timer is not None:
+				self._auto_node_id_timer.stop()
+		except Exception:
+			logger.exception('Failed to stop auto node ID timer')
 		try:
 			super(DeliveryControllerPanel, self).closeEvent(event)
 		finally:

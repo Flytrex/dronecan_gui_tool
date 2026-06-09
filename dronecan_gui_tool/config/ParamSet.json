@@ -14,12 +14,16 @@
         "shaft_pos_rad": {
             "type": "float32",
             "default": 0,
+            "min_val": -3.14,
+            "max_val": 3.14,
             "comment": "The shaft position in radian",
             "color": "black"
         },
         "completion_time_s": {
             "type": "float32",
             "default": 0,
+            "min_val": 0,
+            "max_val": 100,
             "comment": "The time to complete the setup",
             "color": "black"
         }
@@ -28,12 +32,16 @@
         "min_torque_Nm": {
             "type": "float32",
             "default": 0,
+            "min_val": 0,
+            "max_val": 100,
             "comment": "The lower threshold of rotational force that the motor is commanded or allowed to maintain",
             "color": "black"
         },
         "max_torque_Nm": {
             "type": "float32",
             "default": 0,
+            "min_val": 0,
+            "max_val": 100,
             "comment": "The software or hardware limit on the rotational twisting force the motor can apply to the spool shaft",
             "color": "black"
         }
@@ -42,30 +50,40 @@
         "obs_tension_detector_min_torque_Nm": {
             "type": "float32",
             "default": 0,
+            "min_val": 0,
+            "max_val": 100,
             "comment": "The lower threshold of rotational force that the motor is commanded or allowed to maintain",
             "color": "black"
         },
         "obs_tension_detector_window_s": {
             "type": "float32",
             "default": 0,
+            "min_val": 0,
+            "max_val": 100,
             "comment": "The time in seconds which obs_tension_detector_min_torque_Nm was observed",
             "color": "black"
         },
         "obs_traj_deviation_pos_m": {
             "type": "float32",
             "default": 0,
+            "min_val": 0,
+            "max_val": 100,
             "comment": "",
             "color": "black"
         },
         "obs_traj_deviation_neg_m": {
             "type": "float32",
             "default": 0,
+            "min_val": 0,
+            "max_val": 100,
             "comment": "",
             "color": "black"
         },
         "obs_allowed_deviation_pos_window_s": {
             "type": "float32",
             "default": 0,
+            "min_val": 0,
+            "max_val": 100,
             "comment": "",
             "color": "black"
         }
