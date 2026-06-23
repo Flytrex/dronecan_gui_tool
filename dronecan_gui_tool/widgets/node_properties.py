@@ -165,6 +165,68 @@ class InfoBox(QGroupBox):
             self._cert_of_auth.disable()
 
 
+class BmsParamBackup:
+    '''
+    Backs up a BMS node's parameters to a file by fetching them all from the node and
+    saving them. Runs on the long-lived application node, so it keeps going even if the
+    Node Properties window is closed. Progress goes to the log, not the UI.
+    '''
+
+    PARAM_RETRIES = 5
+
+    def __init__(self, node, target_node_id, commit):
+        self._node = node
+        self._target_node_id = target_node_id
+        self._params = []
+        self._retries = 0
+
+        save_dir = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'dronecan_gui_tool')
+        os.makedirs(save_dir, exist_ok=True)
+        self._param_path = os.path.join(save_dir,
+                                        'bms_node_%d_params_%08x.parm' % (target_node_id, commit))
+
+    def start(self):
+        logger.info('Backing up BMS params for node %d to %s', self._target_node_id, self._param_path)
+        self._request_param(0)
+
+    def _request_param(self, index):
+        try:
+            self._node.request(dronecan.uavcan.protocol.param.GetSet.Request(index=index),
+                               self._target_node_id,
+                               partial(self._on_param, index),
+                               priority=REQUEST_PRIORITY)
+        except Exception:
+            logger.error('BMS backup: could not request param %d', index, exc_info=True)
+
+    def _on_param(self, index, e):
+        if e is None:
+            if self._retries < self.PARAM_RETRIES:
+                self._retries += 1
+                self._node.defer(0.1, lambda: self._request_param(index))
+            else:
+                logger.error('BMS backup: param fetch timed out at index %d; backup incomplete', index)
+            return
+
+        self._retries = 0
+        if len(e.response.name) == 0:           # empty name => no more params
+            self._save()
+            return
+
+        self._params.append(e.response)
+        self._node.defer(0.1, lambda: self._request_param(index + 1))
+
+    def _save(self):
+        try:
+            with open(self._param_path, 'w') as f:
+                for p in self._params:
+                    value_string = ConfigParams.param_as_string(p.value, AM32_Rtttl.is_am32_melody_param(p))
+                    if value_string:
+                        f.write('%s %s\n' % (p.name, value_string))
+            logger.info('BMS params saved to %s', self._param_path)
+        except Exception:
+            logger.error('BMS backup: could not write %s', self._param_path, exc_info=True)
+
+
 class Controls(QGroupBox):
     def __init__(self, parent, node, target_node_id, file_server_widget, dynamic_node_id_allocator_widget,
                  node_monitor):
@@ -279,9 +341,13 @@ class Controls(QGroupBox):
         node_status_handle = None
         num_remaining_requests = 4
 
-        # For BMS nodes, capture the live params before flashing (detect by node name).
+        # For BMS nodes, back up the params alongside the update (detect by node name).
+        # The backup runs on the app node, so it completes even if this window is closed.
         entry = self._node_monitor.get(self._target_node_id)
         is_bms = bool(entry and entry.info and 'bms' in entry.info.name.decode().lower())
+        if is_bms:
+            BmsParamBackup(self._node, self._target_node_id,
+                           entry.info.software_version.vcs_commit).start()
 
         def on_success_or_timeout():
             nonlocal deferred_request_handle
@@ -335,32 +401,8 @@ class Controls(QGroupBox):
             else:
                 on_success_or_timeout()
 
-        def start_update():
-            nonlocal node_status_handle
-            node_status_handle = self._node.add_handler(dronecan.uavcan.protocol.NodeStatus, on_node_status)
-            send_request()  # Kickstarting the process, it will continue in the background
-
-        if not is_bms:
-            start_update()
-            return
-
-        # BMS node: fetch-all + save the live params (commit-tagged) before flashing.
-        commit = '_%08x' % entry.info.software_version.vcs_commit
-        save_dir = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'dronecan_gui_tool')
-        os.makedirs(save_dir, exist_ok=True)
-        param_path = os.path.join(save_dir, 'bms_node_%d_params%s.parm' % (self._target_node_id, commit))
-
-        def on_params_fetched(success):
-            if success:
-                self.window()._config_params.save_params_to_path(param_path)
-                self.window().show_message('BMS params saved to %s', param_path)
-            else:
-                self.window().show_message('Could not fetch BMS params; updating without backup')
-            self.window().set_busy(False)   # fetch done; safe to close from here
-            start_update()
-
-        self.window().set_busy(True)        # keep the window alive while params are fetched
-        self.window()._config_params._do_reload(on_complete=on_params_fetched)
+        node_status_handle = self._node.add_handler(dronecan.uavcan.protocol.NodeStatus, on_node_status)
+        send_request()  # Kickstarting the process, it will continue in the background
 
 
 def get_union_value(u):
@@ -616,7 +658,6 @@ class ConfigParams(QGroupBox):
         self._retries = 0
         self._fetch_in_progress = False
         self._fetch_session_id = 0
-        self._fetch_on_complete = None      # Optional callback(success: bool) fired when a fetch ends
 
         self._read_all_button = make_icon_button('fa6s.arrows-rotate', self.FETCH_ALL_TOOLTIP, self,
                              text=self.FETCH_ALL_TEXT, on_clicked=self._on_fetch_all_clicked)
@@ -690,13 +731,6 @@ class ConfigParams(QGroupBox):
             self._read_all_button.setText(self.FETCH_ALL_TEXT)
             self._read_all_button.setToolTip(self.FETCH_ALL_TOOLTIP)
 
-    def _fire_fetch_complete(self, success):
-        '''Fire the one-shot fetch-completion callback, if any was registered.'''
-        on_complete = self._fetch_on_complete
-        self._fetch_on_complete = None
-        if on_complete is not None:
-            on_complete(success)
-
     def _finish_fetch(self, session_id, message=None):
         '''
         @brief  Finish the fetch operation
@@ -713,8 +747,6 @@ class ConfigParams(QGroupBox):
         if message:
             self.window().show_message('%s', message)
 
-        self._fire_fetch_complete(True)
-
     def _stop_fetch(self, message=None):
         '''
         @brief  Stop the fetch operation
@@ -730,8 +762,6 @@ class ConfigParams(QGroupBox):
         self._set_fetch_button_caption(False)
         if message:
             self.window().show_message('%s', message)
-
-        self._fire_fetch_complete(False)
 
     def _request_param_index(self, session_id, index):
         '''
@@ -814,14 +844,13 @@ class ConfigParams(QGroupBox):
             logger.error('Param fetch error', exc_info=True)
             self._finish_fetch(session_id, 'Could not send param get request: %r' % ex)
 
-    def _do_reload(self, on_complete=None):
+    def _do_reload(self):
         if self._fetch_in_progress:
             return
 
         self._fetch_in_progress = True
         self._retries = 0
         self._fetch_session_id += 1
-        self._fetch_on_complete = on_complete
         session_id = self._fetch_session_id
         self._set_fetch_button_caption(True)
 
@@ -839,7 +868,8 @@ class ConfigParams(QGroupBox):
         else:
             self.window().show_message('Param fetch request sent')
 
-    def param_as_string(self, value, is_melody=False):
+    @staticmethod
+    def param_as_string(value, is_melody=False):
         value_type = dronecan.get_active_union_field(value)
 
         if value_type == 'integer_value':
@@ -860,14 +890,6 @@ class ConfigParams(QGroupBox):
                 return value.string_value
         else:
             raise RuntimeError('invalid param value type')
-
-    def save_params_to_path(self, param_file):
-        '''save current parameters to a given file path without prompting'''
-        with open(param_file, "w") as f:
-            for p in self._params:
-                value_string = self.param_as_string(p.value, AM32_Rtttl.is_am32_melody_param(p))
-                if value_string:
-                    f.write("%s %s\n" % (p.name, value_string))
 
     def _do_save_to_file(self):
         '''save parameters to a file'''
@@ -994,7 +1016,6 @@ class NodePropertiesWindow(QDialog):
         self._target_node_id = target_node_id
         self._node = node
         self._file_server_widget = file_server_widget
-        self._busy = False      # True while a BMS backup+update sequence is running; blocks close
 
         self._info_box = InfoBox(self, target_node_id, node_monitor)
         self._controls = Controls(self, node, target_node_id, file_server_widget, dynamic_node_id_allocator_widget,
@@ -1018,18 +1039,6 @@ class NodePropertiesWindow(QDialog):
 
     def show_message(self, text, *fmt, duration=0):
         self._status_bar.showMessage(text % fmt, duration * 1000)
-
-    def set_busy(self, busy):
-        '''Mark a long-running sequence (BMS backup+update) as active so the window won't close mid-way.'''
-        self._busy = busy
-
-    def closeEvent(self, event):
-        # Closing now would kill the background timers driving the fetch/update; refuse until done.
-        if self._busy:
-            self.show_message('Update in progress; please wait before closing')
-            event.ignore()
-        else:
-            super(NodePropertiesWindow, self).closeEvent(event)
 
     @property
     def target_node_id(self):
