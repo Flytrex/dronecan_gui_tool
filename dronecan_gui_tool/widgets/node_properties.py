@@ -166,15 +166,9 @@ class InfoBox(QGroupBox):
 
 
 class BmsParamBackup:
-    '''
-    Backs up a BMS node's parameters to a file by fetching them all from the node and
-    saving them. Runs on the long-lived application node, so it keeps going even if the
-    Node Properties window is closed. Progress goes to the log, not the UI.
-    '''
-
     PARAM_RETRIES = 5
 
-    def __init__(self, node, target_node_id, commit):
+    def __init__(self, node, target_node_id, commit, on_complete=None):
         self._node = node
         self._target_node_id = target_node_id
         self._params = []
@@ -341,8 +335,7 @@ class Controls(QGroupBox):
         node_status_handle = None
         num_remaining_requests = 4
 
-        # For BMS nodes, back up the params alongside the update (detect by node name).
-        # The backup runs on the app node, so it completes even if this window is closed.
+        # backup bms parameter
         entry = self._node_monitor.get(self._target_node_id)
         is_bms = bool(entry and entry.info and 'bms' in entry.info.name.decode().lower())
         if is_bms:
