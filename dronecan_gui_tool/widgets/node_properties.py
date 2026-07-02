@@ -168,7 +168,7 @@ class InfoBox(QGroupBox):
 class BmsParamBackup:
     PARAM_RETRIES = 5
 
-    def __init__(self, node, target_node_id, commit, on_complete=None):
+    def __init__(self, node, target_node_id, commit):
         self._node = node
         self._target_node_id = target_node_id
         self._params = []
@@ -223,7 +223,7 @@ class BmsParamBackup:
 
 class Controls(QGroupBox):
     def __init__(self, parent, node, target_node_id, file_server_widget, dynamic_node_id_allocator_widget,
-                 node_monitor):
+                 node_monitor=None):
         super(Controls, self).__init__(parent)
         self.setTitle('Node controls')
 
@@ -336,7 +336,7 @@ class Controls(QGroupBox):
         num_remaining_requests = 4
 
         # backup bms parameter
-        entry = self._node_monitor.get(self._target_node_id)
+        entry = self._node_monitor.get(self._target_node_id) if self._node_monitor else None
         is_bms = bool(entry and entry.info and 'bms' in entry.info.name.decode().lower())
         if is_bms:
             BmsParamBackup(self._node, self._target_node_id,
