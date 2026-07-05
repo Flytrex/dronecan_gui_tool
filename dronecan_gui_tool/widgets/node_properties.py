@@ -165,8 +165,66 @@ class InfoBox(QGroupBox):
             self._cert_of_auth.disable()
 
 
+class BmsParamBackup:
+    PARAM_RETRIES = 5
+
+    def __init__(self, node, target_node_id, commit):
+        self._node = node
+        self._target_node_id = target_node_id
+        self._params = []
+        self._retries = 0
+
+        save_dir = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'dronecan_gui_tool')
+        os.makedirs(save_dir, exist_ok=True)
+        self._param_path = os.path.join(save_dir,
+                                        'bms_node_%d_params_%08x.parm' % (target_node_id, commit))
+
+    def start(self):
+        logger.info('Backing up BMS params for node %d to %s', self._target_node_id, self._param_path)
+        self._request_param(0)
+
+    def _request_param(self, index):
+        try:
+            self._node.request(dronecan.uavcan.protocol.param.GetSet.Request(index=index),
+                               self._target_node_id,
+                               partial(self._on_param, index),
+                               priority=REQUEST_PRIORITY)
+        except Exception:
+            logger.error('BMS backup: could not request param %d', index, exc_info=True)
+
+    def _on_param(self, index, e):
+        if e is None:
+            if self._retries < self.PARAM_RETRIES:
+                self._retries += 1
+                self._node.defer(0.1, lambda: self._request_param(index))
+            else:
+                logger.error('BMS backup: param fetch timed out at index %d; backup incomplete', index)
+                self._save()
+            return
+
+        self._retries = 0
+        if len(e.response.name) == 0:           # empty name => no more params
+            self._save()
+            return
+
+        self._params.append(e.response)
+        self._node.defer(0.1, lambda: self._request_param(index + 1))
+
+    def _save(self):
+        try:
+            with open(self._param_path, 'w') as f:
+                for p in self._params:
+                    value_string = ConfigParams.param_as_string(p.value, AM32_Rtttl.is_am32_melody_param(p))
+                    if value_string:
+                        f.write('%s %s\n' % (p.name, value_string))
+            logger.info('BMS params saved to %s', self._param_path)
+        except Exception:
+            logger.error('BMS backup: could not write %s', self._param_path, exc_info=True)
+
+
 class Controls(QGroupBox):
-    def __init__(self, parent, node, target_node_id, file_server_widget, dynamic_node_id_allocator_widget):
+    def __init__(self, parent, node, target_node_id, file_server_widget, dynamic_node_id_allocator_widget,
+                 node_monitor=None):
         super(Controls, self).__init__(parent)
         self.setTitle('Node controls')
 
@@ -174,6 +232,7 @@ class Controls(QGroupBox):
         self._target_node_id = target_node_id
         self._file_server_widget = file_server_widget
         self._dynamic_node_id_allocator_widget = dynamic_node_id_allocator_widget
+        self._node_monitor = node_monitor
 
         self._restart_button = make_icon_button('fa6s.power-off', 'Restart the node [dronecan.uavcan.protocol.RestartNode]', self,
                                                 text='Restart', on_clicked=self._do_restart)
@@ -276,6 +335,13 @@ class Controls(QGroupBox):
         deferred_request_handle = None
         node_status_handle = None
         num_remaining_requests = 4
+
+        # backup bms parameter
+        entry = self._node_monitor.get(self._target_node_id) if self._node_monitor else None
+        is_bms = bool(entry and entry.info and 'bms' in entry.info.name.decode().lower())
+        if is_bms:
+            BmsParamBackup(self._node, self._target_node_id,
+                           entry.info.software_version.vcs_commit).start()
 
         def on_success_or_timeout():
             nonlocal deferred_request_handle
@@ -796,7 +862,8 @@ class ConfigParams(QGroupBox):
         else:
             self.window().show_message('Param fetch request sent')
 
-    def param_as_string(self, value, is_melody=False):
+    @staticmethod
+    def param_as_string(value, is_melody=False):
         value_type = dronecan.get_active_union_field(value)
 
         if value_type == 'integer_value':
@@ -945,7 +1012,8 @@ class NodePropertiesWindow(QDialog):
         self._file_server_widget = file_server_widget
 
         self._info_box = InfoBox(self, target_node_id, node_monitor)
-        self._controls = Controls(self, node, target_node_id, file_server_widget, dynamic_node_id_allocator_widget)
+        self._controls = Controls(self, node, target_node_id, file_server_widget, dynamic_node_id_allocator_widget,
+                                  node_monitor=node_monitor)
         self._config_params = ConfigParams(self, node, target_node_id)
 
         self._status_bar = QStatusBar(self)
