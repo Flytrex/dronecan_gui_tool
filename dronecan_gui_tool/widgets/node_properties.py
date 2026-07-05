@@ -9,6 +9,7 @@
 import dronecan
 import os
 import datetime
+import time
 from functools import partial
 from PyQt5.QtWidgets import QDialog, QGridLayout, QLabel, QLineEdit, QGroupBox, QVBoxLayout, QHBoxLayout, QStatusBar,\
     QHeaderView, QSpinBox, QCheckBox, QFileDialog, QApplication, QPlainTextEdit
@@ -25,6 +26,7 @@ logger = getLogger(__name__)
 
 
 REQUEST_PRIORITY = 30
+FIRMWARE_STATUS_MESSAGE_INTERVAL_SEC = 2.0
 
 
 class FirmwareUpdateController(QObject):
@@ -42,9 +44,35 @@ class FirmwareUpdateController(QObject):
         self._monitor_updates_suspended = False
         self._log_updates_suspended = False
         self._update_in_progress = False
+        self._update_started_monotonic = None
+        self._last_status_message_monotonic = None
+        self._last_status_mode_health = None
+        self._last_target_mode = None
         self._restore_timeout_timer = QTimer(self)
         self._restore_timeout_timer.setSingleShot(True)
         self._restore_timeout_timer.timeout.connect(self._on_update_restore_timeout)
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setSingleShot(False)
+        self._progress_timer.timeout.connect(self._emit_progress_heartbeat)
+
+    def _emit_progress_heartbeat(self):
+        if not self._update_in_progress:
+            return
+
+        elapsed = 0
+        if self._update_started_monotonic is not None:
+            elapsed = int(max(0, time.monotonic() - self._update_started_monotonic))
+        self.message.emit('Firmware update in progress... elapsed %02d:%02d' % (elapsed // 60, elapsed % 60))
+
+    def _mark_update_in_progress(self):
+        if not self._update_in_progress:
+            self._update_started_monotonic = time.monotonic()
+            self.message.emit('Firmware update started')
+
+        self._update_in_progress = True
+        if not self._progress_timer.isActive():
+            self._progress_timer.start(3000)
+        self._arm_restore_timeout()
 
     def _on_update_restore_timeout(self):
         self.close()
@@ -68,24 +96,40 @@ class FirmwareUpdateController(QObject):
         log_messages.set_updates_enabled(enabled)
         self._log_updates_suspended = not bool(enabled)
 
+    def _set_firmware_update_mode(self, enabled):
+        if hasattr(self._node, 'set_firmware_update_mode'):
+            self._node.set_firmware_update_mode(enabled)
+            self._monitor_updates_suspended = not bool(enabled)
+            self._log_updates_suspended = not bool(enabled)
+            return
+
+        # Backward compatibility for plain-node callers.
+        self._set_node_monitor_updates_enabled(not enabled)
+        self._set_log_updates_enabled(not enabled)
+
     def close(self):
+        was_in_progress = self._update_in_progress
         self._update_in_progress = False
+        self._update_started_monotonic = None
+        self._last_status_message_monotonic = None
+        self._last_status_mode_health = None
+        self._last_target_mode = None
         self._restore_timeout_timer.stop()
+        self._progress_timer.stop()
         if self._deferred_request_handle is not None:
             self._deferred_request_handle.remove()
             self._deferred_request_handle = None
         if self._node_status_handle is not None:
             self._node_status_handle.remove()
             self._node_status_handle = None
-        if self._monitor_updates_suspended:
-            self._set_node_monitor_updates_enabled(True)
-        if self._log_updates_suspended:
-            self._set_log_updates_enabled(True)
+        if self._monitor_updates_suspended or self._log_updates_suspended:
+            self._set_firmware_update_mode(False)
+        if was_in_progress:
+            self.message.emit('Firmware update mode ended')
 
     def start(self, remote_fw_file):
         self.close()
-        self._set_node_monitor_updates_enabled(False)
-        self._set_log_updates_enabled(False)
+        self._set_firmware_update_mode(True)
         self._update_in_progress = False
         self._remote_fw_file = remote_fw_file
         self._num_remaining_requests = 4
@@ -95,30 +139,59 @@ class FirmwareUpdateController(QObject):
     def _on_response(self, e):
         assert self._deferred_request_handle is None
 
-        self._deferred_request_handle = self._node.defer(2, self._send_request)
-
         if e is None:
             self.message.emit('One of firmware update requests has timed out')
+            if (not self._update_in_progress) and (self._num_remaining_requests > 0):
+                self._deferred_request_handle = self._node.defer(2, self._send_request)
             return
 
         logger.info('Firmware update response: %s', e.response)
         self.message.emit('Firmware update response: %s' % e.response)
 
-        if e.response.error == e.response.ERROR_IN_PROGRESS:
-            self._update_in_progress = True
-            # Keep noisy background callbacks paused while transfer proceeds.
-            self._arm_restore_timeout()
+        # Most targets return either OK (accepted) or IN_PROGRESS when update is active.
+        ok_code = getattr(e.response, 'ERROR_OK', 0)
+        if e.response.error in (ok_code, e.response.ERROR_IN_PROGRESS):
+            self._mark_update_in_progress()
+            return
+
+        if (not self._update_in_progress) and (self._num_remaining_requests > 0):
+            self._deferred_request_handle = self._node.defer(2, self._send_request)
 
     def _on_node_status(self, e):
         if e.transfer.source_node_id != self._target_node_id:
             return
 
+        now = time.monotonic()
+        previous_mode = self._last_target_mode
+        self._last_target_mode = int(e.message.mode)
+        mode_health = (int(e.message.mode), int(e.message.health))
+        mode_name = dronecan.value_to_constant_name(e.message, 'mode', keep_literal=True)
+        health_name = dronecan.value_to_constant_name(e.message, 'health', keep_literal=True)
+
+        should_emit_status = (
+            self._last_status_message_monotonic is None or
+            self._last_status_mode_health != mode_health or
+            (now - self._last_status_message_monotonic) >= FIRMWARE_STATUS_MESSAGE_INTERVAL_SEC
+        )
+        if should_emit_status:
+            self._last_status_message_monotonic = now
+            self._last_status_mode_health = mode_health
+            self.message.emit('FW node status: mode=%s health=%s uptime=%ds vssc=%d' %
+                              (mode_name,
+                               health_name,
+                               int(e.message.uptime_sec),
+                               int(e.message.vendor_specific_status_code)))
+
         if e.message.mode == e.message.MODE_SOFTWARE_UPDATE and e.message.health < e.message.HEALTH_ERROR:
-            self._update_in_progress = True
-            self._arm_restore_timeout()
+            self._mark_update_in_progress()
             return
 
-        if self._update_in_progress and e.message.mode != e.message.MODE_SOFTWARE_UPDATE:
+        left_software_update = (
+            previous_mode == e.message.MODE_SOFTWARE_UPDATE and
+            e.message.mode != e.message.MODE_SOFTWARE_UPDATE
+        )
+
+        if self._update_in_progress and left_software_update:
             self.close()
 
     def _send_request(self):
@@ -136,6 +209,10 @@ class FirmwareUpdateController(QObject):
                 self.close()
                 self.error.emit('Firmware update error', 'Could not send firmware update request', ex)
         else:
+            if self._update_in_progress:
+                self.message.emit('Firmware update request accepted; waiting for node status...')
+                self._arm_restore_timeout()
+                return
             self.close()
 
 

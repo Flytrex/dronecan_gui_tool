@@ -148,6 +148,14 @@ class BusMonitorHookController(QObject):
         super(BusMonitorHookController, self).__init__(parent)
         self._node = node
         self._hook_handle = None
+        self._capture_enabled = True
+
+    @property
+    def capture_enabled(self):
+        return self._capture_enabled
+
+    def set_capture_enabled(self, enabled):
+        self._capture_enabled = bool(enabled)
 
     @pyqtSlot()
     def start(self):
@@ -167,4 +175,10 @@ class BusMonitorHookController(QObject):
         self.stop()
 
     def _on_frame(self, direction, frame):
+        if not self._capture_enabled:
+            return
+
+        if bool(getattr(self._node, 'firmware_update_mode', False)):
+            return
+
         self.frame_received.emit(direction, frame)

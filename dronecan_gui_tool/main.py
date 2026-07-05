@@ -176,6 +176,7 @@ class NodeRuntime(QObject):
         self._local_node = LocalNodeController(node, self)
         self._log_messages = LogMessageController(node, self)
         self._bus_monitor_hook = BusMonitorHookController(node, self)
+        self._firmware_update_mode = False
 
         self._spin_worker = NodeRuntime._NodeSpinWorker(node)
         self._spin_thread = QThread(self)
@@ -214,6 +215,24 @@ class NodeRuntime(QObject):
     def bus_monitor_hook(self):
         return self._bus_monitor_hook
 
+    @property
+    def firmware_update_mode(self):
+        return self._firmware_update_mode
+
+    def set_firmware_update_mode(self, enabled):
+        enabled = bool(enabled)
+        if self._firmware_update_mode == enabled:
+            return
+
+        self._firmware_update_mode = enabled
+
+        # Reduce non-essential traffic and GUI work while firmware transfer is active.
+        self._node_monitor.set_updates_enabled(True)
+        if hasattr(self._node_monitor, 'set_discovery_enabled'):
+            self._node_monitor.set_discovery_enabled(not enabled)
+        self._log_messages.set_updates_enabled(not enabled)
+        self._bus_monitor_hook.set_capture_enabled(not enabled)
+
     @pyqtSlot(int)
     def start(self, interval_ms=10):
         self._spin_start_requested.emit(interval_ms)
@@ -228,6 +247,7 @@ class NodeRuntime(QObject):
 
     @pyqtSlot()
     def close(self):
+        self.set_firmware_update_mode(False)
         self.stop()
         self._spin_close_requested.emit()
         self._spin_thread.quit()
@@ -493,7 +513,7 @@ class MainWindow(QMainWindow):
         new_subscriber_action.setShortcut(QKeySequence('Ctrl+Shift+S'))
         new_subscriber_action.setStatusTip('Open subscription tool')
         new_subscriber_action.triggered.connect(
-            lambda: SubscriberWindow.spawn(self, self._node, self._active_data_type_detector))
+            lambda: SubscriberWindow.spawn(self, self._node_runtime, self._active_data_type_detector))
 
         new_plotter_action = QAction(get_icon('fa6s.chart-area'), '&Plotter', self)
         new_plotter_action.setShortcut(QKeySequence('Ctrl+Shift+P'))

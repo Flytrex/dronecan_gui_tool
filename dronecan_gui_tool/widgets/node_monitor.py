@@ -51,6 +51,10 @@ class NodeMonitorBridge(QObject):
         if hasattr(self._monitor, 'set_enabled'):
             self._monitor.set_enabled(self._updates_enabled)
 
+    def set_discovery_enabled(self, enabled):
+        if hasattr(self._monitor, 'set_discovery_enabled'):
+            self._monitor.set_discovery_enabled(enabled)
+
     def _on_monitor_update(self, event):
         if self._updates_enabled:
             self.registry_changed.emit(event)

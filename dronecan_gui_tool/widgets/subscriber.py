@@ -28,6 +28,14 @@ class SubscriberController(QObject):
         super(SubscriberController, self).__init__(parent)
         self._node = node
         self._subscriber_handle = None
+        self._updates_enabled = True
+
+    @property
+    def updates_enabled(self):
+        return self._updates_enabled
+
+    def set_updates_enabled(self, enabled):
+        self._updates_enabled = bool(enabled)
 
     @pyqtSlot(object)
     def start_subscription(self, data_type):
@@ -50,6 +58,12 @@ class SubscriberController(QObject):
         self.stop_subscription()
 
     def _on_message(self, event):
+        if not self._updates_enabled:
+            return
+
+        if bool(getattr(self._node, 'firmware_update_mode', False)):
+            return
+
         self.message_received.emit(event)
 
 
