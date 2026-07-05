@@ -10,13 +10,50 @@ import datetime
 import dronecan
 from . import BasicTable, get_monospace_font
 from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QHeaderView, QLabel
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from logging import getLogger
 
 
 logger = getLogger(__name__)
 
 app_node_monitor = None
+
+
+class NodeMonitorBridge(QObject):
+    registry_changed = pyqtSignal([object])
+
+    def __init__(self, node, parent=None):
+        super(NodeMonitorBridge, self).__init__(parent)
+        self._monitor = dronecan.app.node_monitor.NodeMonitor(node)
+        self._update_handle = self._monitor.add_update_handler(self._on_monitor_update)
+        self._updates_enabled = True
+
+        global app_node_monitor
+        app_node_monitor = self
+
+    def __getattr__(self, name):
+        return getattr(self._monitor, name)
+
+    def close(self):
+        self._update_handle.try_remove()
+        self._monitor.close()
+
+        global app_node_monitor
+        if app_node_monitor is self:
+            app_node_monitor = None
+
+    @property
+    def updates_enabled(self):
+        return self._updates_enabled
+
+    def set_updates_enabled(self, enabled):
+        self._updates_enabled = bool(enabled)
+        if hasattr(self._monitor, 'set_enabled'):
+            self._monitor.set_enabled(self._updates_enabled)
+
+    def _on_monitor_update(self, event):
+        if self._updates_enabled:
+            self.registry_changed.emit(event)
 
 
 def node_mode_to_color(mode):
@@ -86,9 +123,12 @@ class NodeTable(BasicTable):
         self.cellDoubleClicked.connect(lambda row, col: self._call_info_requested_callback_on_row(row))
         self.on_enter_pressed = self._on_enter
 
-        self._monitor = dronecan.app.node_monitor.NodeMonitor(node)
-        global app_node_monitor
-        app_node_monitor = self._monitor
+        if isinstance(node, NodeMonitorBridge):
+            self._monitor = node
+            self._owns_monitor = False
+        else:
+            self._monitor = NodeMonitorBridge(node, self)
+            self._owns_monitor = True
 
         self._timer = QTimer(self)
         self._timer.setSingleShot(False)
@@ -104,7 +144,9 @@ class NodeTable(BasicTable):
         return self._monitor
 
     def close(self):
-        self._monitor.close()
+        self._timer.stop()
+        if self._owns_monitor:
+            self._monitor.close()
 
     def _call_info_requested_callback_on_row(self, row):
         nid = int(self.item(row, 0).text())
@@ -116,6 +158,9 @@ class NodeTable(BasicTable):
             self._call_info_requested_callback_on_row(list(unique_rows)[0])
 
     def _update(self):
+        if isinstance(self._monitor, NodeMonitorBridge) and not self._monitor.updates_enabled:
+            return
+
         known_nodes = {e.node_id: e for e in self._monitor.find_all(lambda _: True)}
         displayed_nodes = set()
         rows_to_remove = []
@@ -150,7 +195,7 @@ class NodeTable(BasicTable):
 
 
 class NodeMonitorWidget(QGroupBox):
-    def __init__(self, parent, node):
+    def __init__(self, parent, node, node_monitor=None):
         super(NodeMonitorWidget, self).__init__(parent)
         self.setTitle('Online nodes (double click for more options)')
 
@@ -162,10 +207,10 @@ class NodeMonitorWidget(QGroupBox):
         self._status_update_timer.timeout.connect(self._update_status)
         self._status_update_timer.start(500)
 
-        self._table = NodeTable(self, node)
+        self._table = NodeTable(self, node_monitor if node_monitor is not None else node)
         self._table.info_requested.connect(self._show_info_window)
 
-        self._monitor_handle = self._table.monitor.add_update_handler(lambda _: self._update_status())
+        self._table.monitor.registry_changed.connect(self._update_status)
 
         self._status_label = QLabel(self)
 
@@ -180,10 +225,13 @@ class NodeMonitorWidget(QGroupBox):
 
     def close(self):
         self._table.close()
-        self._monitor_handle.remove()
         self._status_update_timer.stop()
 
     def _update_status(self):
+        if isinstance(self.monitor, NodeMonitorBridge) and not self.monitor.updates_enabled:
+            self._status_label.setText('Node monitor paused during firmware update')
+            return
+
         if self._node.is_anonymous:
             self._status_label.setText('Discovery is not possible - local node is configured in anonymous mode')
         else:

@@ -12,11 +12,45 @@ import logging
 import queue
 from PyQt5.QtWidgets import QWidget, QDialog, QPlainTextEdit, QSpinBox, QHBoxLayout, QVBoxLayout, QComboBox, \
     QCompleter, QLabel
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal, pyqtSlot
 from . import CommitableComboBoxWithHistory, make_icon_button, get_monospace_font, show_error, FilterBar
 
 
 logger = logging.getLogger(__name__)
+
+
+class SubscriberController(QObject):
+    message_received = pyqtSignal(object)
+    error = pyqtSignal(str, str, object)
+    active_changed = pyqtSignal(bool)
+
+    def __init__(self, node, parent=None):
+        super(SubscriberController, self).__init__(parent)
+        self._node = node
+        self._subscriber_handle = None
+
+    @pyqtSlot(object)
+    def start_subscription(self, data_type):
+        self.stop_subscription()
+        try:
+            self._subscriber_handle = self._node.add_handler(data_type, self._on_message)
+        except Exception as ex:
+            self.error.emit('Subscription error', 'Could not create requested subscription', ex)
+        else:
+            self.active_changed.emit(True)
+
+    @pyqtSlot()
+    def stop_subscription(self):
+        if self._subscriber_handle is not None:
+            self._subscriber_handle.remove()
+            self._subscriber_handle = None
+        self.active_changed.emit(False)
+
+    def close(self):
+        self.stop_subscription()
+
+    def _on_message(self, event):
+        self.message_received.emit(event)
 
 
 class QuantityDisplay(QWidget):
@@ -73,19 +107,31 @@ class RateEstimator:
 
 class SubscriberWindow(QDialog):
     WINDOW_NAME_PREFIX = 'Subscriber'
+    start_subscription_requested = pyqtSignal(object)
+    stop_subscription_requested = pyqtSignal()
 
     def __init__(self, parent, node, active_data_type_detector):
         super(SubscriberWindow, self).__init__(parent)
         self.setWindowTitle(self.WINDOW_NAME_PREFIX)
         self.setAttribute(Qt.WA_DeleteOnClose)              # This is required to stop background timers!
 
-        self._node = node
+        if isinstance(node, SubscriberController):
+            self._controller = node
+            self._owns_controller = False
+        else:
+            self._controller = SubscriberController(node, self)
+            self._owns_controller = True
         self._active_data_type_detector = active_data_type_detector
         self._active_data_type_detector.message_types_updated.connect(self._update_data_type_list)
+        self.start_subscription_requested.connect(self._controller.start_subscription)
+        self.stop_subscription_requested.connect(self._controller.stop_subscription)
+        self._controller.message_received.connect(self._on_message)
+        self._controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
+        self._controller.active_changed.connect(self._on_subscription_active_changed)
 
         self._message_queue = queue.Queue()
-
-        self._subscriber_handle = None
+        self._subscription_active = False
+        self._requested_type_name = None
 
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(False)
@@ -207,18 +253,15 @@ class SubscriberWindow(QDialog):
 
     def _toggle_start_stop(self):
         try:
-            if self._subscriber_handle is None:
+            if not self._subscription_active:
                 self._do_start()
             else:
                 self._do_stop()
         finally:
-            self._start_stop_button.setChecked(self._subscriber_handle is not None)
+            self._start_stop_button.setChecked(self._subscription_active)
 
     def _do_stop(self):
-        if self._subscriber_handle is not None:
-            self._subscriber_handle.remove()
-            self._subscriber_handle = None
-
+        self.stop_subscription_requested.emit()
         self._pause_button.setChecked(False)
         self.setWindowTitle(self.WINDOW_NAME_PREFIX)
 
@@ -235,14 +278,16 @@ class SubscriberWindow(QDialog):
             show_error('Subscription error', 'Could not load requested data type', ex, self)
             return
 
-        try:
-            self._subscriber_handle = self._node.add_handler(data_type, self._on_message)
-        except Exception as ex:
-            show_error('Subscription error', 'Could not create requested subscription', ex, self)
-            return
+        self._requested_type_name = selected_type
+        self.start_subscription_requested.emit(data_type)
 
-        self.setWindowTitle('%s [%s]' % (self.WINDOW_NAME_PREFIX, selected_type))
-        self._start_stop_button.setChecked(True)
+    def _on_subscription_active_changed(self, active):
+        self._subscription_active = active
+        self._start_stop_button.setChecked(active)
+        if active and self._requested_type_name:
+            self.setWindowTitle('%s [%s]' % (self.WINDOW_NAME_PREFIX, self._requested_type_name))
+        elif not active:
+            self.setWindowTitle(self.WINDOW_NAME_PREFIX)
 
     def _do_redraw(self):
         self._num_messages_total_label.set(self._num_messages_total)
@@ -282,7 +327,10 @@ class SubscriberWindow(QDialog):
 
     def closeEvent(self, qcloseevent):
         try:
-            self._subscriber_handle.close()
+            if self._owns_controller:
+                self._controller.close()
+            else:
+                self.stop_subscription_requested.emit()
         except Exception:
             pass
         super(SubscriberWindow, self).closeEvent(qcloseevent)

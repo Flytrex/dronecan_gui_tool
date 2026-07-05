@@ -85,14 +85,14 @@ from .setup_window import run_setup_window
 from .active_data_type_detector import ActiveDataTypeDetector
 
 from .widgets import show_error, get_icon, get_app_icon
-from .widgets.node_monitor import NodeMonitorWidget
-from .widgets.local_node import LocalNodeWidget
+from .widgets.node_monitor import NodeMonitorWidget, NodeMonitorBridge
+from .widgets.local_node import LocalNodeWidget, LocalNodeController
 from .widgets.local_node import AdapterSettingsWidget
 from .widgets.local_node import setup_filtering
-from .widgets.log_message_display import LogMessageDisplayWidget
-from .widgets.bus_monitor import BusMonitorManager
+from .widgets.log_message_display import LogMessageDisplayWidget, LogMessageController
+from .widgets.bus_monitor import BusMonitorManager, BusMonitorHookController
 from .widgets.dynamic_node_id_allocator import DynamicNodeIDAllocatorWidget
-from .widgets.file_server import FileServerWidget
+from .widgets.file_server import FileServerWidget, FileServerController
 from .widgets.node_properties import NodePropertiesWindow
 from .widgets.console import ConsoleManager, InternalObjectDescriptor
 from .widgets.subscriber import SubscriberWindow
@@ -115,6 +115,158 @@ DSDL_MANIFEST = '.flytrex_dsdl_manifest'
 # Top-level archive entries that are not DSDL trees and must not be synced.
 DSDL_SYNC_EXCLUDES = {'.github', '.gitignore', 'tests', 'LICENSE', 'README.md',
                      'test.py', '.flytrex_dsdl_version'}
+
+
+class NodeRuntime(QObject):
+    spin_error = pyqtSignal(object, int)
+    _spin_start_requested = pyqtSignal(int)
+    _spin_stop_requested = pyqtSignal()
+    _spin_close_requested = pyqtSignal()
+    _spin_node_close_requested = pyqtSignal()
+
+    class _NodeSpinWorker(QObject):
+        spin_error = pyqtSignal(object, int)
+
+        def __init__(self, node):
+            super(NodeRuntime._NodeSpinWorker, self).__init__()
+            self._node = node
+            self._successive_spin_errors = 0
+            self._spin_timer = QTimer(self)
+            self._spin_timer.setSingleShot(False)
+            self._spin_timer.timeout.connect(self._spin_once)
+
+        @pyqtSlot(int)
+        def start(self, interval_ms=10):
+            self._spin_timer.start(interval_ms)
+
+        @pyqtSlot()
+        def stop(self):
+            self._spin_timer.stop()
+
+        @pyqtSlot()
+        def close(self):
+            self.stop()
+
+        @pyqtSlot()
+        def close_node(self):
+            try:
+                self._node.close()
+            except Exception:
+                logger.error('Could not close node from spin worker', exc_info=True)
+
+        def _spin_once(self):
+            try:
+                self._node.spin(0)
+                self._successive_spin_errors = 0
+            except Exception as ex:
+                # Ignore common bus-noise decode errors; surfacing each one floods
+                # the GUI/log path and can starve normal request/response handling.
+                ex_text = str(ex)
+                if 'CRC mismatch' in ex_text or 'Toggle bit value' in ex_text:
+                    self._successive_spin_errors = 0
+                    return
+                self._successive_spin_errors += 1
+                self.spin_error.emit(ex, self._successive_spin_errors)
+
+    def __init__(self, node, parent=None):
+        super(NodeRuntime, self).__init__(parent)
+        self._node = node
+        self._node_monitor = NodeMonitorBridge(node, self)
+        self._file_server = FileServerController(node, self)
+        self._local_node = LocalNodeController(node, self)
+        self._log_messages = LogMessageController(node, self)
+        self._bus_monitor_hook = BusMonitorHookController(node, self)
+
+        self._spin_worker = NodeRuntime._NodeSpinWorker(node)
+        self._spin_thread = QThread(self)
+        self._spin_worker.moveToThread(self._spin_thread)
+        self._spin_thread.finished.connect(self._spin_worker.deleteLater)
+
+        self._spin_start_requested.connect(self._spin_worker.start)
+        self._spin_stop_requested.connect(self._spin_worker.stop)
+        self._spin_close_requested.connect(self._spin_worker.close)
+        self._spin_node_close_requested.connect(self._spin_worker.close_node)
+        self._spin_worker.spin_error.connect(self.spin_error)
+
+        self._spin_thread.start()
+
+    @property
+    def node(self):
+        return self._node
+
+    @property
+    def node_monitor(self):
+        return self._node_monitor
+
+    @property
+    def file_server(self):
+        return self._file_server
+
+    @property
+    def local_node(self):
+        return self._local_node
+
+    @property
+    def log_messages(self):
+        return self._log_messages
+
+    @property
+    def bus_monitor_hook(self):
+        return self._bus_monitor_hook
+
+    @pyqtSlot(int)
+    def start(self, interval_ms=10):
+        self._spin_start_requested.emit(interval_ms)
+
+    @pyqtSlot()
+    def stop(self):
+        self._spin_stop_requested.emit()
+
+    @pyqtSlot()
+    def close_node(self):
+        self._spin_node_close_requested.emit()
+
+    @pyqtSlot()
+    def close(self):
+        self.stop()
+        self._spin_close_requested.emit()
+        self._spin_thread.quit()
+        self._spin_thread.wait(2000)
+        self._bus_monitor_hook.close()
+        self._log_messages.close()
+        self._local_node.close()
+        self._file_server.close()
+        self._node_monitor.close()
+
+    @property
+    def is_anonymous(self):
+        return self._node.is_anonymous
+
+    @property
+    def node_id(self):
+        return self._node.node_id
+
+    @node_id.setter
+    def node_id(self, value):
+        self._node.node_id = value
+
+    def request(self, payload, server_node_id, callback, priority=None, timeout=None):
+        return self._node.request(payload, server_node_id, callback, priority=priority, timeout=timeout)
+
+    def add_handler(self, dronecan_type, callback):
+        return self._node.add_handler(dronecan_type, callback)
+
+    def broadcast(self, payload, priority=None):
+        return self._node.broadcast(payload, priority)
+
+    def periodic(self, period_sec, callback):
+        return self._node.periodic(period_sec, callback)
+
+    def defer(self, delay_sec, callback):
+        return self._node.defer(delay_sec, callback)
+
+    def can_send(self, can_id, data, extended=False):
+        self._node.can_driver.send(can_id, data, extended=extended)
 
 
 def _bundled_config_file_path():
@@ -268,16 +420,14 @@ class MainWindow(QMainWindow):
             '.'.join(map(str, __flytrex_version__))))
         self.setWindowIcon(get_app_icon())
 
-        self._node = node
+        self._node_runtime = NodeRuntime(node, self)
+        self._node = self._node_runtime.node
         self._successive_node_errors = 0
         self._iface_name = iface_name
+        self._node_runtime.spin_error.connect(self._on_node_spin_error)
 
         self._active_data_type_detector = ActiveDataTypeDetector(self._node)
-
-        self._node_spin_timer = QTimer(self)
-        self._node_spin_timer.timeout.connect(self._spin_node)
-        self._node_spin_timer.setSingleShot(False)
-        self._node_spin_timer.start(10)
+        self._node_runtime.start(10)
 
         self._node_windows = {}  # node ID : window object
 
@@ -296,18 +446,18 @@ class MainWindow(QMainWindow):
             except Exception:
                 logger.warning('Could not write default config file: %s', _user_config_file_path(), exc_info=True)
 
-        self._node_monitor_widget = NodeMonitorWidget(self, node)
+        self._node_monitor_widget = NodeMonitorWidget(self, self._node, self._node_runtime.node_monitor)
         self._node_monitor_widget.on_info_window_requested = self._show_node_window
 
-        self._local_node_widget = LocalNodeWidget(self, node)
-        self._adapter_settings_widget = AdapterSettingsWidget(self, node)
-        self._log_message_widget = LogMessageDisplayWidget(self, node)
+        self._local_node_widget = LocalNodeWidget(self, self._node_runtime.local_node)
+        self._adapter_settings_widget = AdapterSettingsWidget(self, self._node_runtime.local_node)
+        self._log_message_widget = LogMessageDisplayWidget(self, self._node_runtime.log_messages)
         self._dynamic_node_id_allocation_widget = DynamicNodeIDAllocatorWidget(self, node,
                                                                                self._node_monitor_widget.monitor)
-        self._file_server_widget = FileServerWidget(self, node)
+        self._file_server_widget = FileServerWidget(self, self._node_runtime.file_server)
 
         self._plotter_manager = PlotterManager(self._node)
-        self._bus_monitor_manager = BusMonitorManager(self._node, iface_name)
+        self._bus_monitor_manager = BusMonitorManager(self._node_runtime.bus_monitor_hook, iface_name)
         # Console manager depends on other stuff via context, initialize it last
         self._console_manager = ConsoleManager(self._make_console_context)
 
@@ -898,7 +1048,7 @@ class MainWindow(QMainWindow):
             print(dronecan.to_yaml(obj))
 
         def throw_if_anonymous():
-            if self._node.is_anonymous:
+            if self._node_runtime.is_anonymous:
                 raise RuntimeError('Local node is configured in anonymous mode. '
                                    'You need to set the local node ID (see the main window) in order to be able '
                                    'to send transfers.')
@@ -919,7 +1069,7 @@ class MainWindow(QMainWindow):
             throw_if_anonymous()
             priority = priority or default_transfer_priority
             callback = callback or print_yaml
-            return self._node.request(payload, server_node_id, callback, priority=priority, timeout=timeout)
+            return self._node_runtime.request(payload, server_node_id, callback, priority=priority, timeout=timeout)
 
         def serve(dronecan_type, callback):
             """
@@ -946,7 +1096,7 @@ class MainWindow(QMainWindow):
                                  dronecan_type, exc_info=True)
                     sub_handle.remove()
 
-            sub_handle = self._node.add_handler(dronecan_type, process_callback)
+            sub_handle = self._node_runtime.add_handler(dronecan_type, process_callback)
             active_handles.append(sub_handle)
             return sub_handle
 
@@ -992,7 +1142,7 @@ class MainWindow(QMainWindow):
 
             # Business end is here
             def do_broadcast():
-                self._node.broadcast(payload, priority or default_transfer_priority)
+                self._node_runtime.broadcast(payload, priority or default_transfer_priority)
 
             do_broadcast()
 
@@ -1016,7 +1166,7 @@ class MainWindow(QMainWindow):
                                         dronecan.get_dronecan_data_type(payload).full_name)
                             timer_handle.remove()
 
-                timer_handle = self._node.periodic(interval, process_next)
+                timer_handle = self._node_runtime.periodic(interval, process_next)
                 active_handles.append(timer_handle)
                 return timer_handle
 
@@ -1075,10 +1225,10 @@ class MainWindow(QMainWindow):
                     if on_end is not None:
                         on_end()
 
-            sub_handle = self._node.add_handler(dronecan_type, process_callback)
+            sub_handle = self._node_runtime.add_handler(dronecan_type, process_callback)
             timer_handle = None
             if duration is not None:
-                timer_handle = self._node.defer(duration, cancel_callback)
+                timer_handle = self._node_runtime.defer(duration, cancel_callback)
             active_handles.append(sub_handle)
             return sub_handle
 
@@ -1086,7 +1236,7 @@ class MainWindow(QMainWindow):
             """
             Calls the specified callback with the specified time interval.
             """
-            handle = self._node.periodic(period_sec, callback)
+            handle = self._node_runtime.periodic(period_sec, callback)
             active_handles.append(handle)
             return handle
 
@@ -1094,7 +1244,7 @@ class MainWindow(QMainWindow):
             """
             Calls the specified callback after the specified amount of time.
             """
-            handle = self._node.defer(delay_sec, callback)
+            handle = self._node_runtime.defer(delay_sec, callback)
             active_handles.append(handle)
             return handle
 
@@ -1118,7 +1268,7 @@ class MainWindow(QMainWindow):
                 data:       Payload as bytes()
                 extended:   True to send a 29-bit frame; False to send an 11-bit frame
             """
-            self._node.can_driver.send(can_id, data, extended=extended)
+            self._node_runtime.can_send(can_id, data, extended=extended)
 
         return [
             InternalObjectDescriptor('can_iface_name', self._iface_name,
@@ -1170,37 +1320,32 @@ class MainWindow(QMainWindow):
                 pass    # Sometimes fails with "wrapped C/C++ object of type NodePropertiesWindow has been deleted"
             del self._node_windows[node_id]
 
-        w = NodePropertiesWindow(self, self._node, node_id, self._file_server_widget,
+        w = NodePropertiesWindow(self, self._node_runtime, node_id, self._file_server_widget,
                                  self._node_monitor_widget.monitor, self._dynamic_node_id_allocation_widget)
         w.show()
         self._node_windows[node_id] = w
 
-    def _spin_node(self):
-        # We're running the node in the GUI thread.
-        # This is not great, but at the moment seems like other options are even worse.
-        try:
-            self._node.spin(0)
-            self._successive_node_errors = 0
-        except Exception as ex:
-            self._successive_node_errors += 1
+    def _on_node_spin_error(self, ex, successive_errors):
+        self._successive_node_errors = successive_errors
 
-            msg = 'Node spin error [%d of %d]: %r' % (self._successive_node_errors, self.MAX_SUCCESSIVE_NODE_ERRORS, ex)
+        msg = 'Node spin error [%d of %d]: %r' % (self._successive_node_errors, self.MAX_SUCCESSIVE_NODE_ERRORS, ex)
 
-            if self._successive_node_errors >= self.MAX_SUCCESSIVE_NODE_ERRORS:
-                show_error('Node failure',
-                           'Local DroneCAN node has generated too many errors and will be terminated.\n'
-                           'Please restart the application.',
-                           msg, self)
-                self._node_spin_timer.stop()
-                self._node.close()
+        if self._successive_node_errors >= self.MAX_SUCCESSIVE_NODE_ERRORS:
+            show_error('Node failure',
+                       'Local DroneCAN node has generated too many errors and will be terminated.\n'
+                       'Please restart the application.',
+                       msg, self)
+            self._node_runtime.stop()
+            self._node_runtime.close_node()
 
-            logger.error(msg, exc_info=True)
-            self.statusBar().showMessage(msg, 3000)
+        logger.error(msg, exc_info=True)
+        self.statusBar().showMessage(msg, 3000)
 
     def closeEvent(self, qcloseevent):
         self._plotter_manager.close()
         self._console_manager.close()
         self._active_data_type_detector.close()
+        self._node_runtime.close()
         super(MainWindow, self).closeEvent(qcloseevent)
 
 def main():

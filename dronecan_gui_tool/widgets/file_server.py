@@ -13,13 +13,19 @@ import json
 import zlib
 import base64
 import struct
+from time import perf_counter
 from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QHBoxLayout, QWidget, QDirModel, QCompleter, QFileDialog, QLabel
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, QObject
 from logging import getLogger
 from . import make_icon_button, CommitableComboBoxWithHistory, get_icon, flash, LabelWithIcon
 
 
 logger = getLogger(__name__)
+
+
+READ_GAP_LOG_THRESHOLD_SEC = 0.02
+READ_HANDLER_LOG_THRESHOLD_SEC = 0.01
+READ_TIMING_LOG_MIN_INTERVAL_SEC = 0.25
 
 def FileServer_PathKey(path):
     '''
@@ -117,6 +123,8 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         self._key_hit_counters = {}
         self._key_complete = set()
         self._key_max_offset = {}
+        self._key_last_request_at = {}
+        self._key_last_timing_log_at = {}
 
     def _resolve_path(self, relative):
         rel = relative.path.decode().replace(chr(relative.SEPARATOR), os.path.sep)
@@ -151,6 +159,8 @@ class FileServerJson(dronecan.app.file_server.FileServer):
             self._image_timestamps[path] = mtime
             self._images[path] = self._load_image(path)
             self._key_to_path[FileServer_PathKey(path)] = path
+            return True
+        return False
 
     def purge_path(self, path):
         """Remove all cached data for a path so file.Read requests for it will fail."""
@@ -177,31 +187,149 @@ class FileServerJson(dronecan.app.file_server.FileServer):
     def _read(self, e):
         logger.debug("[#{0:03d}:uavcan.protocol.file.Read] {1!r} @ offset {2:d}"
                      .format(e.transfer.source_node_id, e.request.path.path.decode(), e.request.offset))
+        started_at = perf_counter()
+        request_gap_sec = None
+        cache_check_sec = 0.0
+        handler_sec = 0.0
+        cache_reloaded = False
+        payload_size = 0
+        key = e.request.path.path.decode()
+        path = None
         try:
-            key = e.request.path.path.decode()
+            last_request_at = self._key_last_request_at.get(key)
+            if last_request_at is not None:
+                request_gap_sec = started_at - last_request_at
+            self._key_last_request_at[key] = started_at
+
             if key in self._key_to_path:
                 path = self._key_to_path[key]
                 self._key_hit_counters[key] = self._key_hit_counters.get(key, 0) + 1
             else:
                 path = self._resolve_path(e.request.path)
-            self._check_path_change(path)
+
+            cache_check_started_at = perf_counter()
+            cache_reloaded = self._check_path_change(path)
+            cache_check_sec = perf_counter() - cache_check_started_at
+
             resp = uavcan.protocol.file.Read.Response()
             read_size = dronecan.get_dronecan_data_type(dronecan.get_fields(resp)['data']).max_size
             resp.data = self._images[path][e.request.offset:e.request.offset+read_size]
+            payload_size = len(resp.data)
             resp.error.value = resp.error.OK
             if key in self._key_to_path:
-                end_offset = e.request.offset + len(resp.data)
+                end_offset = e.request.offset + payload_size
                 prev = self._key_max_offset.get(key, 0)
                 if end_offset > prev:
                     self._key_max_offset[key] = end_offset
-                if len(resp.data) < read_size:
+                if payload_size < read_size:
                     self._key_complete.add(key)
         except Exception:
             logger.exception("[#{0:03d}:uavcan.protocol.file.Read] error")
             resp = uavcan.protocol.file.Read.Response()
             resp.error.value = resp.error.UNKNOWN_ERROR
+        finally:
+            handler_sec = perf_counter() - started_at
+            should_log_timing = (
+                cache_reloaded or
+                handler_sec >= READ_HANDLER_LOG_THRESHOLD_SEC or
+                cache_check_sec >= READ_HANDLER_LOG_THRESHOLD_SEC or
+                (request_gap_sec is not None and request_gap_sec >= READ_GAP_LOG_THRESHOLD_SEC)
+            )
+            if should_log_timing:
+                last_log_at = self._key_last_timing_log_at.get(key)
+                if (
+                    cache_reloaded or
+                    last_log_at is None or
+                    (started_at - last_log_at) >= READ_TIMING_LOG_MIN_INTERVAL_SEC
+                ):
+                    self._key_last_timing_log_at[key] = started_at
+                else:
+                    should_log_timing = False
+            if should_log_timing:
+                logger.info(
+                    '[#%03d:file.Read.timing] key=%r offset=%d size=%d gap_ms=%s cache_check_ms=%.3f '
+                    'handler_ms=%.3f reloaded=%s path=%r',
+                    e.transfer.source_node_id,
+                    key,
+                    e.request.offset,
+                    payload_size,
+                    '%.3f' % (request_gap_sec * 1000.0) if request_gap_sec is not None else 'n/a',
+                    cache_check_sec * 1000.0,
+                    handler_sec * 1000.0,
+                    cache_reloaded,
+                    path,
+                )
 
         return resp
+
+
+class FileServerController(QObject):
+    def __init__(self, node, parent=None):
+        super(FileServerController, self).__init__(parent)
+        self._node = node
+        self._file_server = None
+        self._paths = []
+
+    @property
+    def node(self):
+        return self._node
+
+    @property
+    def file_server(self):
+        return self._file_server
+
+    @property
+    def is_running(self):
+        return self._file_server is not None
+
+    @property
+    def path_hit_counters(self):
+        return {} if self._file_server is None else self._file_server.path_hit_counters
+
+    def set_paths(self, paths):
+        self._paths = [os.path.normcase(os.path.abspath(os.path.expanduser(path))) for path in paths if path]
+
+        if self._file_server:
+            logger.info('Updating lookup paths: %r', self._paths)
+            self._file_server.lookup_paths = list(self._paths)
+            for cached_path in list(self._file_server._images.keys()):
+                if cached_path not in self._paths:
+                    self._file_server.purge_path(cached_path)
+            for path in self._paths:
+                self._file_server._check_path_change(path)
+
+    def add_path(self, path):
+        path = os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+        if path not in self._paths:
+            self.set_paths(self._paths + [path])
+
+    def remove_path(self, path):
+        path = os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+        if path in self._paths:
+            self.set_paths([existing for existing in self._paths if existing != path])
+
+    def force_start(self):
+        if not self._file_server:
+            self._file_server = FileServerJson(self._node)
+            self.set_paths(self._paths)
+
+    def stop(self):
+        if self._file_server:
+            try:
+                self._file_server.close()
+            except Exception:
+                logger.error('Could not stop file server', exc_info=True)
+            self._file_server = None
+            logger.info('File server stopped')
+
+    def close(self):
+        self.stop()
+
+    def is_key_complete(self, key):
+        return self._file_server.is_key_complete(key) if self._file_server else False
+
+    def get_key_progress(self, key):
+        return self._file_server.get_key_progress(key) if self._file_server else (0, 0)
 
 
 class FileServerWidget(QGroupBox):
@@ -209,8 +337,12 @@ class FileServerWidget(QGroupBox):
         super(FileServerWidget, self).__init__(parent)
         self.setTitle('File server (dronecan.uavcan.protocol.file.*)')
 
-        self._node = node
-        self._file_server = None
+        if isinstance(node, FileServerController):
+            self._controller = node
+            self._owns_controller = False
+        else:
+            self._controller = FileServerController(node, self)
+            self._owns_controller = True
 
         self._path_widgets = []
 
@@ -239,10 +371,10 @@ class FileServerWidget(QGroupBox):
         self.setLayout(layout)
 
     def _update_on_timer(self):
-        self._start_button.setEnabled(not self._node.is_anonymous)
-        self._start_button.setChecked(self._file_server is not None)
-        if self._file_server:
-            for path, count in self._file_server.path_hit_counters.items():
+        self._start_button.setEnabled(not self._controller.node.is_anonymous)
+        self._start_button.setChecked(self._controller.is_running)
+        if self._controller.is_running:
+            for path, count in self._controller.path_hit_counters.items():
                 for w in self._path_widgets:
                     if path.startswith(w.path):
                         w.update_hit_count(path, count)
@@ -254,29 +386,17 @@ class FileServerWidget(QGroupBox):
         return [x.path for x in self._path_widgets if x.path]
 
     def _sync_paths(self):
-        if self._file_server:
-            paths = self._get_paths()
-            logger.info('Updating lookup paths: %r', paths)
-            self._file_server.lookup_paths = paths
-            # Purge cached images for paths no longer in the list
-            for cached_path in list(self._file_server._images.keys()):
-                if cached_path not in paths:
-                    self._file_server.purge_path(cached_path)
+        paths = self._get_paths()
+        self._controller.set_paths(paths)
+        if self._controller.is_running:
             flash(self, 'File server lookup paths: %r', paths, duration=3)
-            for p in paths:
-                self._file_server._check_path_change(p)
 
     def _on_start_stop(self):
-        if self._file_server:
-            try:
-                self._file_server.close()
-            except Exception:
-                logger.error('Could not stop file server', exc_info=True)
-            self._file_server = None
-            logger.info('File server stopped')
+        if self._controller.is_running:
+            self._controller.stop()
         else:
-            self._file_server = FileServerJson(self._node)
-            self._sync_paths()
+            self._controller.force_start()
+        self._sync_paths()
 
     def _on_remove_path(self, path):
         orig_len = len(self._path_widgets)
@@ -309,7 +429,7 @@ class FileServerWidget(QGroupBox):
         self._on_add_path(path)
 
     def force_start(self):
-        if not self._file_server:
+        if not self._controller.is_running:
             self._on_start_stop()
 
     def remove_path(self, path):
@@ -319,4 +439,8 @@ class FileServerWidget(QGroupBox):
             if it.path == path:
                 self._on_remove_path(it)
                 return
+
+    @property
+    def _file_server(self):
+        return self._controller.file_server
 

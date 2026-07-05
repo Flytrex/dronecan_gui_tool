@@ -12,7 +12,7 @@ import datetime
 from functools import partial
 from PyQt5.QtWidgets import QDialog, QGridLayout, QLabel, QLineEdit, QGroupBox, QVBoxLayout, QHBoxLayout, QStatusBar,\
     QHeaderView, QSpinBox, QCheckBox, QFileDialog, QApplication, QPlainTextEdit
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QTimer, Qt, QObject, pyqtSignal
 from PyQt5.QtGui import QPalette
 from logging import getLogger
 from . import get_monospace_font, make_icon_button, BasicTable, show_error, request_confirmation
@@ -25,6 +25,340 @@ logger = getLogger(__name__)
 
 
 REQUEST_PRIORITY = 30
+
+
+class FirmwareUpdateController(QObject):
+    message = pyqtSignal(str)
+    error = pyqtSignal(str, str, object)
+
+    def __init__(self, node, target_node_id, parent=None):
+        super(FirmwareUpdateController, self).__init__(parent)
+        self._node = node
+        self._target_node_id = target_node_id
+        self._deferred_request_handle = None
+        self._node_status_handle = None
+        self._remote_fw_file = None
+        self._num_remaining_requests = 0
+        self._monitor_updates_suspended = False
+        self._log_updates_suspended = False
+        self._update_in_progress = False
+        self._restore_timeout_timer = QTimer(self)
+        self._restore_timeout_timer.setSingleShot(True)
+        self._restore_timeout_timer.timeout.connect(self._on_update_restore_timeout)
+
+    def _on_update_restore_timeout(self):
+        self.close()
+
+    def _arm_restore_timeout(self, timeout_sec=300):
+        self._restore_timeout_timer.start(int(timeout_sec * 1000))
+
+    def _set_node_monitor_updates_enabled(self, enabled):
+        monitor = getattr(self._node, 'node_monitor', None)
+        if monitor is None or not hasattr(monitor, 'set_updates_enabled'):
+            return
+
+        monitor.set_updates_enabled(enabled)
+        self._monitor_updates_suspended = not bool(enabled)
+
+    def _set_log_updates_enabled(self, enabled):
+        log_messages = getattr(self._node, 'log_messages', None)
+        if log_messages is None or not hasattr(log_messages, 'set_updates_enabled'):
+            return
+
+        log_messages.set_updates_enabled(enabled)
+        self._log_updates_suspended = not bool(enabled)
+
+    def close(self):
+        self._update_in_progress = False
+        self._restore_timeout_timer.stop()
+        if self._deferred_request_handle is not None:
+            self._deferred_request_handle.remove()
+            self._deferred_request_handle = None
+        if self._node_status_handle is not None:
+            self._node_status_handle.remove()
+            self._node_status_handle = None
+        if self._monitor_updates_suspended:
+            self._set_node_monitor_updates_enabled(True)
+        if self._log_updates_suspended:
+            self._set_log_updates_enabled(True)
+
+    def start(self, remote_fw_file):
+        self.close()
+        self._set_node_monitor_updates_enabled(False)
+        self._set_log_updates_enabled(False)
+        self._update_in_progress = False
+        self._remote_fw_file = remote_fw_file
+        self._num_remaining_requests = 4
+        self._node_status_handle = self._node.add_handler(dronecan.uavcan.protocol.NodeStatus, self._on_node_status)
+        self._send_request()
+
+    def _on_response(self, e):
+        assert self._deferred_request_handle is None
+
+        self._deferred_request_handle = self._node.defer(2, self._send_request)
+
+        if e is None:
+            self.message.emit('One of firmware update requests has timed out')
+            return
+
+        logger.info('Firmware update response: %s', e.response)
+        self.message.emit('Firmware update response: %s' % e.response)
+
+        if e.response.error == e.response.ERROR_IN_PROGRESS:
+            self._update_in_progress = True
+            # Keep noisy background callbacks paused while transfer proceeds.
+            self._arm_restore_timeout()
+
+    def _on_node_status(self, e):
+        if e.transfer.source_node_id != self._target_node_id:
+            return
+
+        if e.message.mode == e.message.MODE_SOFTWARE_UPDATE and e.message.health < e.message.HEALTH_ERROR:
+            self._update_in_progress = True
+            self._arm_restore_timeout()
+            return
+
+        if self._update_in_progress and e.message.mode != e.message.MODE_SOFTWARE_UPDATE:
+            self.close()
+
+    def _send_request(self):
+        self._deferred_request_handle = None
+
+        if self._num_remaining_requests > 0:
+            self._num_remaining_requests -= 1
+            request = dronecan.uavcan.protocol.file.BeginFirmwareUpdate.Request(
+                source_node_id=self._node.node_id,
+                image_file_remote_path=dronecan.uavcan.protocol.file.Path(path=self._remote_fw_file))
+            self.message.emit('Sending request (%d to go) %s' % (self._num_remaining_requests, request))
+            try:
+                self._node.request(request, self._target_node_id, self._on_response, priority=REQUEST_PRIORITY)
+            except Exception as ex:
+                self.close()
+                self.error.emit('Firmware update error', 'Could not send firmware update request', ex)
+        else:
+            self.close()
+
+
+class ConfigParamFetchController(QObject):
+    fetch_started = pyqtSignal(int)
+    param_received = pyqtSignal(int, object)
+    fetch_finished = pyqtSignal(int, str)
+    message = pyqtSignal(str)
+    error = pyqtSignal(str, str, object)
+
+    def __init__(self, node, target_node_id, parent=None):
+        super(ConfigParamFetchController, self).__init__(parent)
+        self._node = node
+        self._target_node_id = target_node_id
+        self._retries = 0
+        self._fetch_in_progress = False
+        self._fetch_session_id = 0
+
+    @property
+    def fetch_in_progress(self):
+        return self._fetch_in_progress
+
+    def stop_fetch(self, message='Param fetch stopped'):
+        if not self._fetch_in_progress:
+            return
+
+        finished_session_id = self._fetch_session_id
+        self._fetch_in_progress = False
+        self._fetch_session_id += 1
+        self.fetch_finished.emit(finished_session_id, message)
+
+    def start_fetch(self):
+        if self._fetch_in_progress:
+            return
+
+        self._fetch_in_progress = True
+        self._retries = 0
+        self._fetch_session_id += 1
+        session_id = self._fetch_session_id
+        self.fetch_started.emit(session_id)
+        self.message.emit('Requesting index 0')
+        self._request_param_index(session_id, 0)
+
+    def _finish_fetch(self, session_id, message=None):
+        if session_id != self._fetch_session_id:
+            return
+
+        self._fetch_in_progress = False
+        self._fetch_session_id += 1
+        self.fetch_finished.emit(session_id, message or '')
+
+    def _request_param_index(self, session_id, index):
+        if (not self._fetch_in_progress) or (session_id != self._fetch_session_id):
+            return
+
+        try:
+            self._node.request(dronecan.uavcan.protocol.param.GetSet.Request(index=index),
+                               self._target_node_id,
+                               partial(self._on_fetch_response, session_id, index),
+                               priority=REQUEST_PRIORITY)
+        except Exception as ex:
+            self.error.emit('Node error', 'Could not send param get request', ex)
+            self._finish_fetch(session_id)
+
+    def _on_fetch_response(self, session_id, index, e):
+        if session_id != self._fetch_session_id:
+            return
+
+        if e is None:
+            if self._retries < 5:
+                self._retries += 1
+                self.message.emit('Re-requesting index %d' % index)
+                self._node.defer(0.1, lambda: self._request_param_index(session_id, index))
+            else:
+                self._finish_fetch(session_id, 'Param fetch failed: request timed out')
+            return
+
+        self._retries = 0
+
+        if len(e.response.name) == 0:
+            self._finish_fetch(session_id, '%d params fetched successfully' % index)
+            return
+
+        self.param_received.emit(index, e.response)
+
+        try:
+            index += 1
+            self.message.emit('Requesting index %d' % index)
+            self._node.defer(0.1, lambda: self._request_param_index(session_id, index))
+        except Exception as ex:
+            logger.error('Param fetch error', exc_info=True)
+            self._finish_fetch(session_id, 'Could not send param get request: %r' % ex)
+
+
+class ConfigParamRequestController(QObject):
+    value_received = pyqtSignal(object)
+    message = pyqtSignal(str)
+    error = pyqtSignal(str, str, object)
+
+    def __init__(self, node, target_node_id, parent=None):
+        super(ConfigParamRequestController, self).__init__(parent)
+        self._node = node
+        self._target_node_id = target_node_id
+
+    def fetch(self, param_name):
+        try:
+            request = dronecan.uavcan.protocol.param.GetSet.Request(name=param_name)
+            self._node.request(request, self._target_node_id, self._on_response, priority=REQUEST_PRIORITY)
+        except Exception as ex:
+            self.error.emit('Node error', 'Could not send param get request', ex)
+        else:
+            self.message.emit('Fetch request sent')
+
+    def send(self, param_name, value):
+        try:
+            request = dronecan.uavcan.protocol.param.GetSet.Request(name=param_name, value=value)
+            logger.info('Sending param set request: %s', request)
+            self._node.request(request, self._target_node_id, self._on_response, priority=REQUEST_PRIORITY)
+        except Exception as ex:
+            self.error.emit('Node error', 'Could not send param set request', ex)
+        else:
+            self.message.emit('Set request sent')
+
+    def _on_response(self, e):
+        if e is None:
+            self.message.emit('Request timed out')
+        else:
+            logger.info('Param get/set response: %s', e.response)
+            self.value_received.emit(e.response.value)
+            self.message.emit('Response received')
+
+
+class NodeControlRequestController(QObject):
+    message = pyqtSignal(str)
+    error = pyqtSignal(str, str, object)
+    transport_stats_received = pyqtSignal(int, str)
+
+    def __init__(self, node, target_node_id, parent=None):
+        super(NodeControlRequestController, self).__init__(parent)
+        self._node = node
+        self._target_node_id = target_node_id
+
+    def restart(self):
+        request = dronecan.uavcan.protocol.RestartNode.Request(
+            magic_number=dronecan.uavcan.protocol.RestartNode.Request().MAGIC_NUMBER)
+
+        try:
+            self._node.request(request, self._target_node_id, self._on_restart_response, priority=REQUEST_PRIORITY)
+        except Exception as ex:
+            self.error.emit('Node error', 'Could not send restart request', ex)
+        else:
+            self.message.emit('Restart requested')
+
+    def request_transport_stats(self):
+        try:
+            self._node.request(dronecan.uavcan.protocol.GetTransportStats.Request(),
+                               self._target_node_id,
+                               self._on_transport_stats_response,
+                               priority=REQUEST_PRIORITY)
+        except Exception as ex:
+            self.error.emit('Node error', 'Could not send stats request', ex)
+        else:
+            self.message.emit('Transport stats requested')
+
+    def _on_restart_response(self, e):
+        if e is None:
+            self.message.emit('Restart request timed out')
+        else:
+            self.message.emit('Restart request response: %s' % e.response)
+
+    def _on_transport_stats_response(self, e):
+        if e is None:
+            self.message.emit('Transport stats request timed out')
+        else:
+            self.transport_stats_received.emit(e.transfer.source_node_id, dronecan.to_yaml(e.response))
+
+
+class ConfigParamActionController(QObject):
+    param_updated = pyqtSignal(str, object)
+    message = pyqtSignal(str)
+    error = pyqtSignal(str, str, object)
+
+    def __init__(self, node, target_node_id, parent=None):
+        super(ConfigParamActionController, self).__init__(parent)
+        self._node = node
+        self._target_node_id = target_node_id
+
+    def save_param(self, name, value):
+        try:
+            request = dronecan.uavcan.protocol.param.GetSet.Request(name=name, value=value)
+            self._node.request(request,
+                               self._target_node_id,
+                               partial(self._on_save_response, str(name)),
+                               priority=REQUEST_PRIORITY)
+        except Exception as ex:
+            self.error.emit('Node error', 'Could not send param set request', ex)
+
+    def execute_opcode(self, opcode):
+        request = dronecan.uavcan.protocol.param.ExecuteOpcode.Request(opcode=opcode)
+        opcode_str = dronecan.value_to_constant_name(request, 'opcode', keep_literal=True)
+
+        try:
+            self._node.request(request,
+                               self._target_node_id,
+                               partial(self._on_opcode_response, opcode_str),
+                               priority=REQUEST_PRIORITY,
+                               timeout=5000.0)
+        except Exception as ex:
+            self.error.emit('Node error', 'Could not send param opcode execution request', ex)
+        else:
+            self.message.emit('Param opcode %s requested' % opcode_str)
+
+    def _on_save_response(self, expected_name, e):
+        if e is None:
+            self.message.emit('Request timed out')
+        elif str(e.response.name) == expected_name:
+            self.param_updated.emit(expected_name, e.response.value)
+
+    def _on_opcode_response(self, opcode_str, e):
+        if e is None:
+            self.message.emit('Opcode execution response for %s has timed out' % opcode_str)
+        else:
+            self.message.emit('Opcode execution response for %s: %s' % (opcode_str, e.response))
 
 
 class FieldValueWidget(QLineEdit):
@@ -174,6 +508,14 @@ class Controls(QGroupBox):
         self._target_node_id = target_node_id
         self._file_server_widget = file_server_widget
         self._dynamic_node_id_allocator_widget = dynamic_node_id_allocator_widget
+        self._firmware_update_controller = FirmwareUpdateController(node, target_node_id, self)
+        self._control_request_controller = NodeControlRequestController(node, target_node_id, self)
+        self._firmware_update_controller.message.connect(lambda text: self.window().show_message('%s', text))
+        self._firmware_update_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
+        self._control_request_controller.message.connect(lambda text: self.window().show_message('%s', text))
+        self._control_request_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
+        self._control_request_controller.transport_stats_received.connect(self._show_transport_stats)
+        self.destroyed.connect(lambda *_: self._firmware_update_controller.close())
 
         self._restart_button = make_icon_button('fa6s.power-off', 'Restart the node [dronecan.uavcan.protocol.RestartNode]', self,
                                                 text='Restart', on_clicked=self._do_restart)
@@ -194,47 +536,28 @@ class Controls(QGroupBox):
         self.setLayout(layout)
 
     def _do_restart(self):
-        request = dronecan.uavcan.protocol.RestartNode.Request(magic_number=dronecan.uavcan.protocol.RestartNode.Request().MAGIC_NUMBER)
         if not request_confirmation('Confirm node restart',
                                     'Do you really want to send request dronecan.uavcan.protocol.RestartNode?', self):
             return
 
-        def callback(e):
-            if e is None:
-                self.window().show_message('Restart request timed out')
-            else:
-                self.window().show_message('Restart request response: %s', e.response)
-
-        try:
-            self._node.request(request, self._target_node_id, callback, priority=REQUEST_PRIORITY)
-            self.window().show_message('Restart requested')
-        except Exception as ex:
-            show_error('Node error', 'Could not send restart request', ex, self)
+        self._control_request_controller.restart()
 
     def _do_get_transport_stats(self):
-        def callback(e):
-            if e is None:
-                self.window().show_message('Transport stats request timed out')
-            else:
-                text = dronecan.to_yaml(e.response)
-                win = QDialog(self)
-                view = QPlainTextEdit(win)
-                view.setReadOnly(True)
-                view.setFont(get_monospace_font())
-                view.setPlainText(text)
-                view.setLineWrapMode(QPlainTextEdit.NoWrap)
-                layout = QVBoxLayout(win)
-                layout.addWidget(view)
-                win.setModal(True)
-                win.setWindowTitle('Transport stats of node %r' % e.transfer.source_node_id)
-                win.setLayout(layout)
-                win.show()
-        try:
-            self._node.request(dronecan.uavcan.protocol.GetTransportStats.Request(),
-                               self._target_node_id, callback, priority=REQUEST_PRIORITY)
-            self.window().show_message('Transport stats requested')
-        except Exception as ex:
-            show_error('Node error', 'Could not send stats request', ex, self)
+        self._control_request_controller.request_transport_stats()
+
+    def _show_transport_stats(self, source_node_id, text):
+        win = QDialog(self)
+        view = QPlainTextEdit(win)
+        view.setReadOnly(True)
+        view.setFont(get_monospace_font())
+        view.setPlainText(text)
+        view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        layout = QVBoxLayout(win)
+        layout.addWidget(view)
+        win.setModal(True)
+        win.setWindowTitle('Transport stats of node %r' % source_node_id)
+        win.setLayout(layout)
+        win.show()
 
 
     def _do_firmware_update(self, fw_file = None):
@@ -272,65 +595,7 @@ class Controls(QGroupBox):
 
         remote_fw_file = FileServer_PathKey(fw_file)
         logger.info('Firmware file remote path: %r', remote_fw_file)
-
-        deferred_request_handle = None
-        node_status_handle = None
-        num_remaining_requests = 4
-
-        def on_success_or_timeout():
-            nonlocal deferred_request_handle
-            nonlocal node_status_handle
-
-            if deferred_request_handle is not None:
-                deferred_request_handle.remove()
-                deferred_request_handle = None
-            if node_status_handle is not None:
-                node_status_handle.remove()
-                node_status_handle = None
-
-        # Sending update requests
-        def on_response(e):
-            nonlocal deferred_request_handle
-
-            assert deferred_request_handle is None
-
-            deferred_request_handle = self._node.defer(2, send_request)
-
-            if e is None:
-                self.window().show_message('One of firmware update requests has timed out')
-            else:
-                logger.info('Firmware update response: %s', e.response)
-                self.window().show_message('Firmware update response: %s', e.response)
-
-                if e.response.error == e.response.ERROR_IN_PROGRESS:
-                    on_success_or_timeout()
-
-        def on_node_status(e):
-            if e.transfer.source_node_id == self._target_node_id and e.message.mode == e.message.MODE_SOFTWARE_UPDATE \
-            and e.message.health < e.message.HEALTH_ERROR:
-                on_success_or_timeout()
-
-        def send_request():
-            nonlocal num_remaining_requests
-            nonlocal deferred_request_handle
-
-            deferred_request_handle = None
-
-            if num_remaining_requests > 0:
-                num_remaining_requests -= 1
-                request = dronecan.uavcan.protocol.file.BeginFirmwareUpdate.Request(
-                    source_node_id=self._node.node_id,
-                    image_file_remote_path=dronecan.uavcan.protocol.file.Path(path=remote_fw_file))
-                self.window().show_message('Sending request (%d to go) %s', num_remaining_requests, request)
-                try:
-                    self._node.request(request, self._target_node_id, on_response, priority=REQUEST_PRIORITY)
-                except Exception as ex:
-                    show_error('Firmware update error', 'Could not send firmware update request', ex, self)
-            else:
-                on_success_or_timeout()
-
-        node_status_handle = self._node.add_handler(dronecan.uavcan.protocol.NodeStatus, on_node_status)
-        send_request()  # Kickstarting the process, it will continue in the background
+        self._firmware_update_controller.start(remote_fw_file)
 
 
 def get_union_value(u):
@@ -374,6 +639,10 @@ class ConfigParamEditWindow(QDialog):
         self._target_node_id = target_node_id
         self._param_struct = param_struct
         self._update_callback = update_callback
+        self._request_controller = ConfigParamRequestController(node, target_node_id, self)
+        self._request_controller.value_received.connect(self._assign)
+        self._request_controller.message.connect(lambda text: self.show_message('%s', text))
+        self._request_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
 
         self._is_tune_editor = AM32_Rtttl.is_am32_melody_param(param_struct)
 
@@ -503,25 +772,11 @@ class ConfigParamEditWindow(QDialog):
                 self._value_widget.setText(str_value)
             self._update_callback(value, self._is_tune_editor)
 
-    def _on_response(self, e):
-        if e is None:
-            self.show_message('Request timed out')
-        else:
-            logger.info('Param get/set response: %s', e.response)
-            self._assign(e.response.value)
-            self.show_message('Response received')
-
     def _restore_default(self):
         self._assign(self._param_struct.default_value)
 
     def _do_fetch(self):
-        try:
-            request = dronecan.uavcan.protocol.param.GetSet.Request(name=self._param_struct.name)
-            self._node.request(request, self._target_node_id, self._on_response, priority=REQUEST_PRIORITY)
-        except Exception as ex:
-            show_error('Node error', 'Could not send param get request', ex, self)
-        else:
-            self.show_message('Fetch request sent')
+        self._request_controller.fetch(self._param_struct.name)
 
     def _do_send(self):
         value_type = dronecan.get_active_union_field(self._param_struct.value)
@@ -559,15 +814,7 @@ class ConfigParamEditWindow(QDialog):
             show_error('Format error', 'Could not parse value', ex, self)
             return
 
-        try:
-            request = dronecan.uavcan.protocol.param.GetSet.Request(name=self._param_struct.name,
-                                                           value=self._param_struct.value)
-            logger.info('Sending param set request: %s', request)
-            self._node.request(request, self._target_node_id, self._on_response, priority=REQUEST_PRIORITY)
-        except Exception as ex:
-            show_error('Node error', 'Could not send param set request', ex, self)
-        else:
-            self.show_message('Set request sent')
+        self._request_controller.send(self._param_struct.name, self._param_struct.value)
 
 
 class ConfigParams(QGroupBox):
@@ -583,9 +830,17 @@ class ConfigParams(QGroupBox):
 
         self._node = node
         self._target_node_id = target_node_id
-        self._retries = 0
         self._fetch_in_progress = False
-        self._fetch_session_id = 0
+        self._fetch_controller = ConfigParamFetchController(node, target_node_id, self)
+        self._action_controller = ConfigParamActionController(node, target_node_id, self)
+        self._fetch_controller.fetch_started.connect(self._on_fetch_started)
+        self._fetch_controller.param_received.connect(self._on_param_received)
+        self._fetch_controller.fetch_finished.connect(self._on_fetch_finished)
+        self._fetch_controller.message.connect(lambda text: self.window().show_message('%s', text))
+        self._fetch_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
+        self._action_controller.param_updated.connect(self._on_param_updated)
+        self._action_controller.message.connect(lambda text: self.window().show_message('%s', text))
+        self._action_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
 
         self._read_all_button = make_icon_button('fa6s.arrows-rotate', self.FETCH_ALL_TOOLTIP, self,
                              text=self.FETCH_ALL_TEXT, on_clicked=self._on_fetch_all_clicked)
@@ -659,66 +914,15 @@ class ConfigParams(QGroupBox):
             self._read_all_button.setText(self.FETCH_ALL_TEXT)
             self._read_all_button.setToolTip(self.FETCH_ALL_TOOLTIP)
 
-    def _finish_fetch(self, session_id, message=None):
-        '''
-        @brief  Finish the fetch operation
-        @param  session_id - The ID of the fetch session
-        @param  message - Optional message to display
-        '''
-
-        if session_id != self._fetch_session_id:
-            return
-
-        self._fetch_in_progress = False
-        self._fetch_session_id += 1  # Invalidate all in-flight and deferred callbacks for this session
-        self._set_fetch_button_caption(False)
-        if message:
-            self.window().show_message('%s', message)
-
-    def _stop_fetch(self, message=None):
-        '''
-        @brief  Stop the fetch operation
-        @param  message - Optional message to display
-        '''
-
-        if not self._fetch_in_progress:
-            return
-
-        # Invalidate all in-flight and deferred callbacks.
-        self._fetch_in_progress = False
-        self._fetch_session_id += 1
-        self._set_fetch_button_caption(False)
-        if message:
-            self.window().show_message('%s', message)
-
-    def _request_param_index(self, session_id, index):
-        '''
-        @brief  Request a parameter by its index
-        @param  session_id - The ID of the fetch session
-        @param  index - The index of the parameter to request
-        '''
-
-        if (not self._fetch_in_progress) or (session_id != self._fetch_session_id):
-            return
-
-        try:
-            self._node.request(dronecan.uavcan.protocol.param.GetSet.Request(index=index),
-                               self._target_node_id,
-                               partial(self._on_fetch_response, session_id, index),
-                               priority=REQUEST_PRIORITY)
-        except Exception as ex:
-            show_error('Node error', 'Could not send param get request', ex, self)
-            self._finish_fetch(session_id)
-
     def _on_fetch_all_clicked(self):
         '''
         @brief  Handle the fetch all button click event
         '''
 
         if self._fetch_in_progress:
-            self._stop_fetch('Param fetch stopped')
+            self._fetch_controller.stop_fetch('Param fetch stopped')
         else:
-            self._do_reload()
+            self._fetch_controller.start_fetch()
 
     def _on_cell_enter_pressed(self, list_of_row_col_pairs):
         unique_rows = set([row for row, _col in list_of_row_col_pairs])
@@ -740,61 +944,22 @@ class ConfigParams(QGroupBox):
         win = ConfigParamEditWindow(self, self._node, self._target_node_id, self._params[index], update_callback)
         win.show()
 
-    def _on_fetch_response(self, session_id, index, e):
-        if session_id != self._fetch_session_id:
-            return
-
-        if e is None:
-            if self._retries < 5:
-                self._retries += 1
-                self.window().show_message('Re-requesting index %d', index)
-                self._node.defer(0.1, lambda: self._request_param_index(session_id, index))
-            else:
-                self._finish_fetch(session_id, 'Param fetch failed: request timed out')
-            return
-
-        # reset retries when we get a response
-        self._retries = 0
-
-        if len(e.response.name) == 0:
-            self._finish_fetch(session_id, '%d params fetched successfully' % index)
-            return
-
-        self._params.append(e.response)
-        self._table.setRowCount(self._table.rowCount() + 1)
-        self._table.set_row(self._table.rowCount() - 1, (index, e.response))
-
-        try:
-            index += 1
-            self.window().show_message('Requesting index %d', index)
-            self._node.defer(0.1, lambda: self._request_param_index(session_id, index))
-        except Exception as ex:
-            logger.error('Param fetch error', exc_info=True)
-            self._finish_fetch(session_id, 'Could not send param get request: %r' % ex)
-
-    def _do_reload(self):
-        if self._fetch_in_progress:
-            return
-
+    def _on_fetch_started(self, _session_id):
         self._fetch_in_progress = True
-        self._retries = 0
-        self._fetch_session_id += 1
-        session_id = self._fetch_session_id
         self._set_fetch_button_caption(True)
-
-        # Clear current view early so the user sees a clean slate during fetch.
         self._table.setRowCount(0)
         self._params = []
 
-        try:
-            index = 0
-            self.window().show_message('Requesting index %d', index)
-            self._request_param_index(session_id, index)
-        except Exception as ex:
-            show_error('Node error', 'Could not send param get request', ex, self)
-            self._finish_fetch(session_id)
-        else:
-            self.window().show_message('Param fetch request sent')
+    def _on_param_received(self, index, response):
+        self._params.append(response)
+        self._table.setRowCount(self._table.rowCount() + 1)
+        self._table.set_row(self._table.rowCount() - 1, (index, response))
+
+    def _on_fetch_finished(self, _session_id, message):
+        self._fetch_in_progress = False
+        self._set_fetch_button_caption(False)
+        if message:
+            self.window().show_message('%s', message)
 
     def param_as_string(self, value, is_melody=False):
         value_type = dronecan.get_active_union_field(value)
@@ -835,18 +1000,17 @@ class ConfigParams(QGroupBox):
                 f.write("%s %s\n" % (name, value_string))
         f.close()
 
-    def _on_send_response(self, e):
-        if e is None:
-            self.show_message('Request timed out')
-        else:
-            for i in range(len(self._params)):
-                p = self._params[i]
-                name = str(p.name)
-                if name == str(e.response.name):
-                    param_string = self.param_as_string(e.response.value)
-                    logger.info('set %s to %s' % (name, param_string))
-                    self._update_table_param(p.value, param_string)
-                    self._table.item(i, self.VALUE_COLUMN).setText(self.param_as_string(e.response.value, AM32_Rtttl.is_am32_melody_param(p)))
+    def _on_param_updated(self, param_name, value):
+        for i in range(len(self._params)):
+            p = self._params[i]
+            name = str(p.name)
+            if name == str(param_name):
+                param_string = self.param_as_string(value)
+                logger.info('set %s to %s' % (name, param_string))
+                self._update_table_param(p.value, param_string)
+                self._table.item(i, self.VALUE_COLUMN).setText(
+                    self.param_as_string(value, AM32_Rtttl.is_am32_melody_param(p)))
+                break
 
     def _update_table_param(self, param, str_value):
         """
@@ -874,12 +1038,7 @@ class ConfigParams(QGroupBox):
         setattr(v, value_type, getattr(old_value, value_type))
 
         self._update_table_param(v, str_value)
-
-        try:
-            request = dronecan.uavcan.protocol.param.GetSet.Request(name=name, value=v)
-            self._node.request(request, self._target_node_id, self._on_send_response, priority=REQUEST_PRIORITY)
-        except Exception as ex:
-            show_error('Node error', 'Could not send param set request', ex, self)
+        self._action_controller.save_param(name, v)
 
     def _do_load_from_file(self):
         '''load parameters from a file'''
@@ -918,18 +1077,7 @@ class ConfigParams(QGroupBox):
         if not request_confirmation('Confirm opcode execution',
                                     'Do you really want to execute param opcode %s?' % opcode_str, self):
             return
-
-        def callback(e):
-            if e is None:
-                self.window().show_message('Opcode execution response for %s has timed out', opcode_str)
-            else:
-                self.window().show_message('Opcode execution response for %s: %s', opcode_str, e.response)
-
-        try:
-            self._node.request(request, self._target_node_id, callback, priority=REQUEST_PRIORITY, timeout=5000.0)
-            self.window().show_message('Param opcode %s requested', opcode_str)
-        except Exception as ex:
-            show_error('Node error', 'Could not send param opcode execution request', ex, self)
+        self._action_controller.execute_opcode(opcode)
 
 
 class NodePropertiesWindow(QDialog):
