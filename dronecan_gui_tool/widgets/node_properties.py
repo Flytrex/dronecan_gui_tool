@@ -199,6 +199,7 @@ class BmsParamBackup:
                 self._node.defer(0.1, lambda: self._request_param(index))
             else:
                 logger.error('BMS backup: param fetch timed out at index %d; backup incomplete', index)
+                self._save()
             return
 
         self._retries = 0
