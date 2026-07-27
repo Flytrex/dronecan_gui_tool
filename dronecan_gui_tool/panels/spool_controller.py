@@ -80,6 +80,7 @@ class DesignConstantsSetPayload(ctypes.LittleEndianStructure):
     @         its explicit trailing pad bytes; `homing_window_ms` is FreeRTOS's `TickType_t`, assumed to be 32-bit here.
     '''
     _pack_ = 1
+
     SIZE: int
     _fields_ = [
         ('spool_width_m', ctypes.c_float),
@@ -140,9 +141,10 @@ class ParamSetPayload(ctypes.LittleEndianStructure):
     '''
     @brief    Class representing the payload of a ParamSet message, responsible for parsing and storing field values.
     @         Must match paramset-manager's `param_set_t` (see the Delivery Controller firmware) field-for-field.
-    @		  TODO: automatically generate this based on the actual param_set_t defintion?
+    @		  TODO: automatically generate this based on the actual param_set_t definition?
     '''
     _pack_ = 1
+
     SIZE: int
     _fields_ = [
         ('param_set_id', ctypes.c_uint16),
@@ -152,6 +154,8 @@ class ParamSetPayload(ctypes.LittleEndianStructure):
         ('execute_not_hold', ctypes.c_bool),
         ('ob_hold_on_event', ctypes.c_bool),
         ('ob_autostop', ctypes.c_bool),
+
+        ('_pad', ctypes.c_uint8 * 1),
 
         ('min_effort_limit', ctypes.c_float),
         ('max_effort_limit', ctypes.c_float),
@@ -173,7 +177,7 @@ class ParamSetPayload(ctypes.LittleEndianStructure):
         ('tg_deceleration', ctypes.c_float),
         ('tg_halt_deceleration', ctypes.c_float),
         ('tg_velocity', ctypes.c_float),
-        ('tg_movement_time_s', ctypes.c_float),
+        ('tg_movement_time_s', ctypes.c_float)
     ]
 
     def set(self, **kwargs):
@@ -214,6 +218,41 @@ class ParamSetPayload(ctypes.LittleEndianStructure):
 
 ParamSetPayload.SIZE = ctypes.sizeof(ParamSetPayload)
 
+
+def _ctypes_struct_to_dict(struct_instance) -> dict:
+    '''
+    @brief    Convert a ctypes.Structure instance to a plain, JSON-serializable dict, field-for-field.
+    @         Fields whose name starts with an underscore (e.g. `_pad`) are internal padding, not
+    @         meaningful data, and are omitted so the JSON stays human-readable/editable.
+    @param    struct_instance - The ctypes.Structure instance to convert.
+    @return   Dict mapping field name to value.
+    '''
+    result = {}
+    for field_name, _field_type in type(struct_instance)._fields_:
+        if field_name.startswith('_'):
+            continue
+        result[field_name] = getattr(struct_instance, field_name)
+    return result
+
+
+def _ctypes_struct_from_dict(struct_instance, data: dict):
+    '''
+    @brief    Populate a ctypes.Structure instance from a dict produced by _ctypes_struct_to_dict, field-for-field.
+    @         Padding fields (name starts with an underscore) are not expected in `data` and are left
+    @         at their zero-initialized default.
+    @param    struct_instance - The ctypes.Structure instance to populate.
+    @param    data - Dict mapping field name to value.
+    @return   The same struct_instance, populated.
+    '''
+    for field_name, _field_type in type(struct_instance)._fields_:
+        if field_name.startswith('_'):
+            continue
+        if field_name not in data:
+            raise ValueError(f'Missing field "{field_name}" for {type(struct_instance).__name__} in JSON data')
+        setattr(struct_instance, field_name, data[field_name])
+    return struct_instance
+
+
 class ParamSetFile:
     '''
     @brief    Class representing a ParamSet definition file, responsible for parsing the file and providing field definitions.
@@ -223,6 +262,12 @@ class ParamSetFile:
     HEADER_FORMAT = '<HHII'
     HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
     VERSION = 1
+
+    BIN_EXTENSION = '.delconparamb'
+    JSON_EXTENSION = '.delconparama'
+
+    BIN_FILTER = f'Binary Delivery Controller Parameters (*{BIN_EXTENSION})'
+    JSON_FILTER = f'Text Delivery Controller Parameters (*{JSON_EXTENSION})'
 
     _version: int = VERSION                         # Version string from the ParamSet file (e.g. "1.0"). 2 bytes
     _num_param_set: int = 0                         # Number of ParamSet definitions in the file. 2 bytes
@@ -293,6 +338,45 @@ class ParamSetFile:
             logger.warning('ParamSetFile deserialize: %d trailing bytes were not parsed', len(buffer) - offset)
 
         return self
+
+    def toJSON(self) -> str:
+        '''
+        @brief    Serialize the ParamSetFile to a human-readable JSON string, intended to be
+        @         hand-edited by a non-expert. Omits values that are meaningless to a human and
+        @         are not needed to reconstruct a valid binary file: the header/payload CRCs
+        @         and num_param_set (recalculated by fromJSON) and any struct padding bytes
+        @         (always zeroed).
+        @return   JSON string.
+        '''
+        data = {
+            'version': self._version,
+            'design_constants_set': _ctypes_struct_to_dict(self._design_constants_set_payload),
+            'param_sets': [_ctypes_struct_to_dict(param_set) for param_set in self._param_sets],
+        }
+        return json.dumps(data, indent=2)
+
+    @classmethod
+    def fromJSON(cls, json_str: str) -> 'ParamSetFile':
+        '''
+        @brief    Deserialize a ParamSetFile from a JSON string produced by toJSON.
+        @         The CRCs and num_param_set are not stored in the JSON (since a human editing it
+        @         would have no way to keep them consistent); they are recalculated here instead.
+        @param    json_str - JSON string to parse.
+        @return   New ParamSetFile instance with freshly calculated CRCs.
+        '''
+        data = json.loads(json_str)
+
+        file = cls()
+        file._version = data['version']
+        file._design_constants_set_payload = _ctypes_struct_from_dict(
+            DesignConstantsSetPayload(), data['design_constants_set'])
+        file._param_sets = [
+            _ctypes_struct_from_dict(ParamSetPayload(), param_set) for param_set in data['param_sets']
+        ]
+        file._num_param_set = len(file._param_sets)
+        file.calculate_crc()
+
+        return file
 
     def calculate_header_crc(self) -> int:
         '''
@@ -584,14 +668,6 @@ class SpoolControllerPanel(QDialog):
         self._delete_button.clicked.connect(self._on_delete_clicked)
         param_set_id_row.addWidget(self._delete_button)
 
-        self._create_config_file_button = QPushButton('Create Config File', header_group)
-        self._create_config_file_button.clicked.connect(self._on_create_config_file_clicked)
-        param_set_id_row.addWidget(self._create_config_file_button)
-
-        self._read_config_file_button = QPushButton('Read Config File', header_group)
-        self._read_config_file_button.clicked.connect(self._on_read_config_file_clicked)
-        param_set_id_row.addWidget(self._read_config_file_button)
-
         param_set_id_row.addStretch(1)
         columns_grid.addLayout(param_set_id_row, 3, 0, 1, 2)
 
@@ -756,7 +832,51 @@ class SpoolControllerPanel(QDialog):
 
         group_layout.addSpacing(2)
 
+        self._save_load_params_group = QGroupBox('Save/Load Parameters', parent)
+        save_load_params_group = self._save_load_params_group
+        save_load_params_group.setStyleSheet("""
+            QGroupBox {
+                border: 2px outset #b0b0b0;
+                border-radius: 3px;
+                margin-top: 0px;
+                padding-top: 15px;
+                background-color: palette(window);
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 2px 5px;
+                background-color: palette(window);
+                border: 2px inset #b0b0b0;
+                font-weight: bold;
+                top: 3px;
+                left: 3px;
+            }
+        """)
+
+        param_file_row = QHBoxLayout(save_load_params_group)
+        param_file_row.setContentsMargins(5, 15, 5, 5)
+
+        self._create_config_file_button = QPushButton('Create Binary Parameter File', save_load_params_group)
+        self._create_config_file_button.clicked.connect(self._on_create_config_file_clicked)
+        param_file_row.addWidget(self._create_config_file_button)
+
+        self._read_config_file_button = QPushButton('Read Binary Parameter File', save_load_params_group)
+        self._read_config_file_button.clicked.connect(self._on_read_config_file_clicked)
+        param_file_row.addWidget(self._read_config_file_button)
+
+        self._create_config_file_json_button = QPushButton('Create Text Parameter File', save_load_params_group)
+        self._create_config_file_json_button.clicked.connect(self._on_create_config_file_json_clicked)
+        param_file_row.addWidget(self._create_config_file_json_button)
+
+        self._read_config_file_json_button = QPushButton('Read Text Parameter File', save_load_params_group)
+        self._read_config_file_json_button.clicked.connect(self._on_read_config_file_json_clicked)
+        param_file_row.addWidget(self._read_config_file_json_button)
+
+        param_file_row.addStretch(1)
+
         left_column.addWidget(param_file_manage_group)
+        left_column.addWidget(save_load_params_group)
 
         return left_column
 
@@ -1075,29 +1195,13 @@ class SpoolControllerPanel(QDialog):
         if deleted_count > 0:
             logger.info('Deleted %d ParamSet groupbox(es)', deleted_count)
 
-    def _on_create_config_file_clicked(self):
+    def _extract_param_set_file_from_ui(self) -> bool:
         '''
-        @brief    Handle Create Config File button click.
-        @return   None
+        @brief    Clear self._param_set_file and repopulate it (Design Constants fields plus all
+                  open ParamSet groupboxes) from the current UI field values, then recalculate its CRC.
+        @return   True on success; False if a field failed to parse (an error dialog was already shown).
         '''
 
-        # Prompt user for save destination before doing any work
-        dialog = QFileDialog(self)
-        dialog.setWindowTitle('Save Config File')
-        dialog.setAcceptMode(QFileDialog.AcceptSave)
-        dialog.setFileMode(QFileDialog.AnyFile)
-        dialog.setNameFilter('Binary config files (*.bin);;All files (*.*)')
-        dialog.setDefaultSuffix('bin')
-
-        if not dialog.exec_():
-            return
-
-        selected_files = dialog.selectedFiles()
-        if not selected_files:
-            return
-        save_path = selected_files[0]
-
-        # Clear any existing data in the ParamSetFile before populating with current field values
         self._param_set_file.clear()
 
         temp_design_constants = DesignConstantsSetPayload()
@@ -1116,13 +1220,12 @@ class SpoolControllerPanel(QDialog):
                     parent=self,
                     blocking=True,
                 )
-                return
+                return False
         self._param_set_file.set_design_constants(temp_design_constants)
+
         # Extract current field values from all open ParamSet groupboxes.
-        extracted_param_sets = {}
         for param_set_id, _groupbox in self._param_set_groupboxes.items():
             field_inputs = self._param_set_field_inputs.get(param_set_id, {})
-            fields = {}
             temp_param_set_payload = ParamSetPayload()
 
             # Set the param_set_id
@@ -1136,15 +1239,11 @@ class SpoolControllerPanel(QDialog):
                     parent=self,
                     blocking=True,
                 )
-                return
+                return False
 
             # Extract and set field values
             for field_name, (textbox, field_type, *_) in field_inputs.items():
                 raw_value = textbox.text().strip()
-                fields[field_name] = {
-                    'value': raw_value,
-                    'type': field_type,
-                }
                 try:
                     value = self._parse_value(field_type, raw_value)
                     setattr(temp_param_set_payload, field_name, value)
@@ -1156,56 +1255,22 @@ class SpoolControllerPanel(QDialog):
                         parent=self,
                         blocking=True,
                     )
-                    return
+                    return False
 
             # Add the populated payload to the param set file
             self._param_set_file.add_param_set(temp_param_set_payload)
-            extracted_param_sets[param_set_id] = fields
 
-        logger.info('Extracted fields from %d ParamSet groupboxes', len(extracted_param_sets))
-        # Calculate the CRC
+        logger.info('Extracted fields from %d ParamSet groupboxes', len(self._param_set_groupboxes))
         self._param_set_file.calculate_crc()
+        return True
 
-        # Serialize and write to file
-        try:
-            data = self._param_set_file.serialize()
-            with open(save_path, 'wb') as f:
-                f.write(data)
-            logger.info('Config file written to %s (%d bytes)', save_path, len(data))
-            self._show_ok_dialog('Create Config File', f'Config file saved to:\n{save_path}')
-        except Exception as ex:
-            logger.exception('Failed to write config file: %s', ex)
-            show_error('Save Error', 'Could not write config file.', str(ex), parent=self, blocking=True)
-
-    def _on_read_config_file_clicked(self):
+    def _populate_ui_from_param_set_file(self, source_description: str) -> None:
         '''
-        @brief    Handle Read Config File button click.
+        @brief    Populate the Design Constants fields, ParamSet groupboxes, and version/CRC/dirty
+                  textboxes from the currently loaded self._param_set_file.
+        @param    source_description - Human-readable description of where the file came from, for logging.
         @return   None
         '''
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            'Read Config File',
-            '',
-            'Binary config files (*.bin);;All files (*.*)'
-        )
-        if not filename:
-            return
-
-        try:
-            with open(filename, 'rb') as file_handle:
-                data = file_handle.read()
-        except Exception as ex:
-            logger.exception('Failed to read config file: %s', ex)
-            show_error('Read Error', 'Could not read config file.', str(ex), parent=self, blocking=True)
-            return
-
-        try:
-            self._param_set_file.clear()
-            self._param_set_file.deserialize(data)
-        except Exception as ex:
-            logger.exception('Failed to deserialize config file: %s', ex)
-            show_error('Read Error', 'Could not parse config file.', str(ex), parent=self, blocking=True)
-            return
 
         self._clear_all_param_set_groupboxes()
 
@@ -1232,8 +1297,143 @@ class SpoolControllerPanel(QDialog):
         self._version_textbox.setText(str(self._param_set_file._version))
         self._crc32_textbox.setText(f'{self._param_set_file.calculate_crc():08X}')
         self._dirty_textbox.setText('False')
-        logger.info('Config file loaded from %s with %d ParamSet entries', filename, self._param_set_file._num_param_set)
+        logger.info('Config loaded from %s with %d ParamSet entries', source_description, self._param_set_file._num_param_set)
+
+    def _on_create_config_file_clicked(self):
+        '''
+        @brief    Handle Create Config File button click.
+        @return   None
+        '''
+
+        # Prompt user for save destination before doing any work
+        dialog = QFileDialog(self)
+        dialog.setWindowTitle('Save Config File')
+        dialog.setAcceptMode(QFileDialog.AcceptSave)
+        dialog.setFileMode(QFileDialog.AnyFile)
+        dialog.setNameFilter(ParamSetFile.BIN_FILTER)
+        dialog.setDefaultSuffix(ParamSetFile.BIN_EXTENSION)
+
+        if not dialog.exec_():
+            return
+
+        selected_files = dialog.selectedFiles()
+        if not selected_files:
+            return
+        save_path = selected_files[0]
+
+        if not self._extract_param_set_file_from_ui():
+            return
+
+        # Serialize and write to file
+        try:
+            data = self._param_set_file.serialize()
+            with open(save_path, 'wb') as f:
+                f.write(data)
+            logger.info('Config file written to %s (%d bytes)', save_path, len(data))
+            self._show_ok_dialog('Create Config File', f'Config file saved to:\n{save_path}')
+        except Exception as ex:
+            logger.exception('Failed to write config file: %s', ex)
+            show_error('Save Error', 'Could not write config file.', str(ex), parent=self, blocking=True)
+
+    def _on_read_config_file_clicked(self):
+        '''
+        @brief    Handle Read Config File button click.
+        @return   None
+        '''
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            'Read Config File',
+            '',
+            ParamSetFile.BIN_FILTER
+        )
+        if not filename:
+            return
+
+        try:
+            with open(filename, 'rb') as file_handle:
+                data = file_handle.read()
+        except Exception as ex:
+            logger.exception('Failed to read config file: %s', ex)
+            show_error('Read Error', 'Could not read config file.', str(ex), parent=self, blocking=True)
+            return
+
+        try:
+            self._param_set_file.clear()
+            self._param_set_file.deserialize(data)
+        except Exception as ex:
+            logger.exception('Failed to deserialize config file: %s', ex)
+            show_error('Read Error', 'Could not parse config file.', str(ex), parent=self, blocking=True)
+            return
+
+        self._populate_ui_from_param_set_file(filename)
         self._show_ok_dialog('Read Config File', f'Config file loaded from:\n{filename}')
+
+    def _on_create_config_file_json_clicked(self):
+        '''
+        @brief    Handle Create Config File (JSON) button click.
+        @return   None
+        '''
+
+        # Prompt user for save destination before doing any work
+        dialog = QFileDialog(self)
+        dialog.setWindowTitle('Save Config File (JSON)')
+        dialog.setAcceptMode(QFileDialog.AcceptSave)
+        dialog.setFileMode(QFileDialog.AnyFile)
+        dialog.setNameFilter(ParamSetFile.JSON_FILTER)
+        dialog.setDefaultSuffix(ParamSetFile.JSON_EXTENSION)
+
+        if not dialog.exec_():
+            return
+
+        selected_files = dialog.selectedFiles()
+        if not selected_files:
+            return
+        save_path = selected_files[0]
+
+        if not self._extract_param_set_file_from_ui():
+            return
+
+        try:
+            json_str = self._param_set_file.toJSON()
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(json_str)
+            logger.info('Config file written to %s (%d bytes)', save_path, len(json_str))
+            self._show_ok_dialog('Create Config File (JSON)', f'Config file saved to:\n{save_path}')
+        except Exception as ex:
+            logger.exception('Failed to write JSON config file: %s', ex)
+            show_error('Save Error', 'Could not write JSON config file.', str(ex), parent=self, blocking=True)
+
+    def _on_read_config_file_json_clicked(self):
+        '''
+        @brief    Handle Read Config File (JSON) button click.
+        @return   None
+        '''
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            'Read Config File (JSON)',
+            '',
+            ParamSetFile.JSON_FILTER
+        )
+        if not filename:
+            return
+
+        try:
+            with open(filename, 'r', encoding='utf-8') as file_handle:
+                json_str = file_handle.read()
+        except Exception as ex:
+            logger.exception('Failed to read JSON config file: %s', ex)
+            show_error('Read Error', 'Could not read JSON config file.', str(ex), parent=self, blocking=True)
+            return
+
+        try:
+            self._param_set_file = ParamSetFile.fromJSON(json_str)
+        except Exception as ex:
+            logger.exception('Failed to parse JSON config file: %s', ex)
+            show_error('Read Error', 'Could not parse JSON config file.', str(ex), parent=self, blocking=True)
+            return
+
+        self._populate_ui_from_param_set_file(filename)
+        self._show_ok_dialog('Read Config File (JSON)', f'Config file loaded from:\n{filename}')
 
     def _clear_all_param_set_groupboxes(self):
         '''
@@ -1708,7 +1908,7 @@ class SpoolControllerPanel(QDialog):
                 return False
         return left_value == right_value
 
-    def _show_ok_dialog(self, title, message):
+    def _show_ok_dialog(self, title, message, success = False):
         '''
         @brief    Show a warning dialog with a title, message, and a single OK button.
         @param    title - Dialog window title.
@@ -1716,7 +1916,10 @@ class SpoolControllerPanel(QDialog):
         @return   None
         '''
         dlg = QMessageBox(self)
-        dlg.setIcon(QMessageBox.Warning)
+        if not success:
+            dlg.setIcon(QMessageBox.Warning)
+        else:
+            dlg.setIcon(QMessageBox.Information)
         dlg.setWindowTitle(str(title))
         dlg.setText(str(message))
         dlg.setStandardButtons(QMessageBox.Ok)
