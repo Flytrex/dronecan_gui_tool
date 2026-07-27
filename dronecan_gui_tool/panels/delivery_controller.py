@@ -9,15 +9,19 @@
 #
 
 import dronecan
+from dronecan.transport import get_active_union_field
 from functools import partial
+from enum import IntEnum
 from logging import getLogger
 import threading
 import os
+import math
 import re
 import xml.etree.ElementTree as ET
+from typing import Optional, Any, Callable
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QIntValidator, QColor
+from PyQt5.QtGui import QIntValidator, QColor, QDoubleValidator
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy
 import numpy as np
@@ -32,33 +36,129 @@ logger = getLogger(__name__)
 
 _singleton = None
 
+class CommsHelper:
+    # a subset of dronecan_comm from the TCA code
+    def __init__(self, node):
+        self._node = node
 
-class DeliveryControllerPanel(QDialog):
+    def request(self,
+                message: Any,
+                dest_node_id: int,
+                callback: Optional[Callable[..., None]] = None,
+                timeout: Optional[float] = None,
+                **kwargs: Any) -> Any:
 
-    HC_MODES = {
-        'INITIAL'               : 0,
-        'ALIGN_ENCODER'         : 1,
-        'HOMING'                : 2,
-        # reserved1
-        'DIRECT_OVERRIDE'       : 4,
-        'HALT'                  : 5,
-        'GROUND_UNLOAD'         : 6,
-        # reserved2
-        'HOOK_STAGING'          : 8,
-        'LIFT_PACKAGE'          : 9,
-        # reserved3
-        'LANDING'               : 11,
-        'PREPAPRE_FOR_DELIVERY' : 12,
-        'DELIVERY'              : 13,
-        'RELEASE_WIRE'          : 14
-    }
+        node = self._node
+
+        try:
+            if callback:
+                # Asynchronous request
+                node.request(message, dest_node_id, callback, canfd=True, **kwargs)
+                logger.debug("Sent async request: %s to node %s", message.__class__, dest_node_id)
+                return None
+            # Synchronous request
+            # pylint: disable=assignment-from-no-return
+            response = node.request(message, dest_node_id, timeout=timeout, canfd=True, **kwargs)
+            logger.debug("Sent sync request: %s to node %s", message.__class__, dest_node_id)
+            return response
+        except Exception as ex:
+            raise RuntimeError("Failed to send request") from ex
+
+    @staticmethod
+    def _make_param_value(param_value: Any):
+        v = dronecan.uavcan.protocol.param.Value()  # pylint: disable=no-member
+        if isinstance(param_value, bool):
+            v.boolean_value = int(param_value)
+        elif isinstance(param_value, int):
+            v.integer_value = param_value
+        elif isinstance(param_value, float):
+            v.real_value = param_value
+        return v
+
+    @staticmethod
+    def _extract_param_value(value) -> Any:
+        field = get_active_union_field(value)
+        raw = getattr(value, field)
+        return {'integer_value': int, 'real_value': float, 'boolean_value': bool}.get(field, lambda x: None)(raw)
+
+    def set_param(self, node_id: int, name: str, value: Any) -> None:
+        req = dronecan.uavcan.protocol.param.GetSet.Request(  # pylint: disable=no-member
+            name=name, value=self._make_param_value(value))
+        response_event = threading.Event()
+        def _callback(event: Any) -> None:
+            if event:
+                response_event.set()
+        logger.info("Setting parameter %s to %s on node %d", name, value, node_id)
+        self.request(req, node_id, callback=_callback, timeout=2.0)
+        assert response_event.wait(timeout=3.0), f"No response to param set for {name}"
+
+    def set_verify_param(self, node_id: int, name: str, value: Any) -> None:
+        """Set a parameter and verify by reading it back."""
+        self.set_param(node_id, name, value)
+        read_back = self.get_param(node_id, name)
+        if isinstance(read_back, float):
+            assert math.isclose(read_back, value, rel_tol=1e-4), (
+                f"{name} verification failed: expected {value}, got {read_back}"
+            )
+        else:
+            assert read_back == value, (
+                f"{name} verification failed: expected {value}, got {read_back}"
+            )
+
+    def get_param(self, node_id: int, name: str) -> Any:
+        req = dronecan.uavcan.protocol.param.GetSet.Request(name=name)  # pylint: disable=no-member
+        response_event = threading.Event()
+        response_data = {}
+
+        def _callback(event: Any) -> None:
+            if event:
+                response_data['value'] = self._extract_param_value(event.response.value)
+            response_event.set()
+
+        self.request(req, node_id, callback=_callback, timeout=2.0)
+        assert response_event.wait(timeout=3.0), f"No response to param get for {name}"
+        return response_data.get('value')
+
+
+class DeliveryControllerModeCommand:
+    PARAM_LATCH = 'API_EXECUTE_LATCH'
+    PARAM_SET_MODE = 'API_ARG_MODE_SELECT'
+    PARAM_SET_WIRE_EXTENSION = 'API_ARG_WIRE_EXTENSION_M'
+
+    class HCMode(IntEnum):
+        INITIAL                 = 0
+        ALIGN_ENCODER           = 1
+        HOMING                  = 2
+        RESERVED1               = 3
+        DIRECT_OVERRIDE         = 4
+        HALT                    = 5
+        GROUND_UNLOAD           = 6
+        RESERVED2               = 7
+        HOOK_STAGING            = 8
+        LIFT_PACKAGE            = 9
+        RESERVED3               = 10
+        LANDING                 = 11
+        PREPARE_FOR_DELIVERY    = 12
+        DELIVERY                = 13
+        RELEASE_WIRE            = 14
 
     REQUEST_PRIORITY = 30
 
-    SET_MODE = 'Set Mode'
-    SET_WIRE_LENGTH_LOWER = 'Set Wire Length Lower'
-    SET_WIRE_LENGTH_LIFT = 'Set Wire Length Lift'
+    def __init__(self, mode : HCMode, wire_extension : float = 0.0):
+        self._mode = mode
+        self._wire_extension = wire_extension
 
+    def _execute(self, comms_helper : CommsHelper, node_id : int):
+        comms_helper.set_verify_param(node_id, 'API_ARG_MODE_SELECT', int(self._mode))
+        comms_helper.set_verify_param(node_id, 'API_ARG_WIRE_EXTENSION_M', self._wire_extension)
+        latch = comms_helper.get_param(node_id, 'API_EXECUTE_LATCH')
+        comms_helper.set_verify_param(node_id, 'API_EXECUTE_LATCH', latch + 1)
+
+    def send(self, comms_helper : CommsHelper, node_id : int):
+        threading.Thread(target=self._execute, args=(comms_helper, node_id,)).start()
+
+
+class DeliveryControllerPanel(QDialog):
     def show_message(self, text, *fmt) -> None:
         """Best-effort status reporting (main window status bar if available)."""
         try:
@@ -99,6 +199,8 @@ class DeliveryControllerPanel(QDialog):
         self.setMinimumSize(700, 400)
 
         self._node = node
+        self._comms_helper = CommsHelper(node)
+
         # Load initial fields from XML in the config directory. This is just a starting point; the user can edit and save to other files.
         self._xml_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'delivery_controller_fields.xml')
         self._live_param_read_thread: threading.Thread | None = None
@@ -164,24 +266,19 @@ class DeliveryControllerPanel(QDialog):
         mode_layout.setColumnStretch(1, 1)
 
         self._active_mode_combo = QComboBox(mode_group)
-        for k, v in DeliveryControllerPanel.HC_MODES:
-            self._active_mode_combo.addItem(k, v)
+        for e in DeliveryControllerModeCommand.HCMode:
+            self._active_mode_combo.addItem(e.name, e.value)
         self._active_mode_combo.setCurrentIndex(0)
-        self._set_mode_btn = QPushButton('Set Mode', mode_group)
-        self._set_wire_length_lower_btn = QPushButton('Set Wire Length Lower', mode_group)
-        self._wire_length_lower_edit = QLineEdit(mode_group)
-        self._wire_length_lower_edit.setPlaceholderText('Length')
-        self._set_wire_length_lift_btn = QPushButton('Set Wire Length Lift', mode_group)
-        self._wire_length_lift_edit = QLineEdit(mode_group)
-        self._wire_length_lift_edit.setPlaceholderText('Length')
+        self._mode_cmd_button = QPushButton('Mode Command', mode_group)
+        self._mode_cmd_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self._wire_length_edit = QLineEdit(mode_group)
+        self._wire_length_edit.setValidator(QDoubleValidator(-10.0, 100.0, 2))
+        self._wire_length_edit.setText('0.0')
 
         # Buttons aligned in column 0, inputs in column 1
-        mode_layout.addWidget(self._set_mode_btn, 0, 0)
+        mode_layout.addWidget(self._mode_cmd_button, 0, 0, 2, 1)
         mode_layout.addWidget(self._active_mode_combo, 0, 1)
-        mode_layout.addWidget(self._set_wire_length_lower_btn, 1, 0)
-        mode_layout.addWidget(self._wire_length_lower_edit, 1, 1)
-        mode_layout.addWidget(self._set_wire_length_lift_btn, 2, 0)
-        mode_layout.addWidget(self._wire_length_lift_edit, 2, 1)
+        mode_layout.addWidget(self._wire_length_edit, 1, 1)
 
         # Params controls
         params_group = QGroupBox('Params', controls_group)
@@ -208,9 +305,7 @@ class DeliveryControllerPanel(QDialog):
         self._set_params_btn.clicked.connect(self._on_set_params_clicked)
         self._get_params_btn.clicked.connect(self._on_get_params_clicked)
         self._live_param_read_btn.toggled.connect(self._on_live_param_read_toggled)
-        self._set_mode_btn.clicked.connect(self._on_set_mode_clicked)
-        self._set_wire_length_lower_btn.clicked.connect(self._on_set_wire_length_lower_clicked)
-        self._set_wire_length_lift_btn.clicked.connect(self._on_set_wire_length_lift_clicked)
+        self._mode_cmd_button.clicked.connect(self._on_mode_cmd_clicked)
 
         self._load_fields_into_table(self._xml_path)
         self._start_auto_node_id_lookup()
@@ -587,127 +682,31 @@ class DeliveryControllerPanel(QDialog):
             return None
         return node_id
 
-    def _on_set_mode_clicked(self) -> None:
+    def _on_mode_cmd_clicked(self) -> None:
         '''
         @brief    Handle Set Mode button click.
         @return   None
         '''
 
-        def _on_response(e):
-            if e is None:
-                self.show_message('Request timed out')
-            else:
-                logger.info('Param get/set response: %s', e.response)
-                self.show_message('Response received')
+        def _get_wire_ext():
+            text = self._wire_length_edit.text().strip()
+            # Convert to float16 (half precision) then back to Python float.
+            return float(np.float16(text))
 
         node_id = self._get_target_node_id()
+
         if node_id is None:
             return
 
         try:
-            mode = int(self._active_mode_combo.currentData())
-            msg = dronecan.uavcan.protocol.param.GetSet.Request(
-                name=self._encode_param_name(self.SET_MODE),
-                value=dronecan.uavcan.protocol.param.Value(integer_value=mode),
-            )
+            new_mode = DeliveryControllerModeCommand.HCMode(int(self._active_mode_combo.currentData()))
+            cmd = DeliveryControllerModeCommand(new_mode, _get_wire_ext())
+            cmd.send(self._comms_helper, node_id)
+        except AssertionError as ex:
+            logger.exception('Failed to set parameter: %s', ex)
         except Exception as ex:
             logger.exception('SetActiveMode type not available: %s', ex)
             return
-
-        try:
-            self._node.request(msg, node_id, _on_response, priority=self.REQUEST_PRIORITY, canfd=True)
-            logger.info('Send %s for target node %s', self.SET_MODE, node_id)
-        except Exception as ex:
-            logger.exception('Failed to broadcast %s: %s', self.SET_MODE, ex)
-            show_error('Send failed', f'Could not broadcast {self.SET_MODE}.', ex, parent=self)
-
-    def _on_set_wire_length_lower_clicked(self) -> None:
-        '''
-        @brief    Handle Set Wire Length Lower button click.
-        @return   None
-        '''
-
-        def _on_response(e):
-            if e is None:
-                self.show_message('Request timed out')
-            else:
-                logger.info('Param get/set response: %s', e.response)
-                self.show_message('Response received')
-
-        node_id = self._get_target_node_id()
-        if node_id is None:
-            return
-
-        wire_len = 0.0
-
-        try:
-            text = self._wire_length_lower_edit.text().strip()
-            # Convert to float16 (half precision) then back to Python float.
-            wire_len = float(np.float16(text))
-        except Exception as ex:
-            logger.exception('Invalid wire length lower value: %s', ex)
-            show_error('Invalid Value', 'Wire Length Lower must be a floating point number.', text, parent=self)
-            return
-
-        try:
-            msg = dronecan.uavcan.protocol.param.GetSet.Request(
-                name=self._encode_param_name(self.SET_WIRE_LENGTH_LOWER),
-                value=dronecan.uavcan.protocol.param.Value(real_value=float(wire_len)),
-            )
-        except Exception as ex:
-            logger.exception('GetSet type not available: %s', ex)
-            return
-
-        try:
-            self._node.request(msg, node_id, _on_response, priority=self.REQUEST_PRIORITY, canfd=True)
-            logger.info('Send %s for target node %s', self.SET_WIRE_LENGTH_LOWER, node_id)
-        except Exception as ex:
-            logger.exception('Failed to send %s: %s', self.SET_WIRE_LENGTH_LOWER, ex)
-            show_error('Send failed', f'Could not send {self.SET_WIRE_LENGTH_LOWER}.', ex, parent=self)
-
-    def _on_set_wire_length_lift_clicked(self) -> None:
-        '''
-        @brief    Handle Set Wire Length Lift button click.
-        @return   None
-        '''
-
-        def _on_response(e):
-            if e is None:
-                self.show_message('Request timed out')
-            else:
-                logger.info('Param get/set response: %s', e.response)
-                self.show_message('Response received')
-
-        node_id = self._get_target_node_id()
-        if node_id is None:
-            return
-
-        wire_len = 0.0
-
-        try:
-            text = self._wire_length_lift_edit.text().strip()
-            # Convert to float16 (half precision) then back to Python float.
-            wire_len = float(np.float16(text))
-        except Exception as ex:
-            logger.exception('Invalid wire length lift value: %s', ex)
-            show_error('Invalid Value', 'Wire Length Lift must be a floating point number.', text, parent=self)
-            return
-
-        try:
-            msg = dronecan.uavcan.protocol.param.GetSet.Request(
-                name=self._encode_param_name(self.SET_WIRE_LENGTH_LIFT),
-                value=dronecan.uavcan.protocol.param.Value(real_value=float(wire_len)),
-            )
-        except Exception as ex:
-            logger.exception('GetSet type not available: %s', ex)
-            return
-
-        try:
-            self._node.request(msg, node_id, _on_response, priority=self.REQUEST_PRIORITY, canfd=True)
-            logger.info('Send %s for target node %s', self.SET_WIRE_LENGTH_LIFT, node_id)
-        except Exception as ex:
-            logger.exception('Failed to send %s: %s', self.SET_WIRE_LENGTH_LIFT, ex)
-            show_error('Send failed', f'Could not send {self.SET_WIRE_LENGTH_LIFT}.', ex, parent=self)
 
     def _on_set_params_clicked(self) -> None:
         '''
