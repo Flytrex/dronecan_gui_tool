@@ -1,26 +1,58 @@
 {
-    "wire_diameter": {
+    "spool_width_m": {
         "type": "float32",
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "",
+        "comment": "The width of the spool in meters",
         "color": "black"
     },
-    "barrel_diameter": {
+    "wire_diameter_m": {
         "type": "float32",
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The diameter of the barrel in meters",
+        "comment": "Diameter of the wire in meters",
         "color": "black"
     },
-    "spool_width": {
+    "spool_barrel_diameter_m": {
         "type": "float32",
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The width of the spool",
+        "comment": "The diameter of the spool's barrel in meters",
+        "color": "black"
+    },
+    "horizontal_packing": {
+        "type": "float32",
+        "default": 0,
+        "min_val": 0,
+        "max_val": 100,
+        "comment": "Horizontal packing efficiency factor of the wound wire",
+        "color": "black"
+    },
+    "radial_packing": {
+        "type": "float32",
+        "default": 0,
+        "min_val": 0,
+        "max_val": 100,
+        "comment": "Radial packing efficiency factor of the wound wire",
+        "color": "black"
+    },
+    "total_wire_length_m": {
+        "type": "float32",
+        "default": 0,
+        "min_val": 0,
+        "max_val": 100,
+        "comment": "The wire's total length in meters",
+        "color": "black"
+    },
+    "dead_wire_length_m": {
+        "type": "float32",
+        "default": 0,
+        "min_val": 0,
+        "max_val": 100,
+        "comment": "The length of wire permanently wound on the spool that can't be deployed",
         "color": "black"
     },
     "gearbox_ratio": {
@@ -28,23 +60,37 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "",
+        "comment": "Gearbox ratio",
         "color": "black"
     },
-    "wire_packing_efficiencies": {
+    "reverse_phase_sequence": {
+        "type": "bool",
+        "default": 0,
+        "comment": "Reverse the motor's phase sequence",
+        "color": "black"
+    },
+    "torque_constant_Nm_A": {
         "type": "float32",
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "",
+        "comment": "The motor's torque constant, in Newton-meters per Ampere",
         "color": "black"
     },
-    "total_length_of_spooled_wire": {
+    "homing_max_torque_Nm": {
         "type": "float32",
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The wire's total length in meters",
+        "comment": "The maximum torque allowed while homing, in Newton-meters",
+        "color": "black"
+    },
+    "homing_window_ms": {
+        "type": "uint32",
+        "default": 0,
+        "min_val": 0,
+        "max_val": 100,
+        "comment": "The time window used by the homing detector, in milliseconds",
         "color": "black"
     }
 }

@@ -18,6 +18,7 @@ import json
 import random
 import xml.etree.ElementTree as ET
 import struct
+import ctypes
 
 from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer, pyqtSignal
 from PyQt5.QtGui import QIntValidator, QColor, QFont
@@ -27,11 +28,11 @@ import numpy as np
 
 from ..widgets import get_icon, show_error
 from ..widgets.file_server import FileServer_PathKey
-from .utils import calculate_crc32
+from .utils import crc32_stm32_batch
 
 __all__ = 'PANEL_NAME', 'spawn', 'get_icon'
 
-PANEL_NAME = 'Spool Controller'                    # Main panel window title
+PANEL_NAME = 'Delivery Controller: Spool'           # Main panel window title
 SPOOL_CONTROLLER_TUNE_NAME = 'Spool Controller Tuning'  # Header label for the tuning section
 PARAM_FILE_MANAGE_NAME = 'Parameter File Management'    # Label for the file upload/download section
 DESIGN_CONSTANTS_TUNE_NAME = 'DesignConstantsSet Tuning'  # Label for the design constants section header
@@ -41,7 +42,7 @@ PARAM_SET_ID_NAME = 'ParamSet ID'                   # Label next to the ParamSet
 PARAM_SET_NAME = 'ParamSet'                         # Prefix for individual ParamSet groupbox titles
 
 BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) between buttons in button rows
-PARAM_SET_GROUPBOX_HEIGHT = 200                     # Fixed height (px) for each ParamSet editing groupbox
+PARAM_SET_GROUPBOX_HEIGHT = 500                     # Fixed height (px) for each ParamSet editing groupbox
 PARAM_SET_GROUPBOX_WIDTH = 410                      # Fixed width (px) for each ParamSet editing groupbox
 RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
 CONFIG_FILE_TRANSFER_TIMEOUT = 30                   # Number of seconds to wait for a config file upload/download to complete before showing a timeout error dialog
@@ -72,32 +73,35 @@ logger = getLogger(__name__)
 
 _singleton = None
 
-class DesignConstantsSetPayload:
+class DesignConstantsSetPayload(ctypes.LittleEndianStructure):
 	'''
 	@brief    Class representing the payload of a DesignConstantsSet message, responsible for parsing and storing field values.
+	@         Must match `design_constants_set_t` (see the Delivery Controller firmware) field-for-field, including
+	@         its explicit trailing pad bytes; `homing_window_ms` is FreeRTOS's `TickType_t`, assumed to be 32-bit here.
 	'''
-	FORMAT = '<6f'
-	SIZE = struct.calcsize(FORMAT)
+	_pack_ = 1
+	SIZE: int
+	_fields_ = [
+		('spool_width_m', ctypes.c_float),
+		('wire_diameter_m', ctypes.c_float),
+		('spool_barrel_diameter_m', ctypes.c_float),
+		('horizontal_packing', ctypes.c_float),
+		('radial_packing', ctypes.c_float),
+		('total_wire_length_m', ctypes.c_float),
+		('dead_wire_length_m', ctypes.c_float),
+		('gearbox_ratio', ctypes.c_float),
 
-	wire_diameter: float = 0.0                      # The diameter of the wire used in the delivery system. 4 bytes
-	barrel_diameter: float = 0.0                    # The inner diameter of the barrel through which the payload is delivered. 4 bytes
-	spool_width: float = 0.0                        # The width of the spool that holds the wire. 4 bytes
-	gearbox_ratio: float = 0.0                      # The gear ratio of the spool controller's motor gearbox. 4 bytes
-	wire_packing_efficiencies: float = 0.0          # The efficiency of wire packing on the spool. 4 bytes
-	total_length_of_spooled_wire: float = 0.0       # The total length of wire currently spooled, used for calculating remaining wire and feed rate. 4 bytes
-
-	def __init__(self):
-		self.wire_diameter = 0.0
-		self.barrel_diameter = 0.0
-		self.spool_width = 0.0
-		self.gearbox_ratio = 0.0
-		self.wire_packing_efficiencies = 0.0
-		self.total_length_of_spooled_wire = 0.0
+		('homing_max_torque_Nm', ctypes.c_float),
+		('homing_window_ms', ctypes.c_uint32),
+		('torque_constant_Nm_A', ctypes.c_float),
+		('_pad', ctypes.c_uint8 * 3),
+		('reverse_phase_sequence', ctypes.c_bool),
+	]
 
 	def set(self, **kwargs):
 		'''
 		@brief    Set multiple fields of the DesignConstantsSetPayload at once using keyword arguments.
-		@param    kwargs - Field names and values to set (e.g. wire_diameter=0.5, spool_width=10.0).
+		@param    kwargs - Field names and values to set (e.g. spool_width_m=0.5, gearbox_ratio=10.0).
 		@return   None
 		'''
 		for key, value in kwargs.items():
@@ -111,14 +115,7 @@ class DesignConstantsSetPayload:
 		@brief    Serialize the DesignConstantsSetPayload to bytes.
 		@return   Bytes array containing the serialized payload.
 		'''
-		return struct.pack(self.FORMAT,
-			self.wire_diameter,
-			self.barrel_diameter,
-			self.spool_width,
-			self.gearbox_ratio,
-			self.wire_packing_efficiencies,
-			self.total_length_of_spooled_wire
-		)
+		return bytes(self)
 
 	def deserialize(self, data, offset=0):
 		'''
@@ -128,63 +125,61 @@ class DesignConstantsSetPayload:
 		@return   Next offset after parsing this payload.
 		'''
 		buffer = memoryview(data)
-		end = offset + self.SIZE
+		size = ctypes.sizeof(self)
+		end = offset + size
 		if end > len(buffer):
-			raise ValueError(f'Not enough data to deserialize DesignConstantsSetPayload: need {self.SIZE} bytes from offset {offset}, got {len(buffer) - offset}')
+			raise ValueError(f'Not enough data to deserialize DesignConstantsSetPayload: need {size} bytes from offset {offset}, got {len(buffer) - offset}')
 
-		(
-			wire_diameter,
-			barrel_diameter,
-			spool_width,
-			gearbox_ratio,
-			wire_packing_efficiencies,
-			total_length_of_spooled_wire,
-		) = struct.unpack_from(self.FORMAT, buffer, offset)
-
-		self.wire_diameter = wire_diameter
-		self.barrel_diameter = barrel_diameter
-		self.spool_width = spool_width
-		self.gearbox_ratio = gearbox_ratio
-		self.wire_packing_efficiencies = wire_packing_efficiencies
-		self.total_length_of_spooled_wire = total_length_of_spooled_wire
+		ctypes.memmove(ctypes.addressof(self), bytes(buffer[offset:end]), size)
 		return end
 
-class ParamSetPayload:
+
+DesignConstantsSetPayload.SIZE = ctypes.sizeof(DesignConstantsSetPayload)
+
+class ParamSetPayload(ctypes.LittleEndianStructure):
 	'''
 	@brief    Class representing the payload of a ParamSet message, responsible for parsing and storing field values.
+	@         Must match paramset-manager's `param_set_t` (see the Delivery Controller firmware) field-for-field.
+	@		  TODO: automatically generate this based on the actual param_set_t defintion?
 	'''
-	FORMAT = '<H?9f'
-	SIZE = struct.calcsize(FORMAT)
+	_pack_ = 1
+	SIZE: int
+	_fields_ = [
+		('param_set_id', ctypes.c_uint16),
 
-	param_set_id: int = 0                           # The ID of the ParamSet, used to identify which set of parameters is being edited or applied. 2 bytes
-	load_not_shaft_control: bool = False            # Whether the spool controller should operate in load control mode (true) or shaft control mode (false). 1 byte
-	shaft_pos_rad: float = 0.0                      # The target shaft position in radians, used when load_not_shaft_control is false. 4 bytes
-	completion_time_s: float = 0.0                  # The desired time in seconds to complete the movement to the target position or load. 4 bytes
-	min_torque_Nm: float = 0.0                      # The minimum torque in Newton-meters that the controller should apply during the movement. 4 bytes
-	max_torque_Nm: float = 0.0                      # The maximum torque in Newton-meters that the controller should apply during the movement. 4 bytes
-	obs_tension_detector_min_torque_Nm: float = 0.0  # The minimum torque threshold in Newton-meters for the obstacle tension detector, used to detect if the payload is snagged on an obstacle. 4 bytes
-	obs_tension_detector_window_s: float = 0.0       # The time window in seconds for the obstacle tension detector to evaluate if the torque has been below the threshold for long enough to indicate a snag. 4 bytes
-	obs_traj_deviation_pos_m: float = 0.0           # The position deviation threshold in meters for the obstacle trajectory deviation detector, used to detect if the payload is snagged on an obstacle based on unexpected deviations from the planned trajectory. 4 bytes
-	obs_traj_deviation_neg_m: float = 0.0           # The position deviation threshold in meters for the obstacle trajectory deviation detector, used to detect if the payload is snagged on an obstacle based on unexpected deviations from the planned trajectory. 4 bytes
-	obs_allowed_deviation_pos_window_s: float = 0.0  # The time window in seconds for the obstacle trajectory deviation detector to evaluate if the position has been above the positive deviation threshold for long enough to indicate a snag. 4 bytes
+		('energize', ctypes.c_bool),
+		('load_not_shaft_control', ctypes.c_bool),
+		('execute_not_hold', ctypes.c_bool),
+		('ob_hold_on_event', ctypes.c_bool),
+		('ob_autostop', ctypes.c_bool),
 
-	def __init__(self):
-		self.param_set_id = 0
-		self.load_not_shaft_control = False
-		self.shaft_pos_rad = 0.0
-		self.completion_time_s = 0.0
-		self.min_torque_Nm = 0.0
-		self.max_torque_Nm = 0.0
-		self.obs_tension_detector_min_torque_Nm = 0.0
-		self.obs_tension_detector_window_s = 0.0
-		self.obs_traj_deviation_pos_m = 0.0
-		self.obs_traj_deviation_neg_m = 0.0
-		self.obs_allowed_deviation_pos_window_s = 0.0
+		('min_effort_limit', ctypes.c_float),
+		('max_effort_limit', ctypes.c_float),
+
+		('ob_neg_departure_error', ctypes.c_float),
+		('ob_neg_departure_window_s', ctypes.c_float),
+		('ob_pos_departure_error', ctypes.c_float),
+		('ob_pos_departure_window_s', ctypes.c_float),
+		('ob_stall_min_speed', ctypes.c_float),
+		('ob_stall_window_s', ctypes.c_float),
+		('ob_target_margin', ctypes.c_float),
+		('ob_on_target_window_s', ctypes.c_float),
+		('ob_tension_min_effort', ctypes.c_float),
+		('ob_tension_max_effort', ctypes.c_float),
+		('ob_tension_window_s', ctypes.c_float),
+
+		('tg_position_setpoint', ctypes.c_float),
+		('tg_acceleration', ctypes.c_float),
+		('tg_deceleration', ctypes.c_float),
+		('tg_halt_deceleration', ctypes.c_float),
+		('tg_velocity', ctypes.c_float),
+		('tg_movement_time_s', ctypes.c_float),
+	]
 
 	def set(self, **kwargs):
 		'''
 		@brief    Set multiple fields of the ParamSetPayload at once using keyword arguments.
-		@param    kwargs - Field names and values to set (e.g. param_set_id=1, shaft_pos_rad=0.5).
+		@param    kwargs - Field names and values to set (e.g. param_set_id=1, tg_position_setpoint=0.5).
 		@return   None
 		'''
 		for key, value in kwargs.items():
@@ -198,19 +193,7 @@ class ParamSetPayload:
 		@brief    Serialize the ParamSetPayload to bytes.
 		@return   Bytes array containing the serialized payload.
 		'''
-		return struct.pack(self.FORMAT,
-			self.param_set_id,
-			self.load_not_shaft_control,
-			self.shaft_pos_rad,
-			self.completion_time_s,
-			self.min_torque_Nm,
-			self.max_torque_Nm,
-			self.obs_tension_detector_min_torque_Nm,
-			self.obs_tension_detector_window_s,
-			self.obs_traj_deviation_pos_m,
-			self.obs_traj_deviation_neg_m,
-			self.obs_allowed_deviation_pos_window_s
-		)
+		return bytes(self)
 
 	def deserialize(self, data, offset=0):
 		'''
@@ -220,36 +203,16 @@ class ParamSetPayload:
 		@return   Next offset after parsing this payload.
 		'''
 		buffer = memoryview(data)
-		end = offset + self.SIZE
+		size = ctypes.sizeof(self)
+		end = offset + size
 		if end > len(buffer):
-			raise ValueError(f'Not enough data to deserialize ParamSetPayload: need {self.SIZE} bytes from offset {offset}, got {len(buffer) - offset}')
+			raise ValueError(f'Not enough data to deserialize ParamSetPayload: need {size} bytes from offset {offset}, got {len(buffer) - offset}')
 
-		(
-			param_set_id,
-			load_not_shaft_control,
-			shaft_pos_rad,
-			completion_time_s,
-			min_torque_Nm,
-			max_torque_Nm,
-			obs_tension_detector_min_torque_Nm,
-			obs_tension_detector_window_s,
-			obs_traj_deviation_pos_m,
-			obs_traj_deviation_neg_m,
-			obs_allowed_deviation_pos_window_s,
-		) = struct.unpack_from(self.FORMAT, buffer, offset)
-
-		self.param_set_id = param_set_id
-		self.load_not_shaft_control = load_not_shaft_control
-		self.shaft_pos_rad = shaft_pos_rad
-		self.completion_time_s = completion_time_s
-		self.min_torque_Nm = min_torque_Nm
-		self.max_torque_Nm = max_torque_Nm
-		self.obs_tension_detector_min_torque_Nm = obs_tension_detector_min_torque_Nm
-		self.obs_tension_detector_window_s = obs_tension_detector_window_s
-		self.obs_traj_deviation_pos_m = obs_traj_deviation_pos_m
-		self.obs_traj_deviation_neg_m = obs_traj_deviation_neg_m
-		self.obs_allowed_deviation_pos_window_s = obs_allowed_deviation_pos_window_s
+		ctypes.memmove(ctypes.addressof(self), bytes(buffer[offset:end]), size)
 		return end
+
+
+ParamSetPayload.SIZE = ctypes.sizeof(ParamSetPayload)
 
 class ParamSetFile:
 	'''
@@ -257,11 +220,11 @@ class ParamSetFile:
 	'''
 
 	CRC_HEADER_INITIAL = 0x560D5450  # Initial CRC value for the header section, used to verify that the header CRC is calculated correctly (matches the C++ implementation)
-	HEADER_FORMAT = '<BHII'
+	HEADER_FORMAT = '<HHII'
 	HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 	VERSION = 1
 
-	_version: int = VERSION                         # Version string from the ParamSet file (e.g. "1.0"). 1 byte
+	_version: int = VERSION                         # Version string from the ParamSet file (e.g. "1.0"). 2 bytes
 	_num_param_set: int = 0                         # Number of ParamSet definitions in the file. 2 bytes
 	_hdr_crc: int = 0                               # CRC32 of the header section. 4 bytes
 	_payload_crc: int = 0                           # CRC32 of the payload section (DesignConstantsSet + all ParamSetPayloads). 4 bytes
@@ -281,7 +244,7 @@ class ParamSetFile:
 		@brief    Serialize the ParamSetFile to bytes.
 		@return   Bytes array containing the serialized file.
 		'''
-		# Serialize header: version (1 byte), num_param_set (2 bytes), hdr_crc (4 bytes), payload_crc (4 bytes)
+		# Serialize header: version (2 bytes), num_param_set (2 bytes), hdr_crc (4 bytes), payload_crc (4 bytes)
 		result = struct.pack(self.HEADER_FORMAT,
 			self._version,
 			self._num_param_set,
@@ -343,7 +306,7 @@ class ParamSetFile:
 			self._hdr_crc,
 			self._payload_crc
 		)
-		self._hdr_crc = calculate_crc32(header_bytes, self.CRC_HEADER_INITIAL)
+		self._hdr_crc = crc32_stm32_batch(header_bytes, self.CRC_HEADER_INITIAL)
 
 		return self._hdr_crc
 
@@ -356,7 +319,7 @@ class ParamSetFile:
 		payload_bytes = self._design_constants_set_payload.serialize()
 		for param_set in self._param_sets:
 			payload_bytes += param_set.serialize()
-		self._payload_crc = calculate_crc32(payload_bytes, self.CRC_HEADER_INITIAL)
+		self._payload_crc = crc32_stm32_batch(payload_bytes, self.CRC_HEADER_INITIAL)
 
 		return self._payload_crc
 
@@ -369,7 +332,7 @@ class ParamSetFile:
 		self._payload_crc = self.calculate_payload_crc()
 		self._hdr_crc = self.calculate_header_crc()
 
-		return calculate_crc32(self.serialize())
+		return crc32_stm32_batch(self.serialize())
 
 	def clear(self):
 		'''
@@ -1363,10 +1326,6 @@ class SpoolControllerPanel(QDialog):
 		clear_button = QPushButton('Clear', groupbox)
 		clear_button.clicked.connect(lambda: self._on_param_set_clear(param_set_id))
 		buttons_layout.addWidget(clear_button)
-
-		randomize_button = QPushButton('Randomize', groupbox)
-		randomize_button.clicked.connect(lambda: self._on_param_set_randomize(param_set_id))
-		buttons_layout.addWidget(randomize_button)
 
 		execute_button = QPushButton('Execute', groupbox)
 		execute_button.clicked.connect(lambda: self._on_param_set_execute(param_set_id))
@@ -3400,10 +3359,6 @@ class SpoolControllerPanel(QDialog):
 		clear_button = QPushButton('Clear', design_const_set_group)
 		clear_button.clicked.connect(self._on_design_constants_clear)
 		buttons_layout.addWidget(clear_button)
-
-		randomize_button = QPushButton('Randomize', design_const_set_group)
-		randomize_button.clicked.connect(self._on_design_constants_randomize)
-		buttons_layout.addWidget(randomize_button)
 
 		self._store_button = QPushButton('Store', design_const_set_group)
 		self._store_button.clicked.connect(self._on_design_constants_store)
