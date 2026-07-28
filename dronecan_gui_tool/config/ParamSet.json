@@ -5,86 +5,192 @@
         "comment": "The ParamSet ID number"
     },
     "general": {
+        "energize": {
+            "type": "bool",
+            "default": 0,
+            "comment": "Energize the motor",
+            "color": "black"
+        },
         "load_not_shaft_control": {
             "type": "bool",
             "default": 0,
-            "comment": "",
+            "comment": "false: shaft control; true: load control",
             "color": "black"
         },
-        "shaft_pos_rad": {
-            "type": "float32",
+        "execute_not_hold": {
+            "type": "bool",
             "default": 0,
-            "min_val": -3.14,
-            "max_val": 3.14,
-            "comment": "The shaft position in radian",
-            "color": "black"
-        },
-        "completion_time_s": {
-            "type": "float32",
-            "default": 0,
-            "min_val": 0,
-            "max_val": 100,
-            "comment": "The time to complete the setup",
+            "comment": "false: hold the current action; true: execute the current action",
             "color": "black"
         }
     },
     "limits": {
-        "min_torque_Nm": {
+        "min_effort_limit": {
             "type": "float32",
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "The lower threshold of rotational force that the motor is commanded or allowed to maintain",
+            "comment": "Lower torque (N·m) or force (N) limit, depending on load_not_shaft_control. The negative direction is spooling, the positive direction is extending",
             "color": "black"
         },
-        "max_torque_Nm": {
+        "max_effort_limit": {
             "type": "float32",
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "The software or hardware limit on the rotational twisting force the motor can apply to the spool shaft",
+            "comment": "Upper torque (N·m) or force (N) limit, depending on load_not_shaft_control",
             "color": "black"
         }
     },
     "observer": {
-        "obs_tension_detector_min_torque_Nm": {
-            "type": "float32",
+        "ob_hold_on_event": {
+            "type": "bool",
             "default": 0,
-            "min_val": 0,
-            "max_val": 100,
-            "comment": "The lower threshold of rotational force that the motor is commanded or allowed to maintain",
+            "comment": "Hold the spool when the observer detects an event",
             "color": "black"
         },
-        "obs_tension_detector_window_s": {
+        "ob_neg_departure_error": {
             "type": "float32",
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "The time in seconds which obs_tension_detector_min_torque_Nm was observed",
+            "comment": "\"Negative Departure\" detector threshold, in rad or m depending on load_not_shaft_control",
             "color": "black"
         },
-        "obs_traj_deviation_pos_m": {
+        "ob_neg_departure_window_s": {
             "type": "float32",
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "",
+            "comment": "\"Negative Departure\" detector time window, in seconds",
             "color": "black"
         },
-        "obs_traj_deviation_neg_m": {
+        "ob_pos_departure_error": {
             "type": "float32",
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "",
+            "comment": "\"Positive Departure\" detector threshold, in rad or m depending on load_not_shaft_control",
             "color": "black"
         },
-        "obs_allowed_deviation_pos_window_s": {
+        "ob_pos_departure_window_s": {
             "type": "float32",
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "",
+            "comment": "\"Positive Departure\" detector time window, in seconds",
+            "color": "black"
+        },
+        "ob_stall_min_speed": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "\"Stall\" detector minimum speed threshold, in rad/s or m/s depending on load_not_shaft_control",
+            "color": "black"
+        },
+        "ob_stall_window_s": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "\"Stall\" detector time window, in seconds",
+            "color": "black"
+        },
+        "ob_target_margin": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "\"Target Reached\" detector margin, in rad or m depending on load_not_shaft_control",
+            "color": "black"
+        },
+        "ob_on_target_window_s": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "\"Target Reached\" detector time window, in seconds",
+            "color": "black"
+        },
+        "ob_tension_min_effort": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "\"Tension Reached\" detector lower threshold, in Nm or N depending on load_not_shaft_control",
+            "color": "black"
+        },
+        "ob_tension_max_effort": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "\"Tension Reached\" detector upper threshold, in Nm or N depending on load_not_shaft_control",
+            "color": "black"
+        },
+        "ob_tension_window_s": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "\"Tension Reached\" detector time window, in seconds",
+            "color": "black"
+        },
+        "ob_autostop": {
+            "type": "bool",
+            "default": 0,
+            "comment": "Hold when the limit switch activates",
+            "color": "black"
+        }
+    },
+    "target": {
+        "tg_position_setpoint": {
+            "type": "float32",
+            "default": 0,
+            "min_val": -3.14,
+            "max_val": 3.14,
+            "comment": "Target position, in rad or m depending on load_not_shaft_control",
+            "color": "black"
+        },
+        "tg_acceleration": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "Acceleration, in rad/s^2 or m/s^2 depending on load_not_shaft_control",
+            "color": "black"
+        },
+        "tg_deceleration": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "Deceleration, in rad/s^2 or m/s^2 depending on load_not_shaft_control",
+            "color": "black"
+        },
+        "tg_halt_deceleration": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "Halt deceleration, in rad/s^2 or m/s^2 depending on load_not_shaft_control",
+            "color": "black"
+        },
+        "tg_velocity": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "Cruise velocity, in rad/s or m/s depending on load_not_shaft_control",
+            "color": "black"
+        },
+        "tg_movement_time_s": {
+            "type": "float32",
+            "default": 0,
+            "min_val": 0,
+            "max_val": 100,
+            "comment": "Trajectory execution time",
             "color": "black"
         }
     }

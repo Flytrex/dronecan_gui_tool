@@ -9,58 +9,18 @@
   - field_type should be compatible with UAVCAN/DroneCAN DSDL primitive type names
     (e.g., uint32, int16, float32, float64, bool, uint8[16], uint8[<=16]).
   - default_value is stored as text and should be parseable according to field_type.
+  - Fields with edit="false" are read-only and are populated from 21010.StateReport.uavcan.
+  - Fields with edit="true" are (planned to be) sent via a DirectOverride broadcast.
 -->
 <fields>
-  <field name="active_mode" type="uint5" default="0" comment="The current active mode" edit="false" />
-  <field name="active_submode" type="uint5" default="0" comment="The current active submode" edit="false" />
-  <field name="mode_error" type="bool" default="0" comment="The error mode bit. If asserted then error_flags contains the current error map" edit="false" />
-  <field name="mode_status" type="bool" default="0" comment="The current mode’s status" edit="false" />
-  <field name="error_flags" type="uint32" default="0" comment="A bitmap of all the possible errors" edit="false" />
-  <field name="motor_rpm" type="uint16" default="0" comment="Motor revolutions per minute" edit="false" />
-  <field name="has_package" type="bool" default="0" comment="A flag that indicates if a package is sensed on the wire" edit="false" />
-  <field name="instant_weight" type="float32" default="0.0" comment="The wait of the package in kg. Relevant when has_package = 1" edit="false" />
-  <field name="net_state" type="bool" default="0" comment="A flag that indicates the net status" edit="true" />
-  <field name="lock_state" type="bool" default="0" comment="The state of the lock servo" edit="true" />
-  <field name="mode_duration" type="uint32" default="0" comment="Time in milliseconds in the current mode" edit="false" />
-  <field name="motor_temperature" type="float32" default="0.0" comment="The current temperature of the motor" edit="false" />
-  <field name="spool_input_max_lag" type="float32" default="0.0" comment="The distance (in meters) that the actual wire position is permitted to fall behind the target position before the controller triggers an error" edit="true" />
-  <field name="spool_input_max_lag_window" type="float32" default="0.0" comment="The maximum time (e.g., 0.5 seconds) the controller will wait for the spool to reach a commanded position" edit="true" />
-  <field name="spool_input_max_overshoot" type="float32" default="0.0" comment="The difference between the peak physical position reached by the spool and the final steady-state setpoint" edit="true" />
-  <field name="spool_input_max_overshoot_window" type="float32" default="0.0" comment="The time window which allows spool/unspool overshoot" edit="true" />
-  <field name="spool_input_min_speed" type="float32" default="0.0" comment="The lowest linear velocity at which the wire is permitted to travel while the system is in an active &quot;run&quot; state" edit="true" />
-  <field name="spool_input_min_speed_window" type="float32" default="0.0" comment="The maximum duration the system allows for the motor to reach or maintain its &quot;Min Speed&quot; threshold" edit="true" />
-  <field name="spool_input_ack_observer_fault" type="bool" default="0" comment="" edit="true" />
-  <field name="spool_input_load_acc" type="float32" default="0.0" comment="The rate of change of the angular velocity of the rotating spool drum (measured in rad/s²)" edit="true" />
-  <field name="spool_input_load_dec" type="float32" default="0.0" comment="The rate at which the angular velocity of the spool drum decreases (measured in rad/s²)" edit="true" />
-  <field name="spool_input_req_shaft_ctrl_load" type="bool" default="0.0" comment="" edit="true" />
-  <field name="spool_input_req_exec_hold" type="bool" default="0" comment="A flag for executing/stopping the current action" edit="true" />
-  <field name="spool_input_target_ext" type="uint8" default="0" comment="The desired total length of cable to be deployed or unwound" edit="true" />
-  <field name="spool_input_home_switch_activated" type="bool" default="0" comment="The endswitch which is triggered when the bobbin is in the house" edit="true" />
-  <field name="spool_input_max_force" type="float32" default="0.0" comment="The maximum allowable cable tension or linear pulling force the system can exert" edit="true" />
-  <field name="spool_input_min_force" type="float32" default="0.0" comment="The minimum amount of tension or pulling effort that must be maintained on the wire to ensure safe and reliable operation" edit="true" />
-  <field name="spool_input_max_torque" type="float32" default="0.0" comment="The software or hardware limit on the rotational twisting force the motor can apply to the spool shaft" edit="true" />
-  <field name="spool_input_min_torque" type="float32" default="0.0" comment="The lower threshold of rotational force that the motor is commanded or allowed to maintain" edit="true" />
-  <field name="spool_input_energize" type="bool" default="0" comment="Energizing the motor" edit="true" />
-  <field name="spool_input_encoder_reliable" type="bool" default="0" comment="" edit="true" />
-  <field name="spool_internal_energize_allowed" type="bool" default="0" comment="AND (spool_input_energize, spool_input_encoder_reliable)" edit="false" />
-  <field name="spool_internal_ext_setpoint" type="float32" default="0.0" comment="The target value for the length of wire that comes out from the trajectory generator" edit="false" />
-  <field name="spool_internal_ext_err" type="float32" default="0.0" comment="The difference between where the wire should be and where it actually is (spool_internal_ext_setpoint - spool_output_ext)" edit="false" />
-  <field name="spool_internal_shaft_setpoint" type="float32" default="0.0" comment="The target angular position for the motor's output shaft" edit="false" />
-  <field name="spool_internal_shaft_err" type="float32" default="0.0" comment="The difference between where the shaft should be and where it actually is (spool_internal_shaft_setpoint - spool_output_shaft_pos)" edit="false" />
-  <field name="spool_internal_quad_current_req" type="float32" default="0.0" comment="The value for the specific component of motor current that is responsible for generating torque" edit="false" />
-  <field name="spool_internal_quad_current_active_setpoint" type="float32" default="0.0" comment="The final, safety-filtered command for torque-producing current (𝐼𝑞) that is actually sent to the motor's power electronics" edit="false" />
-  <field name="spool_output_trajectory_margin" type="float32" default="0.0" comment="The maximum allowable physical distance the system can deviate from its pre-planned motion path" edit="false" />
-  <field name="spool_output_target_reached" type="bool" default="0" comment="A flag which indicates if the wire reached target" edit="false" />
-  <field name="spool_output_go_emergency_hold" type="bool" default="0" comment="A flag which controls if the spooling enters emergency hold or continue with operation" edit="false" />
-  <field name="spool_output_executing_holding" type="bool" default="0" comment="OR (spool_output_go_emergency_hold, spool_input_req_exec_hold)" edit="false" />
-  <field name="spool_output_shaft_load_ctrl" type="bool" default="0" comment="AND(spool_input_req_shaft_ctrl_load, spool_output_homing_complete)" edit="false" />
-  <field name="spool_output_ext" type="float32" default="0.0" comment="The output wire extension in meters" edit="false" />
-  <field name="spool_output_shaft_pos" type="float32" default="0.0" comment="The output shaft position in radian" edit="false" />
-  <field name="spool_output_homing_complete" type="bool" default="0" comment="“WIRE_HOMING” mode is complete" edit="false" />
-  <field name="spool_output_force" type="float32" default="0.0" comment="The real-time linear pulling effort currently being exerted by the cable (in N)" edit="false" />
-  <field name="spool_output_torque" type="float32" default="0.0" comment="The rotational twisting force currently being generated at the motor's output shaft (in Nm)" edit="false" />
-  <field name="spool_output_bobbin_speed" type="float32" default="0.0" comment="Bobbin speed, rad/s" edit="false" />
-  <field name="spool_output_load_speed" type="float32" default="0.0" comment="Load speed, m/s" edit="false" />
-  <field name="spool_output_total_energy_cntr" type="float32" default="0.0" comment="Total energy counter, J" edit="false" />
-  <field name="spool_output_alignment_complete" type="bool" default="0" comment="Alignment complete flag" edit="false" />
+  <field name="safety_state" type="bool" default="0" comment="The current safety state" edit="false" />
+  <field name="readiness" type="uint2" default="0" comment="The current motion coordinate frame readiness" edit="false" />
+  <field name="mode" type="uint7" default="0" comment="The current active mode" edit="false" />
+  <field name="mode_execution_state" type="uint2" default="0" comment="0 = IN PROGRESS; 1 = DONE; 2 = ERROR" edit="false" />
+  <field name="error" type="uint10" default="0" comment="The current error, if any" edit="false" />
+  <field name="package_state" type="uint2" default="0" comment="The current package status" edit="false" />
+  <field name="wire_extension_m" type="float32" default="0.0" comment="The wire extension in meters" edit="false" />
+  <field name="load_speed_m_s" type="float32" default="0.0" comment="The load speed in meters per second" edit="false" />
+  <field name="force_on_wire_N" type="float32" default="0.0" comment="The force on the wire in Newtons" edit="false" />
+  <field name="estimated_weight_kg" type="float32" default="0.0" comment="The estimated weight of the package in kg" edit="false" />
 </fields>
