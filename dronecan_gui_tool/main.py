@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import sys
 import time
+import threading
 import tempfile
 import re
 import glob
@@ -28,7 +29,7 @@ parser.add_argument("--debug", action='store_true', help="enable debugging")
 parser.add_argument("--dsdl", help="path to custom DSDL")
 parser.add_argument("--signing-passphrase", help="MAVLink2 signing passphrase", default=None)
 parser.add_argument("--interface", help="skip the setup dialog by setting the device to connect to")
-parser.add_argument("--baudrate", help="set the baudrate", type=int, default=115200)
+parser.add_argument("--baudrate", help="set the baudrate", type=int, default=921600)
 parser.add_argument("--bitrate", help="set the bitrate of the CAN Bus", type=int, default=1000000)
 parser.add_argument("--bus", help="set the CAN Bus number", type=int, default=1)
 parser.add_argument("--filtered", action='store_true', help="enable filtering of DroneCAN traffic")
@@ -116,10 +117,17 @@ DSDL_MANIFEST = '.flytrex_dsdl_manifest'
 DSDL_SYNC_EXCLUDES = {'.github', '.gitignore', 'tests', 'LICENSE', 'README.md',
                      'test.py', '.flytrex_dsdl_version'}
 
+FIRMWARE_UPDATE_REQUEST_PRIORITY = 10
+NON_FIRMWARE_REQUEST_PRIORITY_DURING_UPDATE = 31
+DEFAULT_NODE_REQUEST_PRIORITY = 20
+FIRMWARE_UPDATE_SPIN_INTERVAL_MS = 1
+FIRMWARE_UPDATE_IDLE_SPIN_INTERVAL_MS = 2
+
 
 class NodeRuntime(QObject):
     spin_error = pyqtSignal(object, int)
     _spin_start_requested = pyqtSignal(int)
+    _spin_interval_requested = pyqtSignal(int)
     _spin_stop_requested = pyqtSignal()
     _spin_close_requested = pyqtSignal()
     _spin_node_close_requested = pyqtSignal()
@@ -131,17 +139,43 @@ class NodeRuntime(QObject):
             super(NodeRuntime._NodeSpinWorker, self).__init__()
             self._node = node
             self._successive_spin_errors = 0
-            self._spin_timer = QTimer(self)
-            self._spin_timer.setSingleShot(False)
-            self._spin_timer.timeout.connect(self._spin_once)
+            self._spin_interval_ms = 10
+            self._firmware_update_spin_interval_ms = FIRMWARE_UPDATE_SPIN_INTERVAL_MS
+            self._spin_loop_thread = None
+            self._spin_stop_requested = threading.Event()
+            self._spin_loop_lock = threading.Lock()
 
         @pyqtSlot(int)
         def start(self, interval_ms=10):
-            self._spin_timer.start(interval_ms)
+            self._spin_interval_ms = max(1, int(interval_ms))
+            self.stop()
+            self._spin_stop_requested.clear()
+            self._spin_loop_thread = threading.Thread(
+                target=self._spin_loop,
+                name='NodeSpinWorker',
+                daemon=True,
+            )
+            self._spin_loop_thread.start()
+
+        @pyqtSlot(int)
+        def set_interval(self, interval_ms):
+            self._spin_interval_ms = max(1, int(interval_ms))
+
+        def _effective_spin_interval_ms(self):
+            if bool(getattr(self._node, '_firmware_update_mode', False)):
+                active_until = float(getattr(self._node, '_firmware_read_active_until', 0.0) or 0.0)
+                if active_until > time.monotonic():
+                    return self._firmware_update_spin_interval_ms
+            return self._spin_interval_ms
 
         @pyqtSlot()
         def stop(self):
-            self._spin_timer.stop()
+            self._spin_stop_requested.set()
+            with self._spin_loop_lock:
+                loop_thread = self._spin_loop_thread
+                self._spin_loop_thread = None
+            if loop_thread and loop_thread.is_alive():
+                loop_thread.join(timeout=2.0)
 
         @pyqtSlot()
         def close(self):
@@ -168,6 +202,21 @@ class NodeRuntime(QObject):
                 self._successive_spin_errors += 1
                 self.spin_error.emit(ex, self._successive_spin_errors)
 
+        def _spin_loop(self):
+            next_run_at = time.monotonic()
+            while not self._spin_stop_requested.is_set():
+                interval_sec = self._effective_spin_interval_ms() / 1000.0
+                now = time.monotonic()
+                if now < next_run_at:
+                    self._spin_stop_requested.wait(min(next_run_at - now, 0.001))
+                    continue
+
+                self._spin_once()
+
+                next_run_at += interval_sec
+                if next_run_at < now - interval_sec:
+                    next_run_at = now + interval_sec
+
     def __init__(self, node, parent=None):
         super(NodeRuntime, self).__init__(parent)
         self._node = node
@@ -177,6 +226,9 @@ class NodeRuntime(QObject):
         self._log_messages = LogMessageController(node, self)
         self._bus_monitor_hook = BusMonitorHookController(node, self)
         self._firmware_update_mode = False
+        self._pre_firmware_update_filter_list = None
+        self._firmware_update_filter_applied = False
+        self._base_spin_interval_ms = FIRMWARE_UPDATE_IDLE_SPIN_INTERVAL_MS
 
         self._spin_worker = NodeRuntime._NodeSpinWorker(node)
         self._spin_thread = QThread(self)
@@ -184,6 +236,7 @@ class NodeRuntime(QObject):
         self._spin_thread.finished.connect(self._spin_worker.deleteLater)
 
         self._spin_start_requested.connect(self._spin_worker.start)
+        self._spin_interval_requested.connect(self._spin_worker.set_interval)
         self._spin_stop_requested.connect(self._spin_worker.stop)
         self._spin_close_requested.connect(self._spin_worker.close)
         self._spin_node_close_requested.connect(self._spin_worker.close_node)
@@ -225,6 +278,7 @@ class NodeRuntime(QObject):
             return
 
         self._firmware_update_mode = enabled
+        setattr(self._node, '_firmware_update_mode', enabled)
 
         # Reduce non-essential traffic and GUI work while firmware transfer is active.
         self._node_monitor.set_updates_enabled(True)
@@ -232,9 +286,71 @@ class NodeRuntime(QObject):
             self._node_monitor.set_discovery_enabled(not enabled)
         self._log_messages.set_updates_enabled(not enabled)
         self._bus_monitor_hook.set_capture_enabled(not enabled)
+        self._set_driver_firmware_update_mode(enabled)
+        self._set_firmware_update_filtering(enabled)
+        if not enabled:
+            setattr(self._node, '_firmware_read_active_until', 0.0)
+        self._spin_interval_requested.emit(FIRMWARE_UPDATE_IDLE_SPIN_INTERVAL_MS if enabled else self._base_spin_interval_ms)
+
+    def _set_driver_firmware_update_mode(self, enabled):
+        driver = getattr(self._node, 'can_driver', None)
+        if driver is None or not hasattr(driver, 'set_firmware_update_mode'):
+            return
+        try:
+            driver.set_firmware_update_mode(enabled)
+        except Exception:
+            logger.debug('Could not toggle driver firmware-update mode', exc_info=True)
+
+    @staticmethod
+    def _firmware_update_filter_ids():
+        return sorted(set([
+            0,
+            dronecan.uavcan.protocol.NodeStatus.default_dtid,
+            dronecan.uavcan.protocol.GetNodeInfo.default_dtid,
+            dronecan.uavcan.protocol.RestartNode.default_dtid,
+            dronecan.uavcan.protocol.file.BeginFirmwareUpdate.default_dtid,
+            dronecan.uavcan.protocol.file.Read.default_dtid,
+            dronecan.uavcan.protocol.file.GetInfo.default_dtid,
+        ]))
+
+    def _set_firmware_update_filtering(self, enabled):
+        driver = getattr(self._node, 'can_driver', None)
+        if driver is None:
+            return
+        if not hasattr(driver, 'set_filter_list') or not hasattr(driver, 'get_filter_list'):
+            return
+
+        if enabled:
+            if self._firmware_update_filter_applied:
+                return
+            try:
+                self._pre_firmware_update_filter_list = driver.get_filter_list()
+            except Exception:
+                self._pre_firmware_update_filter_list = None
+            try:
+                driver.set_filter_list(self._firmware_update_filter_ids())
+                self._firmware_update_filter_applied = True
+            except Exception:
+                logger.debug('Could not apply firmware-update filter profile', exc_info=True)
+                self._firmware_update_filter_applied = False
+            return
+
+        if not self._firmware_update_filter_applied:
+            return
+        try:
+            restore_filter_list = self._pre_firmware_update_filter_list
+            if restore_filter_list is None:
+                restore_filter_list = []
+            driver.set_filter_list(restore_filter_list)
+        except Exception:
+            logger.debug('Could not restore pre-update filter profile', exc_info=True)
+        finally:
+            self._pre_firmware_update_filter_list = None
+            self._firmware_update_filter_applied = False
 
     @pyqtSlot(int)
     def start(self, interval_ms=10):
+        self._base_spin_interval_ms = max(1, int(interval_ms))
         self._spin_start_requested.emit(interval_ms)
 
     @pyqtSlot()
@@ -270,7 +386,30 @@ class NodeRuntime(QObject):
     def node_id(self, value):
         self._node.node_id = value
 
+    @staticmethod
+    def _is_begin_firmware_update_request(payload):
+        try:
+            payload_type = dronecan.get_dronecan_data_type(payload)
+            begin_update = dronecan.uavcan.protocol.file.BeginFirmwareUpdate
+            request_type = getattr(begin_update, 'Request', None)
+            if request_type is not None and payload_type == request_type:
+                return True
+            return (
+                getattr(payload_type, 'default_dtid', None) == getattr(begin_update, 'default_dtid', None)
+                and hasattr(payload, 'image_file_remote_path')
+                and hasattr(payload, 'source_node_id')
+            )
+        except Exception:
+            return False
+
     def request(self, payload, server_node_id, callback, priority=None, timeout=None):
+        if self._firmware_update_mode:
+            original_priority = DEFAULT_NODE_REQUEST_PRIORITY if priority is None else int(priority)
+            is_firmware_begin_update = self._is_begin_firmware_update_request(payload)
+            if is_firmware_begin_update:
+                priority = min(original_priority, FIRMWARE_UPDATE_REQUEST_PRIORITY)
+            else:
+                priority = max(original_priority, NON_FIRMWARE_REQUEST_PRIORITY_DURING_UPDATE)
         return self._node.request(payload, server_node_id, callback, priority=priority, timeout=timeout)
 
     def add_handler(self, dronecan_type, callback):
@@ -447,7 +586,7 @@ class MainWindow(QMainWindow):
         self._node_runtime.spin_error.connect(self._on_node_spin_error)
 
         self._active_data_type_detector = ActiveDataTypeDetector(self._node)
-        self._node_runtime.start(10)
+        self._node_runtime.start(2)
 
         self._node_windows = {}  # node ID : window object
 

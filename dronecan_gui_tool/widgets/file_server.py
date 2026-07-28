@@ -13,7 +13,7 @@ import json
 import zlib
 import base64
 import struct
-from time import perf_counter
+from time import monotonic
 from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QHBoxLayout, QWidget, QDirModel, QCompleter, QFileDialog, QLabel
 from PyQt5.QtCore import QTimer, QObject
 from logging import getLogger
@@ -23,9 +23,8 @@ from . import make_icon_button, CommitableComboBoxWithHistory, get_icon, flash, 
 logger = getLogger(__name__)
 
 
-READ_GAP_LOG_THRESHOLD_SEC = 0.02
-READ_HANDLER_LOG_THRESHOLD_SEC = 0.01
-READ_TIMING_LOG_MIN_INTERVAL_SEC = 0.25
+READ_ACTIVITY_WINDOW_SEC = 0.250
+READ_CACHE_REVALIDATE_INTERVAL_SEC = 1.000
 
 def FileServer_PathKey(path):
     '''
@@ -117,14 +116,22 @@ def hex2bin(heximage):
 class FileServerJson(dronecan.app.file_server.FileServer):
     def __init__(self, node):
         super(FileServerJson, self).__init__(node)
+        self._node = node
         self._images = {}
+        self._image_views = {}
         self._image_timestamps = {}
+        self._image_last_checked_at = {}
         self._key_to_path = {}
         self._key_hit_counters = {}
         self._key_complete = set()
         self._key_max_offset = {}
-        self._key_last_request_at = {}
-        self._key_last_timing_log_at = {}
+
+    def _is_firmware_update_mode(self):
+        return bool(getattr(self._node, '_firmware_update_mode', False))
+
+    def _is_active_firmware_read_window(self):
+        active_until = float(getattr(self._node, '_firmware_read_active_until', 0.0) or 0.0)
+        return active_until > monotonic()
 
     def _resolve_path(self, relative):
         rel = relative.path.decode().replace(chr(relative.SEPARATOR), os.path.sep)
@@ -154,10 +161,20 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         return open(path,'rb').read()
 
     def _check_path_change(self, path):
+        now = monotonic()
+        if self._is_firmware_update_mode() and path in self._images:
+            if self._is_active_firmware_read_window():
+                return False
+            last_checked_at = self._image_last_checked_at.get(path)
+            if last_checked_at is not None and (now - last_checked_at) < READ_CACHE_REVALIDATE_INTERVAL_SEC:
+                return False
+
         mtime = os.path.getmtime(path)
+        self._image_last_checked_at[path] = now
         if path not in self._images or mtime != self._image_timestamps[path]:
             self._image_timestamps[path] = mtime
             self._images[path] = self._load_image(path)
+            self._image_views[path] = memoryview(self._images[path])
             self._key_to_path[FileServer_PathKey(path)] = path
             return True
         return False
@@ -167,7 +184,9 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         key = FileServer_PathKey(path)
         self._key_to_path.pop(key, None)
         self._images.pop(path, None)
+        self._image_views.pop(path, None)
         self._image_timestamps.pop(path, None)
+        self._image_last_checked_at.pop(path, None)
 
     @property
     def key_hit_counters(self):
@@ -185,37 +204,30 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         return (sent, total)
 
     def _read(self, e):
-        logger.debug("[#{0:03d}:uavcan.protocol.file.Read] {1!r} @ offset {2:d}"
-                     .format(e.transfer.source_node_id, e.request.path.path.decode(), e.request.offset))
-        started_at = perf_counter()
-        request_gap_sec = None
-        cache_check_sec = 0.0
-        handler_sec = 0.0
-        cache_reloaded = False
-        payload_size = 0
+        if not self._is_firmware_update_mode():
+            logger.debug("[#{0:03d}:uavcan.protocol.file.Read] {1!r} @ offset {2:d}"
+                         .format(e.transfer.source_node_id, e.request.path.path.decode(), e.request.offset))
+        if self._is_firmware_update_mode():
+            setattr(self._node, '_firmware_read_active_until', monotonic() + READ_ACTIVITY_WINDOW_SEC)
         key = e.request.path.path.decode()
-        path = None
         try:
-            last_request_at = self._key_last_request_at.get(key)
-            if last_request_at is not None:
-                request_gap_sec = started_at - last_request_at
-            self._key_last_request_at[key] = started_at
-
             if key in self._key_to_path:
                 path = self._key_to_path[key]
                 self._key_hit_counters[key] = self._key_hit_counters.get(key, 0) + 1
             else:
                 path = self._resolve_path(e.request.path)
 
-            cache_check_started_at = perf_counter()
-            cache_reloaded = self._check_path_change(path)
-            cache_check_sec = perf_counter() - cache_check_started_at
+            self._check_path_change(path)
 
             resp = uavcan.protocol.file.Read.Response()
             read_size = dronecan.get_dronecan_data_type(dronecan.get_fields(resp)['data']).max_size
-            resp.data = self._images[path][e.request.offset:e.request.offset+read_size]
-            payload_size = len(resp.data)
+
+            image_view = self._image_views[path]
+            end_offset = min(e.request.offset + read_size, len(image_view))
+            payload_size = max(0, end_offset - e.request.offset)
+            resp.data = image_view[e.request.offset:end_offset]
             resp.error.value = resp.error.OK
+
             if key in self._key_to_path:
                 end_offset = e.request.offset + payload_size
                 prev = self._key_max_offset.get(key, 0)
@@ -227,38 +239,6 @@ class FileServerJson(dronecan.app.file_server.FileServer):
             logger.exception("[#{0:03d}:uavcan.protocol.file.Read] error")
             resp = uavcan.protocol.file.Read.Response()
             resp.error.value = resp.error.UNKNOWN_ERROR
-        finally:
-            handler_sec = perf_counter() - started_at
-            should_log_timing = (
-                cache_reloaded or
-                handler_sec >= READ_HANDLER_LOG_THRESHOLD_SEC or
-                cache_check_sec >= READ_HANDLER_LOG_THRESHOLD_SEC or
-                (request_gap_sec is not None and request_gap_sec >= READ_GAP_LOG_THRESHOLD_SEC)
-            )
-            if should_log_timing:
-                last_log_at = self._key_last_timing_log_at.get(key)
-                if (
-                    cache_reloaded or
-                    last_log_at is None or
-                    (started_at - last_log_at) >= READ_TIMING_LOG_MIN_INTERVAL_SEC
-                ):
-                    self._key_last_timing_log_at[key] = started_at
-                else:
-                    should_log_timing = False
-            if should_log_timing:
-                logger.info(
-                    '[#%03d:file.Read.timing] key=%r offset=%d size=%d gap_ms=%s cache_check_ms=%.3f '
-                    'handler_ms=%.3f reloaded=%s path=%r',
-                    e.transfer.source_node_id,
-                    key,
-                    e.request.offset,
-                    payload_size,
-                    '%.3f' % (request_gap_sec * 1000.0) if request_gap_sec is not None else 'n/a',
-                    cache_check_sec * 1000.0,
-                    handler_sec * 1000.0,
-                    cache_reloaded,
-                    path,
-                )
 
         return resp
 

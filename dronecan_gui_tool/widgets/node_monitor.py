@@ -7,6 +7,7 @@
 #
 
 import datetime
+import time
 import dronecan
 from . import BasicTable, get_monospace_font
 from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QHeaderView, QLabel
@@ -24,6 +25,7 @@ class NodeMonitorBridge(QObject):
 
     def __init__(self, node, parent=None):
         super(NodeMonitorBridge, self).__init__(parent)
+        self._node = node
         self._monitor = dronecan.app.node_monitor.NodeMonitor(node)
         self._update_handle = self._monitor.add_update_handler(self._on_monitor_update)
         self._updates_enabled = True
@@ -56,6 +58,12 @@ class NodeMonitorBridge(QObject):
             self._monitor.set_discovery_enabled(enabled)
 
     def _on_monitor_update(self, event):
+        if not self._updates_enabled:
+            return
+        if bool(getattr(self._node, '_firmware_update_mode', False)):
+            active_until = float(getattr(self._node, '_firmware_read_active_until', 0.0) or 0.0)
+            if active_until > time.monotonic():
+                return
         if self._updates_enabled:
             self.registry_changed.emit(event)
 

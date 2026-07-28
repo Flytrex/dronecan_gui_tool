@@ -32,6 +32,9 @@ FIRMWARE_STATUS_MESSAGE_INTERVAL_SEC = 2.0
 class FirmwareUpdateController(QObject):
     message = pyqtSignal(str)
     error = pyqtSignal(str, str, object)
+    _response_received = pyqtSignal(object)
+    _node_status_received = pyqtSignal(object)
+    _send_request_requested = pyqtSignal()
 
     def __init__(self, node, target_node_id, parent=None):
         super(FirmwareUpdateController, self).__init__(parent)
@@ -54,6 +57,9 @@ class FirmwareUpdateController(QObject):
         self._progress_timer = QTimer(self)
         self._progress_timer.setSingleShot(False)
         self._progress_timer.timeout.connect(self._emit_progress_heartbeat)
+        self._response_received.connect(self._on_response)
+        self._node_status_received.connect(self._on_node_status)
+        self._send_request_requested.connect(self._send_request)
 
     def _emit_progress_heartbeat(self):
         if not self._update_in_progress:
@@ -133,16 +139,31 @@ class FirmwareUpdateController(QObject):
         self._update_in_progress = False
         self._remote_fw_file = remote_fw_file
         self._num_remaining_requests = 4
-        self._node_status_handle = self._node.add_handler(dronecan.uavcan.protocol.NodeStatus, self._on_node_status)
+        self._node_status_handle = self._node.add_handler(dronecan.uavcan.protocol.NodeStatus,
+                                                          self._on_node_status_from_node_thread)
         self._send_request()
 
+    def _on_response_from_node_thread(self, e):
+        self._response_received.emit(e)
+
+    def _on_node_status_from_node_thread(self, e):
+        self._node_status_received.emit(e)
+
+    def _request_send_from_node_thread(self):
+        self._send_request_requested.emit()
+
     def _on_response(self, e):
-        assert self._deferred_request_handle is None
+        if self._deferred_request_handle is not None:
+            try:
+                self._deferred_request_handle.remove()
+            except Exception:
+                logger.debug('Could not remove stale deferred firmware request handle', exc_info=True)
+            self._deferred_request_handle = None
 
         if e is None:
             self.message.emit('One of firmware update requests has timed out')
             if (not self._update_in_progress) and (self._num_remaining_requests > 0):
-                self._deferred_request_handle = self._node.defer(2, self._send_request)
+                self._deferred_request_handle = self._node.defer(2, self._request_send_from_node_thread)
             return
 
         logger.info('Firmware update response: %s', e.response)
@@ -155,7 +176,7 @@ class FirmwareUpdateController(QObject):
             return
 
         if (not self._update_in_progress) and (self._num_remaining_requests > 0):
-            self._deferred_request_handle = self._node.defer(2, self._send_request)
+            self._deferred_request_handle = self._node.defer(2, self._request_send_from_node_thread)
 
     def _on_node_status(self, e):
         if e.transfer.source_node_id != self._target_node_id:
@@ -204,7 +225,10 @@ class FirmwareUpdateController(QObject):
                 image_file_remote_path=dronecan.uavcan.protocol.file.Path(path=self._remote_fw_file))
             self.message.emit('Sending request (%d to go) %s' % (self._num_remaining_requests, request))
             try:
-                self._node.request(request, self._target_node_id, self._on_response, priority=REQUEST_PRIORITY)
+                self._node.request(request,
+                                   self._target_node_id,
+                                   self._on_response_from_node_thread,
+                                   priority=REQUEST_PRIORITY)
             except Exception as ex:
                 self.close()
                 self.error.emit('Firmware update error', 'Could not send firmware update request', ex)
@@ -587,9 +611,9 @@ class Controls(QGroupBox):
         self._dynamic_node_id_allocator_widget = dynamic_node_id_allocator_widget
         self._firmware_update_controller = FirmwareUpdateController(node, target_node_id, self)
         self._control_request_controller = NodeControlRequestController(node, target_node_id, self)
-        self._firmware_update_controller.message.connect(lambda text: self.window().show_message('%s', text))
+        self._firmware_update_controller.message.connect(self._show_status_message)
         self._firmware_update_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
-        self._control_request_controller.message.connect(lambda text: self.window().show_message('%s', text))
+        self._control_request_controller.message.connect(self._show_status_message)
         self._control_request_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
         self._control_request_controller.transport_stats_received.connect(self._show_transport_stats)
         self.destroyed.connect(lambda *_: self._firmware_update_controller.close())
@@ -611,6 +635,15 @@ class Controls(QGroupBox):
         layout.addWidget(self._transport_stats_button, 1)
         layout.addWidget(self._update_button, 1)
         self.setLayout(layout)
+
+    def _show_status_message(self, text):
+        try:
+            window = self.window()
+            if window is not None and hasattr(window, 'show_message'):
+                window.show_message('%s', text)
+        except RuntimeError:
+            # Ignore late async callbacks after the Qt object has been destroyed.
+            pass
 
     def _do_restart(self):
         if not request_confirmation('Confirm node restart',
