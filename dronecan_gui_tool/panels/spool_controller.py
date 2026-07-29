@@ -1,4 +1,3 @@
-
 #
 # Copyright (C) 2026  UAVCAN Development Team  <dronecan.org>
 #
@@ -16,9 +15,11 @@ import os
 import re
 import json
 import random
-import xml.etree.ElementTree as ET
 import struct
 import ctypes
+import tempfile
+import atexit
+
 
 from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer, pyqtSignal
 from PyQt5.QtGui import QIntValidator, QColor, QFont
@@ -43,7 +44,8 @@ PARAM_SET_NAME = 'ParamSet'                         # Prefix for individual Para
 
 BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) between buttons in button rows
 PARAM_SET_GROUPBOX_HEIGHT = 500                     # Fixed height (px) for each ParamSet editing groupbox
-PARAM_SET_GROUPBOX_WIDTH = 410                      # Fixed width (px) for each ParamSet editing groupbox
+PARAM_SET_GROUPBOX_WIDTH = 240                      # Fixed width (px) for each ParamSet editing groupbox
+LEFT_COLUMN_MAX_WIDTH = 260                         # Maximum width (px) of the narrow left-hand button column
 RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
 CONFIG_FILE_TRANSFER_TIMEOUT = 30                   # Number of seconds to wait for a config file upload/download to complete before showing a timeout error dialog
 BROADCAST_PRIORITY = 16                             # DroneCAN message broadcast priority (lower number = higher priority)
@@ -76,7 +78,7 @@ _singleton = None
 class DesignConstantsSetPayload(ctypes.LittleEndianStructure):
     '''
     @brief    Class representing the payload of a DesignConstantsSet message, responsible for parsing and storing field values.
-    @         Must match `design_constants_set_t` (see the Delivery Controller firmware) field-for-field, including
+    @         Must match `design_constants_set_t` (see the The Delivery Controller firmware) field-for-field, including
     @         its explicit trailing pad bytes; `homing_window_ms` is FreeRTOS's `TickType_t`, assumed to be 32-bit here.
     '''
     _pack_ = 1
@@ -140,7 +142,7 @@ DesignConstantsSetPayload.SIZE = ctypes.sizeof(DesignConstantsSetPayload)
 class ParamSetPayload(ctypes.LittleEndianStructure):
     '''
     @brief    Class representing the payload of a ParamSet message, responsible for parsing and storing field values.
-    @         Must match paramset-manager's `param_set_t` (see the Delivery Controller firmware) field-for-field.
+    @         Must match paramset-manager's `param_set_t` (see the The Delivery Controller firmware) field-for-field.
     @		  TODO: automatically generate this based on the actual param_set_t definition?
     '''
     _pack_ = 1
@@ -266,8 +268,8 @@ class ParamSetFile:
     BIN_EXTENSION = '.delconparamb'
     JSON_EXTENSION = '.delconparama'
 
-    BIN_FILTER = f'Binary Delivery Controller Parameters (*{BIN_EXTENSION})'
-    JSON_FILTER = f'Text Delivery Controller Parameters (*{JSON_EXTENSION})'
+    BIN_FILTER = f'Binary The Delivery Controller Parameters (*{BIN_EXTENSION})'
+    JSON_FILTER = f'Text The Delivery Controller Parameters (*{JSON_EXTENSION})'
 
     _version: int = VERSION                         # Version string from the ParamSet file (e.g. "1.0"). 2 bytes
     _num_param_set: int = 0                         # Number of ParamSet definitions in the file. 2 bytes
@@ -540,7 +542,12 @@ class _FlowContainer(QWidget):
 
 
 class SpoolControllerPanel(QDialog):
-    _file_download_finished_signal = pyqtSignal(bool, str, str)  # success, error_message, save_path
+    
+    TEXT_UPLOAD_BTN = 'Upload Params'
+    TEXT_DOWNLOAD_BTN = 'Download Params'
+    
+    
+    _file_download_finished_signal = pyqtSignal(bool, str)  # success, error_message
     _file_download_progress_signal = pyqtSignal(int)             # percent 0-100
 
     def __init__(self, parent, node):
@@ -603,6 +610,10 @@ class SpoolControllerPanel(QDialog):
         self._file_download_finished_signal.connect(self._on_file_download_finished)
         self._file_download_progress_signal.connect(lambda pct: self._config_transfer_progress.setValue(pct))
 
+        self._temporary_file_bytes = None # This is to store the received ParamSetFile
+        self._temporary_file = tempfile.NamedTemporaryFile(delete=False) # This for the uploaded ParamSetFile
+        atexit.register(self._tempfile_cleanup)
+
         self._setup_ui()
 
     def _setup_ui(self):
@@ -610,47 +621,52 @@ class SpoolControllerPanel(QDialog):
         @brief    Main UI setup function that creates the window layout.
         @return   None
         '''
+
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+
         layout = QVBoxLayout(self)
 
         # Create groupbox with header labels and sub-groupboxes
         header_group = QGroupBox(self)
         header_layout = QVBoxLayout(header_group)
 
-        # Top row: Spool Controller Tuning label
-        spool_tune_label = QLabel(SPOOL_CONTROLLER_TUNE_NAME, header_group)
+        spool_tune_label = QLabel(SPOOL_CONTROLLER_TUNE_NAME)
         font_main = QFont()
         font_main.setBold(True)
         font_main.setPointSize(12)
         spool_tune_label.setFont(font_main)
-        header_layout.addWidget(spool_tune_label, 0, Qt.AlignTop)
 
-        # Grid layout for two columns + ParamSet Editing below
-        columns_grid = QGridLayout()
-        columns_grid.setColumnStretch(0, 1)
-        columns_grid.setColumnStretch(1, 1)
+        layout.addWidget(spool_tune_label)
 
-        # Row 0, Col 0: Left column - Parameter File Management section
+        columns_row = QHBoxLayout()
+
+        # Left area (narrow): Parameter File Management buttons; Design Constants Tuning
+        # is opened via a button here rather than embedded in this layout.
         left_column = self._create_param_file_manage_section(header_group)
-        columns_grid.addLayout(left_column, 0, 0)
+        left_container = QWidget(header_group)
+        left_container.setLayout(left_column)
+        left_container.setMaximumWidth(LEFT_COLUMN_MAX_WIDTH)
+        columns_row.addWidget(left_container, 0)
 
-        # Row 0, Col 1: Right column - Design Constants section
-        right_column = self._create_design_constants_section(header_group)
-        columns_grid.addLayout(right_column, 0, 1)
+        # Right area: fully occupied by the ParamSet Editing section.
+        right_column = QVBoxLayout()
+        right_column.setContentsMargins(0, 0, 0, 0)
+        right_column.setSpacing(6)
 
-        # Row 1, spanning both columns: ParamSet Editing label
+        # ParamSet Editing label
         param_set_edit_label = QLabel(PARAM_SET_EDIT_NAME, header_group)
         font_secondary = QFont()
         font_secondary.setBold(True)
         param_set_edit_label.setFont(font_secondary)
-        columns_grid.addWidget(param_set_edit_label, 1, 0, 1, 2, Qt.AlignLeft)
+        right_column.addWidget(param_set_edit_label, 0, Qt.AlignLeft)
 
-        # Row 2, spanning both columns: sunken line
+        # Sunken line below the label
         param_set_line = QFrame(header_group)
         param_set_line.setFrameShape(QFrame.HLine)
         param_set_line.setFrameShadow(QFrame.Sunken)
-        columns_grid.addWidget(param_set_line, 2, 0, 1, 2)
+        right_column.addWidget(param_set_line)
 
-        # Row 3: ParamSet ID label, textbox, and Edit button
+        # ParamSet ID label, textbox, and Edit/Delete buttons
         param_set_id_row = QHBoxLayout()
         param_set_id_label = QLabel(PARAM_SET_ID_NAME + ':', header_group)
         param_set_id_row.addWidget(param_set_id_label)
@@ -669,9 +685,9 @@ class SpoolControllerPanel(QDialog):
         param_set_id_row.addWidget(self._delete_button)
 
         param_set_id_row.addStretch(1)
-        columns_grid.addLayout(param_set_id_row, 3, 0, 1, 2)
+        right_column.addLayout(param_set_id_row)
 
-        # Row 4: Scrollable area spanning full width for ParamSet editing content
+        # Scrollable area for ParamSet editing content, filling remaining vertical space
         self._param_set_scroll_area = QScrollArea(header_group)
         self._param_set_scroll_area.setWidgetResizable(True)
         self._param_set_scroll_area.setFrameShape(QFrame.StyledPanel)
@@ -682,14 +698,17 @@ class SpoolControllerPanel(QDialog):
         self._param_set_container_layout = FlowLayout(self._param_set_container, margin=2, hSpacing=4, vSpacing=4)
         self._param_set_scroll_area.setWidget(self._param_set_container)
 
-        columns_grid.addWidget(self._param_set_scroll_area, 4, 0, 1, 2)
+        right_column.addWidget(self._param_set_scroll_area, 1)
 
-        # Row 5: stretch to absorb remaining space
-        columns_grid.setRowStretch(4, 1)
+        columns_row.addLayout(right_column, 1)
 
-        header_layout.addLayout(columns_grid)
+        header_layout.addLayout(columns_row)
 
         layout.addWidget(header_group)
+
+        # DesignConstantsSet Tuning lives in its own (non-modal) child window, opened via
+        # a button in the Parameter File Management area.
+        self._create_design_constants_window()
 
     def _create_param_file_manage_section(self, parent):
         '''
@@ -716,8 +735,7 @@ class SpoolControllerPanel(QDialog):
 
         self._param_file_manage_group = QGroupBox(PARAM_FILE_MANAGE_NAME, parent)
         param_file_manage_group = self._param_file_manage_group
-        param_file_manage_group.setMinimumHeight(200)
-        param_file_manage_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        '''
         param_file_manage_group.setStyleSheet("""
             QGroupBox {
                 border: 2px outset #b0b0b0;
@@ -737,103 +755,71 @@ class SpoolControllerPanel(QDialog):
                 left: 3px;
             }
         """)
-
+        '''
         group_layout = QVBoxLayout(param_file_manage_group)
         group_layout.setSpacing(6)
         group_layout.setContentsMargins(5, 15, 5, 5)
 
         BUTTON_WIDTH = 110
 
-        upload_row = QHBoxLayout()
-        self._upload_button = QPushButton('Upload', param_file_manage_group)
-        self._upload_button.setFixedWidth(BUTTON_WIDTH)
+        # Upload/Download buttons
+        self._upload_button = QPushButton('&Upload Params', param_file_manage_group)
         self._upload_button.clicked.connect(self._on_upload_clicked)
-        upload_row.addWidget(self._upload_button)
 
-        self._upload_textbox = QLineEdit(param_file_manage_group)
-        upload_row.addWidget(self._upload_textbox)
-
-        self._upload_browse_button = QPushButton('Browse', param_file_manage_group)
-        self._upload_browse_button.setFixedWidth(BUTTON_WIDTH)
-        self._upload_browse_button.clicked.connect(self._on_upload_browse_clicked)
-        upload_row.addWidget(self._upload_browse_button)
-        group_layout.addLayout(upload_row)
-
-        download_row = QHBoxLayout()
-        self._download_button = QPushButton('Download', param_file_manage_group)
-        self._download_button.setFixedWidth(BUTTON_WIDTH)
+        self._download_button = QPushButton('&Download Params', param_file_manage_group)
         self._download_button.clicked.connect(self._on_download_clicked)
-        download_row.addWidget(self._download_button)
-
-        self._download_textbox = QLineEdit(param_file_manage_group)
-        download_row.addWidget(self._download_textbox)
-
-        self._download_browse_button = QPushButton('Browse', param_file_manage_group)
-        self._download_browse_button.setFixedWidth(BUTTON_WIDTH)
-        self._download_browse_button.clicked.connect(self._on_download_browse_clicked)
-        download_row.addWidget(self._download_browse_button)
-        group_layout.addLayout(download_row)
 
         STATUS_LABEL_WIDTH = 60
         STATUS_TEXTBOX_WIDTH = 80
 
-        status_row = QHBoxLayout()
-        status_row.setSpacing(0)
-
+        # Version/CRC32/Dirty are stacked vertically (rather than side-by-side) so they fit
+        # within the narrow left column.
+        version_row = QHBoxLayout()
+        version_row.setSpacing(6)
         version_label = QLabel('Version:', param_file_manage_group)
         version_label.setFixedWidth(STATUS_LABEL_WIDTH)
-        status_row.addWidget(version_label)
-
+        version_row.addWidget(version_label)
         self._version_textbox = QLineEdit(param_file_manage_group)
         self._version_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
         self._version_textbox.setReadOnly(True)
-        status_row.addWidget(self._version_textbox)
+        version_row.addWidget(self._version_textbox)
+        version_row.addStretch(1)
+        group_layout.addLayout(version_row)
 
-        status_row.addSpacing(23)
-
+        crc32_row = QHBoxLayout()
+        crc32_row.setSpacing(6)
         crc32_label = QLabel('CRC32:', param_file_manage_group)
         crc32_label.setFixedWidth(STATUS_LABEL_WIDTH)
-        status_row.addWidget(crc32_label)
-
+        crc32_row.addWidget(crc32_label)
         self._crc32_textbox = QLineEdit(param_file_manage_group)
         self._crc32_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
         self._crc32_textbox.setReadOnly(True)
-        status_row.addWidget(self._crc32_textbox)
+        crc32_row.addWidget(self._crc32_textbox)
+        crc32_row.addStretch(1)
+        group_layout.addLayout(crc32_row)
 
-        status_row.addSpacing(23)
-
+        dirty_row = QHBoxLayout()
+        dirty_row.setSpacing(6)
         dirty_label = QLabel('Dirty:', param_file_manage_group)
         dirty_label.setFixedWidth(STATUS_LABEL_WIDTH)
-        status_row.addWidget(dirty_label)
-
+        dirty_row.addWidget(dirty_label)
         self._dirty_textbox = QLineEdit(param_file_manage_group)
         self._dirty_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
         self._dirty_textbox.setReadOnly(True)
-        status_row.addWidget(self._dirty_textbox)
+        dirty_row.addWidget(self._dirty_textbox)
+        dirty_row.addStretch(1)
+        group_layout.addLayout(dirty_row)
 
-        status_row.addStretch(1)
-
-        group_layout.addLayout(status_row)
-
-        group_layout.addStretch(1)
-
-        progress_row = QHBoxLayout()
-        progress_row.setSpacing(0)
         self._config_transfer_progress = QProgressBar(param_file_manage_group)
         self._config_transfer_progress.setRange(0, 100)
         self._config_transfer_progress.setValue(0)
         self._config_transfer_progress.setAlignment(Qt.AlignCenter)
-        self._config_transfer_progress.setFixedWidth(
-            (STATUS_LABEL_WIDTH * 3) + (STATUS_TEXTBOX_WIDTH * 3) + 46
-        )
-        progress_row.addWidget(self._config_transfer_progress)
-        progress_row.addStretch(1)
-        group_layout.addLayout(progress_row)
 
-        group_layout.addSpacing(2)
+        left_column.addWidget(param_file_manage_group)
 
         self._save_load_params_group = QGroupBox('Save/Load Parameters', parent)
         save_load_params_group = self._save_load_params_group
+        '''
         save_load_params_group.setStyleSheet("""
             QGroupBox {
                 border: 2px outset #b0b0b0;
@@ -853,46 +839,62 @@ class SpoolControllerPanel(QDialog):
                 left: 3px;
             }
         """)
-
-        param_file_row = QHBoxLayout(save_load_params_group)
-        param_file_row.setContentsMargins(5, 15, 5, 5)
+        '''
+        # Buttons are stacked vertically to fit within the narrow left column.
+        save_load_layout = QVBoxLayout(save_load_params_group)
+        save_load_layout.setContentsMargins(5, 15, 5, 5)
+        save_load_layout.setSpacing(6)
 
         self._create_config_file_button = QPushButton('Create Binary Parameter File', save_load_params_group)
         self._create_config_file_button.clicked.connect(self._on_create_config_file_clicked)
-        param_file_row.addWidget(self._create_config_file_button)
+        save_load_layout.addWidget(self._create_config_file_button)
 
         self._read_config_file_button = QPushButton('Read Binary Parameter File', save_load_params_group)
         self._read_config_file_button.clicked.connect(self._on_read_config_file_clicked)
-        param_file_row.addWidget(self._read_config_file_button)
+        save_load_layout.addWidget(self._read_config_file_button)
 
         self._create_config_file_json_button = QPushButton('Create Text Parameter File', save_load_params_group)
         self._create_config_file_json_button.clicked.connect(self._on_create_config_file_json_clicked)
-        param_file_row.addWidget(self._create_config_file_json_button)
+        save_load_layout.addWidget(self._create_config_file_json_button)
 
         self._read_config_file_json_button = QPushButton('Read Text Parameter File', save_load_params_group)
         self._read_config_file_json_button.clicked.connect(self._on_read_config_file_json_clicked)
-        param_file_row.addWidget(self._read_config_file_json_button)
+        save_load_layout.addWidget(self._read_config_file_json_button)
 
-        param_file_row.addStretch(1)
-
-        left_column.addWidget(param_file_manage_group)
         left_column.addWidget(save_load_params_group)
+
+        upload_download = QGroupBox(self)
+        upload_download.setTitle('Device Operations')
+        upload_download_layout = QVBoxLayout(upload_download)
+
+        upload_download_layout.addWidget(self._config_transfer_progress)
+        upload_download_layout.addWidget(self._upload_button)
+        upload_download_layout.addWidget(self._download_button)
+
+        left_column.addWidget(upload_download)
+
+        self._design_constants_button = QPushButton('Design Constants...', parent)
+        self._design_constants_button.clicked.connect(self._on_open_design_constants_clicked)
+        left_column.addWidget(self._design_constants_button)
+
+        left_column.addStretch(1)
 
         return left_column
 
-    def _on_upload_browse_clicked(self):
-        '''
-        @brief    Handle upload browse button click to select a file.
-        @return   None
-        '''
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            'Select file to upload',
-            '',
-            'All files (*.*)'
-        )
-        if filename:
-            self._upload_textbox.setText(filename)
+    def _tempfile_cleanup(self):
+        if self._temporary_file is not None:
+            try:
+                self._temporary_file.close()
+                os.unlink(self._temporary_file.name)
+                self._temporary_file = None
+            except FileNotFoundError:
+                pass
+
+    def _paramsetfile_to_tempfile(self):
+        self._tempfile_cleanup()
+        self._temporary_file = tempfile.NamedTemporaryFile(delete=False)
+        self._temporary_file.write(self._param_set_file.serialize())
+        self._temporary_file.close()
 
     def _on_upload_clicked(self):
         '''
@@ -904,15 +906,10 @@ class SpoolControllerPanel(QDialog):
             self._cancel_upload()
             return
 
-        upload_path = self._upload_textbox.text().strip()
-        if not upload_path or not os.path.isfile(upload_path):
-            self._show_ok_dialog('Upload', 'Choose a file to upload!', icon = QMessageBox.Warning)
-            return
-
-        upload_path = os.path.normcase(os.path.abspath(os.path.expanduser(upload_path)))
-
         self._config_transfer_progress.setValue(0)
         self._cleanup_config_transfer_timeout()
+
+        self._extract_param_set_file_from_ui()
 
         # Get the file server widget from the main window
         try:
@@ -925,18 +922,26 @@ class SpoolControllerPanel(QDialog):
             show_error('File Server Error', 'Could not access file server.', str(ex), parent=self, blocking=True)
             return
 
+        try:
+            if self._temporary_file:
+                file_server_widget.remove_path(self._temporary_file.name)
+        except Exception as ex:
+            pass
+
+        self._paramsetfile_to_tempfile()
+
         # Add the file to the file server
         try:
-            file_server_widget.add_path(upload_path)
+            file_server_widget.add_path(self._temporary_file.name)
             file_server_widget.force_start()
-            logger.info('File server configured for: %s', upload_path)
+            logger.info('File server configured for: %s', self._temporary_file.name)
         except Exception as ex:
             logger.exception('Could not configure file server: %s', ex)
             show_error('File Server Error', 'Could not configure file server.', str(ex), parent=self, blocking=True)
             return
 
         # Get the remote path that the file server will use
-        remote_config_file = FileServer_PathKey(upload_path)
+        remote_config_file = FileServer_PathKey(os.path.normcase(self._temporary_file.name))
         logger.info('Remote config file path: %r', remote_config_file)
         self._config_transfer_key = remote_config_file
 
@@ -961,8 +966,6 @@ class SpoolControllerPanel(QDialog):
 
         # Switch button to Cancel mode and disable browse buttons while waiting for response
         self._upload_button.setText('Cancel')
-        self._upload_browse_button.setEnabled(False)
-        self._download_browse_button.setEnabled(False)
 
         try:
             self._node.broadcast(msg, priority=BROADCAST_PRIORITY)
@@ -970,9 +973,7 @@ class SpoolControllerPanel(QDialog):
         except Exception as ex:
             logger.exception('Failed to broadcast WriteConfigFile: %s', ex)
             show_error('Broadcast failed', 'Could not broadcast WriteConfigFile.', str(ex), parent=self, blocking=True)
-            self._upload_button.setText('Upload')
-            self._upload_browse_button.setEnabled(True)
-            self._download_browse_button.setEnabled(True)
+            self._upload_button.setText(SpoolControllerPanel.TEXT_UPLOAD_BTN)
             return
 
         # Register handler for the response message
@@ -983,7 +984,7 @@ class SpoolControllerPanel(QDialog):
             )
         except Exception as ex:
             logger.exception('Could not register WriteConfigFile handler: %s', ex)
-            self._upload_button.setText('Upload')
+            self._upload_button.setText(SpoolControllerPanel.TEXT_UPLOAD_BTN)
             self._cleanup_upload_handler()
             return
 
@@ -996,28 +997,22 @@ class SpoolControllerPanel(QDialog):
                 self._config_transfer_progress.setValue(0),
                 self._on_recall_timeout(
                     f'No WriteConfigFile response was received within {RESPONSE_TIMEOUT} seconds.\n\n'
-                    f'The spool controller may be offline or not responding.'
+                    f'The Delivery Controller may be offline or not responding.'
                 ),
             )
         )
         self._upload_timeout_timer.start(RESPONSE_TIMEOUT * 1000)
 
-        self._show_message('Upload request sent. Waiting for spool controller response...')
+        self._show_message('Upload request sent. Waiting for Delivery Controller response...')
 
     def _on_download_clicked(self):
         '''
         @brief    Handle download button click: validate destination path and send ReadConfigFile.
         @return   None
         '''
-        download_path = self._download_textbox.text().strip()
-        if not download_path:
-            self._show_ok_dialog('Download', 'Choose a file to download!', icon = QMessageBox.Warning)
-            return
 
-        download_dir = os.path.dirname(download_path)
-        if download_dir and not os.path.isdir(download_dir):
-            self._show_ok_dialog('Download', 'Choose a valid download directory!', icon = QMessageBox.Warning)
-            return
+        if self._temporary_file_bytes is not None:
+            self._show_ok_dialog('Another operation is in progress.', QMessageBox.Warning)
 
         try:
             msg = dronecan.flytrex.delcon.ReadConfigFile()
@@ -1031,24 +1026,24 @@ class SpoolControllerPanel(QDialog):
                 parent=self,
                 blocking=True,
             )
+
             return
 
         # Clean up any previous download handler
         self._cleanup_download_handler()
 
-        # Disable the download and browse buttons while waiting for response
+        # Disable the download button while waiting for response
         self._download_button.setEnabled(False)
-        self._upload_browse_button.setEnabled(False)
-        self._download_browse_button.setEnabled(False)
 
         try:
             self._node.broadcast(msg, priority=BROADCAST_PRIORITY)
-            logger.info('Broadcast ReadConfigFile for %s', download_path)
         except Exception as ex:
             logger.exception('Failed to broadcast ReadConfigFile: %s', ex)
             show_error('Broadcast failed', 'Could not broadcast ReadConfigFile.', str(ex), parent=self, blocking=True)
             self._download_button.setEnabled(True)
             return
+
+        self._temporary_file = tempfile.TemporaryFile()
 
         # Register handler for the response message
         try:
@@ -1070,7 +1065,7 @@ class SpoolControllerPanel(QDialog):
                 self._cleanup_download_handler(),
                 self._on_recall_timeout(
                     f'No ReadConfigFile response was received within {RESPONSE_TIMEOUT} seconds.\n\n'
-                    f'The spool controller may be offline or not responding.'
+                    f'The Delivery Controller may be offline or not responding.'
                 ),
             )
         )
@@ -1264,11 +1259,10 @@ class SpoolControllerPanel(QDialog):
         self._param_set_file.calculate_crc()
         return True
 
-    def _populate_ui_from_param_set_file(self, source_description: str) -> None:
+    def _populate_ui_from_param_set_file(self) -> None:
         '''
         @brief    Populate the Design Constants fields, ParamSet groupboxes, and version/CRC/dirty
                   textboxes from the currently loaded self._param_set_file.
-        @param    source_description - Human-readable description of where the file came from, for logging.
         @return   None
         '''
 
@@ -1297,7 +1291,6 @@ class SpoolControllerPanel(QDialog):
         self._version_textbox.setText(str(self._param_set_file._version))
         self._crc32_textbox.setText(f'{self._param_set_file.calculate_crc():08X}')
         self._dirty_textbox.setText('False')
-        logger.info('Config loaded from %s with %d ParamSet entries', source_description, self._param_set_file._num_param_set)
 
     def _on_create_config_file_clicked(self):
         '''
@@ -1365,7 +1358,7 @@ class SpoolControllerPanel(QDialog):
             show_error('Read Error', 'Could not parse config file.', str(ex), parent=self, blocking=True)
             return
 
-        self._populate_ui_from_param_set_file(filename)
+        self._populate_ui_from_param_set_file()
         self._show_ok_dialog('Read Config File', f'Config file loaded from:\n{filename}', icon=QMessageBox.Information)
 
     def _on_create_config_file_json_clicked(self):
@@ -1432,7 +1425,7 @@ class SpoolControllerPanel(QDialog):
             show_error('Read Error', 'Could not parse JSON config file.', str(ex), parent=self, blocking=True)
             return
 
-        self._populate_ui_from_param_set_file(filename)
+        self._populate_ui_from_param_set_file()
         self._show_ok_dialog('Read Config File (JSON)', f'Config file loaded from:\n{filename}', icon = QMessageBox.Information)
 
     def _clear_all_param_set_groupboxes(self):
@@ -1571,6 +1564,7 @@ class SpoolControllerPanel(QDialog):
         param_set_scroll.setWidgetResizable(True)
         param_set_scroll.setFrameShape(QFrame.NoFrame)
         param_set_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        param_set_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         param_set_fields_container = QWidget()
         param_set_fields_container.setStyleSheet(f"background-color: {color};")
@@ -1951,19 +1945,19 @@ class SpoolControllerPanel(QDialog):
         if hasattr(error_obj, 'STATUS_FILE_NOT_FOUND') and error_value == error_obj.STATUS_FILE_NOT_FOUND:
             return (
                 f'{operation_context.capitalize()} Error',
-                'The spool controller could not find the file on the file server. Please check that the file was uploaded correctly and try again.',
+                'The Delivery Controller could not find the file on the file server. Please check that the file was uploaded correctly and try again.',
                 f'{operation_context} failed with file not found error'
             )
         elif hasattr(error_obj, 'STATUS_IO_ERROR') and error_value == error_obj.STATUS_IO_ERROR:
             return (
                 f'{operation_context.capitalize()} Error',
-                'An I/O error occurred while the spool controller was processing the request. Please try again.',
+                'An I/O error occurred while The Delivery Controller was processing the request. Please try again.',
                 f'{operation_context} failed with I/O error'
             )
         elif hasattr(error_obj, 'STATUS_ACCESS_DENIED') and error_value == error_obj.STATUS_ACCESS_DENIED:
             return (
                 f'{operation_context.capitalize()} Error',
-                'The spool controller was denied access. Please check permissions and try again.',
+                'The Delivery Controller was denied access. Please check permissions and try again.',
                 f'{operation_context} failed with access denied error'
             )
         elif hasattr(error_obj, 'STATUS_IS_DIRECTORY') and error_value == error_obj.STATUS_IS_DIRECTORY:
@@ -1981,19 +1975,19 @@ class SpoolControllerPanel(QDialog):
         elif hasattr(error_obj, 'STATUS_FILE_TOO_LARGE') and error_value == error_obj.STATUS_FILE_TOO_LARGE:
             return (
                 f'{operation_context.capitalize()} Error',
-                'The file is too large for the spool controller to handle. Please check the file size and try again.',
+                'The file is too large for The Delivery Controller to handle. Please check the file size and try again.',
                 f'{operation_context} failed with file too large error'
             )
         elif hasattr(error_obj, 'STATUS_OUT_OF_SPACE') and error_value == error_obj.STATUS_OUT_OF_SPACE:
             return (
                 f'{operation_context.capitalize()} Error',
-                'The spool controller does not have enough space. Please free up space and try again.',
+                'The Delivery Controller does not have enough space. Please free up space and try again.',
                 f'{operation_context} failed with out of space error'
             )
         elif hasattr(error_obj, 'STATUS_NOT_IMPLEMENTED') and error_value == error_obj.STATUS_NOT_IMPLEMENTED:
             return (
                 f'{operation_context.capitalize()} Error',
-                f'The spool controller does not support {operation_context} operations. Please check the controller capabilities and try again.',
+                f'The Delivery Controller does not support {operation_context} operations. Please check the controller capabilities and try again.',
                 f'{operation_context} failed with not implemented error'
             )
         elif hasattr(error_obj, 'STATUS_IDX_OUT_OF_BOUNDS') and error_value == error_obj.STATUS_IDX_OUT_OF_BOUNDS:
@@ -2005,13 +1999,13 @@ class SpoolControllerPanel(QDialog):
         elif hasattr(error_obj, 'STATUS_BUSY') and error_value == error_obj.STATUS_BUSY:
             return (
                 f'{operation_context.capitalize()} Status',
-                'The spool controller is busy. Please try again later.',
+                'The Delivery Controller is busy. Please try again later.',
                 f'{operation_context} failed - controller busy'
             )
         elif hasattr(error_obj, 'STATUS_LOW_MEM') and error_value == error_obj.STATUS_LOW_MEM:
             return (
                 f'{operation_context.capitalize()} Status',
-                'The spool controller has low memory. Please try again later.',
+                'The Delivery Controller has low memory. Please try again later.',
                 f'{operation_context} failed - low memory'
             )
         elif hasattr(error_obj, 'STATUS_UNKNOWN_ERROR') and error_value == error_obj.STATUS_UNKNOWN_ERROR:
@@ -2068,7 +2062,7 @@ class SpoolControllerPanel(QDialog):
                 self._cleanup_param_set_execute(_id),
                 self._on_recall_timeout(
                     f'No ParamSet OPERATION_RESPONSE for ParamSet ID {_id} was received within {RESPONSE_TIMEOUT} seconds.\n\n'
-                    f'The spool controller may be offline or not responding.'
+                    f'The Delivery Controller may be offline or not responding.'
                 ),
             ),
         )
@@ -2124,7 +2118,7 @@ class SpoolControllerPanel(QDialog):
                 self._cleanup_param_set_store(_id),
                 self._on_recall_timeout(
                     f'No ParamSet OPERATION_STORE response for ParamSet ID {_id} was received within {RESPONSE_TIMEOUT} seconds.\n\n'
-                    f'The spool controller may be offline or not responding.'
+                    f'The Delivery Controller may be offline or not responding.'
                 ),
             )
         )
@@ -2170,7 +2164,7 @@ class SpoolControllerPanel(QDialog):
                 self._cleanup_param_set_recall(_id),
                 self._on_recall_timeout(
                     f'No ParamSet OPERATION_RESPONSE for ParamSet ID {_id} was received within {RESPONSE_TIMEOUT} seconds.\n\n'
-                    f'The spool controller may be offline or not responding.'
+                    f'The Delivery Controller may be offline or not responding.'
                 ),
             )
         )
@@ -2238,7 +2232,7 @@ class SpoolControllerPanel(QDialog):
                 self._clear_pending_design_constants_compare(),
                 self._on_recall_timeout(
                     f'No DesignConstantsSet OPERATION_RESPONSE was received within {RESPONSE_TIMEOUT} seconds.\n\n'
-                    f'The spool controller may be offline or not responding.'
+                    f'The Delivery Controller may be offline or not responding.'
                 ),
             )
         )
@@ -2438,7 +2432,7 @@ class SpoolControllerPanel(QDialog):
     def _on_upload_response(self, event):
         '''
         @brief    Handle an incoming WriteConfigFile response message.
-                  The spool controller will automatically request the file from the file server.
+                  The Delivery Controller will automatically request the file from the file server.
         @param    event - DroneCAN transfer event containing the response message.
         @return   None
         '''
@@ -2449,7 +2443,7 @@ class SpoolControllerPanel(QDialog):
 
         try:
             if msg.error.value == msg.error.STATUS_OK:
-                logger.info('Upload successful. Spool controller is reading the config file.')
+                logger.info('The configuration file is being uploaded...')
                 self._upload_button.setText('Cancel')
                 self._start_config_transfer_timeout()
             else:
@@ -2560,12 +2554,12 @@ class SpoolControllerPanel(QDialog):
         # No new reads since last poll
         if hits > self._config_transfer_start_hits:
             message = (
-                f'The spool controller stopped reading the config file '
+                f'The Delivery Controller stopped reading the config file '
                 f'(no activity for {RESPONSE_TIMEOUT} seconds).'
             )
         else:
             message = (
-                f'No file read activity was observed from the spool controller '
+                f'No file read activity was observed from The Delivery Controller '
                 f'within {RESPONSE_TIMEOUT} seconds of the upload request.'
             )
 
@@ -2613,8 +2607,7 @@ class SpoolControllerPanel(QDialog):
             self._config_transfer_progress.setValue(100)
             self._cleanup_config_transfer_timeout()
             self._cleanup_upload_handler()
-            self._show_ok_dialog('Upload Complete', 'Config file was uploaded successfully.', icon=QMessageBox.Information)
-            self._config_transfer_progress.setValue(0)
+            # self._show_ok_dialog('Upload Complete', 'Upload succesful.', icon=QMessageBox.Information)
             return
         self._update_config_transfer_progress()
 
@@ -2693,11 +2686,8 @@ class SpoolControllerPanel(QDialog):
                 pass
             self._upload_response_handle = None
         if self._upload_button is not None:
-            self._upload_button.setText('Upload')
-        if self._upload_browse_button is not None:
-            self._upload_browse_button.setEnabled(True)
-        if self._download_browse_button is not None:
-            self._download_browse_button.setEnabled(True)
+            self._upload_button.setText(SpoolControllerPanel.TEXT_UPLOAD_BTN)
+
 
     def _cleanup_recall_handler(self):
         '''
@@ -2927,7 +2917,7 @@ class SpoolControllerPanel(QDialog):
                 self._cleanup_store_constants_handler(),
                 self._on_recall_timeout(
                     f'No DesignConstantsSet OPERATION_STORE response was received within {RESPONSE_TIMEOUT} seconds.\n\n'
-                    f'The spool controller may be offline or not responding.'
+                    f'The Delivery Controller may be offline or not responding.'
                 ),
             )
         )
@@ -2975,25 +2965,6 @@ class SpoolControllerPanel(QDialog):
         '''
         self._pending_design_constants_compare = None
 
-    def _on_download_browse_clicked(self):
-        '''
-        @brief    Handle download browse button click to select a save destination.
-        @return   None
-        '''
-        dialog = QFileDialog(self)
-        dialog.setWindowTitle('Select file to download')
-        dialog.setAcceptMode(QFileDialog.AcceptSave)
-        dialog.setFileMode(QFileDialog.AnyFile)
-        dialog.setNameFilter(SpoolControllerPanel.BIN_FILTER)
-
-        initial_path = self._download_textbox.text().strip()
-        if initial_path:
-            dialog.selectFile(initial_path)
-
-        if dialog.exec_():
-            selected_files = dialog.selectedFiles()
-            if selected_files:
-                self._download_textbox.setText(selected_files[0])
 
     def _on_download_response(self, event):
         '''
@@ -3076,7 +3047,7 @@ class SpoolControllerPanel(QDialog):
             self._show_ok_dialog(
                 'Download Timeout',
                 f'No GetInfo response for "{DOWNLOAD_CONFIG_FILE_NAME}" was received.\n\n'
-                f'The spool controller may be offline or not responding.'
+                f'The Delivery Controller may be offline or not responding.'
             )
             return
 
@@ -3094,14 +3065,16 @@ class SpoolControllerPanel(QDialog):
         # GetInfo succeeded — file exists on the remote node
         file_size = resp.size
         target_node_id = event.transfer.source_node_id
-        save_path = self._download_textbox.text().strip()
-        logger.info('GetInfo OK: file size = %d bytes, starting download from node %d to %s', file_size, target_node_id, save_path)
+        logger.info(f'GetInfo OK: file size = {file_size} bytes, starting download from node {target_node_id}')
+
+        if self._temporary_file_bytes is not None:
+            self._show_ok_dialog(title='Error', message='Another operation is in progress', icon=QMessageBox.Warning)
 
         # Start the file download thread
         self._file_download_stop.clear()
         self._file_download_thread = threading.Thread(
             target=self._file_download_thread_func,
-            args=(target_node_id, file_size, save_path),
+            args=(target_node_id, file_size),
             daemon=True,
         )
         self._file_download_thread.start()
@@ -3112,7 +3085,7 @@ class SpoolControllerPanel(QDialog):
         self._file_download_timeout_timer.timeout.connect(self._on_file_download_timeout)
         self._file_download_timeout_timer.start(CONFIG_FILE_TRANSFER_TIMEOUT * 1000)
 
-    def _file_download_thread_func(self, target_node_id, file_size, save_path):
+    def _file_download_thread_func(self, target_node_id, file_size):
         '''
         @brief    Background thread that reads a file from a remote node using
                   uavcan.protocol.file.Read requests.
@@ -3121,79 +3094,84 @@ class SpoolControllerPanel(QDialog):
         @param    save_path - Local file path to save the downloaded data.
         @return   None
         '''
+
         READ_DATA_CAPACITY = 256
         offset = 0
         bytes_written = 0
         error_message = None
 
+        if self._temporary_file_bytes is not None:
+            raise FileExistsError('Another operation is in progress')
+
+        self._temporary_file_bytes = bytes(0)
+
         try:
-            with open(save_path, 'wb') as f:
-                while not self._file_download_stop.is_set():
-                    read_event = threading.Event()
-                    read_result = [None]  # [event_or_None]
+            while not self._file_download_stop.is_set():
+                read_event = threading.Event()
+                read_result = [None]  # [event_or_None]
 
-                    def _on_read_response(evt, _result=read_result, _flag=read_event):
-                        _result[0] = evt
-                        _flag.set()
+                def _on_read_response(evt, _result=read_result, _flag=read_event):
+                    _result[0] = evt
+                    _flag.set()
 
-                    try:
-                        req = dronecan.uavcan.protocol.file.Read.Request()
-                        req.offset = offset
-                        req.path.path = DOWNLOAD_CONFIG_FILE_NAME
-                    except Exception as ex:
-                        error_message = f'Could not create file.Read request: {ex}'
-                        break
+                try:
+                    req = dronecan.uavcan.protocol.file.Read.Request()
+                    req.offset = offset
+                    req.path.path = DOWNLOAD_CONFIG_FILE_NAME
+                except Exception as ex:
+                    error_message = f'Could not create file.Read request: {ex}'
+                    break
 
-                    try:
-                        self._node.request(req, target_node_id, _on_read_response, timeout=RESPONSE_TIMEOUT)
-                    except Exception as ex:
-                        error_message = f'Failed to send file.Read request: {ex}'
-                        break
+                try:
+                    self._node.request(req, target_node_id, _on_read_response, timeout=RESPONSE_TIMEOUT)
+                except Exception as ex:
+                    error_message = f'Failed to send file.Read request: {ex}'
+                    break
 
-                    # Wait for the response callback. If neither the actual response nor
-                    # the dronecan internal timeout fires within RESPONSE_TIMEOUT seconds,
-                    # this wait itself acts as the per-packet timeout.
-                    if not read_event.wait(timeout=RESPONSE_TIMEOUT):
-                        logger.warning('file.Read per-packet timeout at offset %d '
-                            '(no response within %d seconds)', offset, RESPONSE_TIMEOUT)
-                        error_message = (
-                            f'file.Read request timed out at offset {offset}.\n\n'
-                            f'No response was received within {RESPONSE_TIMEOUT} seconds.\n'
-                            f'The spool controller may be offline or not responding.'
-                        )
-                        break
+                # Wait for the response callback. If neither the actual response nor
+                # the dronecan internal timeout fires within RESPONSE_TIMEOUT seconds,
+                # this wait itself acts as the per-packet timeout.
+                if not read_event.wait(timeout=RESPONSE_TIMEOUT):
+                    logger.warning('file.Read per-packet timeout at offset %d '
+                        '(no response within %d seconds)', offset, RESPONSE_TIMEOUT)
+                    error_message = (
+                        f'file.Read request timed out at offset {offset}.\n\n'
+                        f'No response was received within {RESPONSE_TIMEOUT} seconds.\n'
+                        f'The Delivery Controller may be offline or not responding.'
+                    )
+                    break
 
-                    evt = read_result[0]
-                    if evt is None:
-                        # dronecan internal timeout fired — callback was called with None
-                        logger.warning('file.Read dronecan timeout at offset %d', offset)
-                        error_message = (
-                            f'file.Read request timed out at offset {offset}.\n\n'
-                            f'No response was received within {RESPONSE_TIMEOUT} seconds.\n'
-                            f'The spool controller may be offline or not responding.'
-                        )
-                        break
+                evt = read_result[0]
+                if evt is None:
+                    # dronecan internal timeout fired — callback was called with None
+                    logger.warning('file.Read dronecan timeout at offset %d', offset)
+                    error_message = (
+                        f'file.Read request timed out at offset {offset}.\n\n'
+                        f'No response was received within {RESPONSE_TIMEOUT} seconds.\n'
+                        f'The Delivery Controller may be offline or not responding.'
+                    )
+                    break
 
-                    resp = evt.response
-                    if resp.error.value != 0:
-                        error_message = f'file.Read error at offset {offset}: error code {resp.error.value}'
-                        break
+                resp = evt.response
+                if resp.error.value != 0:
+                    error_message = f'file.Read error at offset {offset}: error code {resp.error.value}'
+                    break
 
-                    chunk = bytes(resp.data)
-                    f.write(chunk)
-                    bytes_written += len(chunk)
-                    offset += len(chunk)
-                    logger.debug('file.Read offset=%d, received=%d bytes, total=%d/%d',
-                        offset - len(chunk), len(chunk), bytes_written, file_size)
+                chunk = bytes(resp.data)
+                self._temporary_file_bytes += chunk
+                bytes_written += len(chunk)
+                offset += len(chunk)
+                logger.debug('file.Read offset=%d, received=%d bytes, total=%d/%d',
+                    offset - len(chunk), len(chunk), bytes_written, file_size)
 
-                    # Update progress bar on the main thread
-                    if file_size > 0:
-                        percent = min(int(bytes_written * 100 / file_size), 100)
-                        self._file_download_progress_signal.emit(percent)
+                # Update progress bar on the main thread
+                if file_size > 0:
+                    percent = min(int(bytes_written * 100 / file_size), 100)
+                    self._file_download_progress_signal.emit(percent)
 
-                    # End of file: data shorter than capacity
-                    if len(chunk) < READ_DATA_CAPACITY:
-                        break
+                # End of file: data shorter than capacity
+                if len(chunk) < READ_DATA_CAPACITY:
+                    break
 
         except Exception as ex:
             logger.exception('Unexpected error in file download thread: %s', ex)
@@ -3204,13 +3182,13 @@ class SpoolControllerPanel(QDialog):
             error_message = 'Download was cancelled.'
 
         if error_message is None:
-            logger.info('File downloaded successfully: %d bytes written to %s', bytes_written, save_path)
+            logger.info('File downloaded successfully: %d bytes', bytes_written)
 
         # Signal the main thread to handle completion
         success = error_message is None
-        self._file_download_finished_signal.emit(success, error_message or '', save_path)
+        self._file_download_finished_signal.emit(success, error_message or '')
 
-    def _on_file_download_finished(self, success, error_message, save_path):
+    def _on_file_download_finished(self, success, error_message):
         '''
         @brief    Called on the main thread when the file download thread finishes.
         @param    success - True if the download succeeded.
@@ -3224,10 +3202,8 @@ class SpoolControllerPanel(QDialog):
 
         if success:
             try:
-                with open(save_path, 'rb') as f:
-                    data = f.read()
                 param_set_file = ParamSetFile()
-                param_set_file.deserialize(data)
+                param_set_file.deserialize(self._temporary_file_bytes)
 
                 # Save original CRCs from the file before recalculation
                 orig_hdr_crc = param_set_file._hdr_crc
@@ -3245,28 +3221,28 @@ class SpoolControllerPanel(QDialog):
                     self._crc32_textbox.clear()
                     self._show_ok_dialog(
                         'Download CRC Error',
-                        f'File downloaded to:\n{save_path}\n\n'
                         f'CRC verification failed.\n'
                         f'Header CRC: file=0x{orig_hdr_crc:08X}, calculated=0x{calc_hdr_crc:08X}\n'
-                        f'Payload CRC: file=0x{orig_payload_crc:08X}, calculated=0x{calc_payload_crc:08X}'
-                    )
+                        f'Payload CRC: file=0x{orig_payload_crc:08X}, calculated=0x{calc_payload_crc:08X}')
                 else:
+                    self._param_set_file = param_set_file
+                    self._populate_ui_from_param_set_file()
                     self._version_textbox.setText(str(param_set_file._version))
                     self._crc32_textbox.setText(f'{orig_hdr_crc:08X}')
-                    self._show_ok_dialog('Download Complete', f'File downloaded successfully to:\n{save_path}', icon = QMessageBox.Information)
+                    # self._show_ok_dialog('Download Complete', f'Downloaded successfully', icon = QMessageBox.Information)
             except Exception as ex:
                 logger.exception('Failed to verify downloaded file: %s', ex)
                 self._version_textbox.clear()
                 self._crc32_textbox.clear()
                 self._show_ok_dialog(
                     'Download Verification Error',
-                    f'File was downloaded to:\n{save_path}\n\n'
-                    f'But verification failed: {ex}'
+                    f'Verification failed: {ex}'
                 )
         else:
             self._show_ok_dialog('Download Failed', error_message)
 
-        self._config_transfer_progress.setValue(0)
+        self._temporary_file_bytes = None
+
 
     def _on_file_download_timeout(self):
         '''
@@ -3283,8 +3259,9 @@ class SpoolControllerPanel(QDialog):
         self._show_ok_dialog(
             'Download Timeout',
             f'File download did not complete within {CONFIG_FILE_TRANSFER_TIMEOUT} seconds.\n\n'
-            f'The spool controller may be offline or not responding.'
+            f'The Delivery Controller may be offline or not responding.'
         )
+        self._temporary_file_bytes = None
 
     def _cleanup_file_download_timeout(self):
         '''
@@ -3317,7 +3294,7 @@ class SpoolControllerPanel(QDialog):
             'Download Timeout',
             f'No GetInfo response for "{DOWNLOAD_CONFIG_FILE_NAME}" was received '
             f'within {RESPONSE_TIMEOUT} seconds.\n\n'
-            f'The spool controller may be offline or not responding.'
+            f'The Delivery Controller may be offline or not responding.'
         )
 
     def _cleanup_download_getinfo(self):
@@ -3345,10 +3322,7 @@ class SpoolControllerPanel(QDialog):
             self._download_response_handle = None
         if self._download_button is not None:
             self._download_button.setEnabled(True)
-        if self._upload_browse_button is not None:
-            self._upload_browse_button.setEnabled(True)
-        if self._download_browse_button is not None:
-            self._download_browse_button.setEnabled(True)
+
 
     def _load_design_constants_fields(self):
         '''
@@ -3594,6 +3568,30 @@ class SpoolControllerPanel(QDialog):
         right_column.addWidget(design_const_set_group)
 
         return right_column
+
+    def _create_design_constants_window(self):
+        '''
+        @brief    Create the DesignConstantsSet Tuning window: a separate, non-modal child
+                  window (rather than an embedded section), opened via a button in the
+                  Parameter File Management area.
+        @return   None
+        '''
+        self._design_const_window = QDialog(self)
+        self._design_const_window.setWindowTitle(DESIGN_CONSTANTS_TUNE_NAME)
+        self._design_const_window.resize(420, 520)
+
+        window_layout = self._create_design_constants_section(self._design_const_window)
+        self._design_const_window.setLayout(window_layout)
+
+    def _on_open_design_constants_clicked(self):
+        '''
+        @brief    Handle the "Design Constants..." button click: show (or bring to front)
+                  the DesignConstantsSet Tuning window.
+        @return   None
+        '''
+        self._design_const_window.show()
+        self._design_const_window.raise_()
+        self._design_const_window.activateWindow()
 
     def __del__(self):
         '''
