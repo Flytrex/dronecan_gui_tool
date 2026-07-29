@@ -906,7 +906,7 @@ class SpoolControllerPanel(QDialog):
 
         upload_path = self._upload_textbox.text().strip()
         if not upload_path or not os.path.isfile(upload_path):
-            self._show_ok_dialog('Upload', 'Choose a file to upload!')
+            self._show_ok_dialog('Upload', 'Choose a file to upload!', icon = QMessageBox.Warning)
             return
 
         upload_path = os.path.normcase(os.path.abspath(os.path.expanduser(upload_path)))
@@ -1011,12 +1011,12 @@ class SpoolControllerPanel(QDialog):
         '''
         download_path = self._download_textbox.text().strip()
         if not download_path:
-            self._show_ok_dialog('Download', 'Choose a file to download!')
+            self._show_ok_dialog('Download', 'Choose a file to download!', icon = QMessageBox.Warning)
             return
 
         download_dir = os.path.dirname(download_path)
         if download_dir and not os.path.isdir(download_dir):
-            self._show_ok_dialog('Download', 'Choose a valid download directory!')
+            self._show_ok_dialog('Download', 'Choose a valid download directory!', icon = QMessageBox.Warning)
             return
 
         try:
@@ -1330,7 +1330,7 @@ class SpoolControllerPanel(QDialog):
             with open(save_path, 'wb') as f:
                 f.write(data)
             logger.info('Config file written to %s (%d bytes)', save_path, len(data))
-            self._show_ok_dialog('Create Config File', f'Config file saved to:\n{save_path}')
+            self._show_ok_dialog('Create Config File', f'Config file saved to:\n{save_path}', icon = QMessageBox.Information)
         except Exception as ex:
             logger.exception('Failed to write config file: %s', ex)
             show_error('Save Error', 'Could not write config file.', str(ex), parent=self, blocking=True)
@@ -1366,7 +1366,7 @@ class SpoolControllerPanel(QDialog):
             return
 
         self._populate_ui_from_param_set_file(filename)
-        self._show_ok_dialog('Read Config File', f'Config file loaded from:\n{filename}')
+        self._show_ok_dialog('Read Config File', f'Config file loaded from:\n{filename}', icon=QMessageBox.Information)
 
     def _on_create_config_file_json_clicked(self):
         '''
@@ -1398,7 +1398,7 @@ class SpoolControllerPanel(QDialog):
             with open(save_path, 'w', encoding='utf-8') as f:
                 f.write(json_str)
             logger.info('Config file written to %s (%d bytes)', save_path, len(json_str))
-            self._show_ok_dialog('Create Config File (JSON)', f'Config file saved to:\n{save_path}')
+            self._show_ok_dialog('Create Config File (JSON)', f'Config file saved to:\n{save_path}', QMessageBox.Information)
         except Exception as ex:
             logger.exception('Failed to write JSON config file: %s', ex)
             show_error('Save Error', 'Could not write JSON config file.', str(ex), parent=self, blocking=True)
@@ -1433,7 +1433,7 @@ class SpoolControllerPanel(QDialog):
             return
 
         self._populate_ui_from_param_set_file(filename)
-        self._show_ok_dialog('Read Config File (JSON)', f'Config file loaded from:\n{filename}')
+        self._show_ok_dialog('Read Config File (JSON)', f'Config file loaded from:\n{filename}', icon = QMessageBox.Information)
 
     def _clear_all_param_set_groupboxes(self):
         '''
@@ -1908,7 +1908,7 @@ class SpoolControllerPanel(QDialog):
                 return False
         return left_value == right_value
 
-    def _show_ok_dialog(self, title, message, success = False):
+    def _show_ok_dialog(self, title, message, icon : QMessageBox.Icon = QMessageBox.Warning):
         '''
         @brief    Show a warning dialog with a title, message, and a single OK button.
         @param    title - Dialog window title.
@@ -1916,10 +1916,8 @@ class SpoolControllerPanel(QDialog):
         @return   None
         '''
         dlg = QMessageBox(self)
-        if not success:
-            dlg.setIcon(QMessageBox.Warning)
-        else:
-            dlg.setIcon(QMessageBox.Information)
+        if icon:
+            dlg.setIcon(icon)
         dlg.setWindowTitle(str(title))
         dlg.setText(str(message))
         dlg.setStandardButtons(QMessageBox.Ok)
@@ -2615,7 +2613,7 @@ class SpoolControllerPanel(QDialog):
             self._config_transfer_progress.setValue(100)
             self._cleanup_config_transfer_timeout()
             self._cleanup_upload_handler()
-            self._show_ok_dialog('Upload Complete', 'Config file was uploaded successfully.')
+            self._show_ok_dialog('Upload Complete', 'Config file was uploaded successfully.', icon=QMessageBox.Information)
             self._config_transfer_progress.setValue(0)
             return
         self._update_config_transfer_progress()
@@ -2986,7 +2984,7 @@ class SpoolControllerPanel(QDialog):
         dialog.setWindowTitle('Select file to download')
         dialog.setAcceptMode(QFileDialog.AcceptSave)
         dialog.setFileMode(QFileDialog.AnyFile)
-        dialog.setNameFilter('All files (*.*)')
+        dialog.setNameFilter(SpoolControllerPanel.BIN_FILTER)
 
         initial_path = self._download_textbox.text().strip()
         if initial_path:
@@ -3255,7 +3253,7 @@ class SpoolControllerPanel(QDialog):
                 else:
                     self._version_textbox.setText(str(param_set_file._version))
                     self._crc32_textbox.setText(f'{orig_hdr_crc:08X}')
-                    self._show_ok_dialog('Download Complete', f'File downloaded successfully to:\n{save_path}')
+                    self._show_ok_dialog('Download Complete', f'File downloaded successfully to:\n{save_path}', icon = QMessageBox.Information)
             except Exception as ex:
                 logger.exception('Failed to verify downloaded file: %s', ex)
                 self._version_textbox.clear()
