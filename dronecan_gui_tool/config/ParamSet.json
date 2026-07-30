@@ -144,7 +144,7 @@
             "color": "black"
         }
     },
-    "target": {
+    "trajectory-generator": {
         "tg_position_setpoint": {
             "type": "float32",
             "default": 0,
