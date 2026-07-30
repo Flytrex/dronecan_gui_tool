@@ -10,6 +10,7 @@
 import dronecan
 from functools import partial
 from logging import getLogger
+from dataclasses import dataclass
 import threading
 import os
 import re
@@ -20,13 +21,14 @@ import ctypes
 import tempfile
 import atexit
 
+from .delivery_controller import DeliveryControllerCommand, DeliveryControllerMode, NodeParametersHelper
 
 from PyQt5 import QtCore
 from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer, QLocale, pyqtSignal
 from PyQt5.QtGui import QIntValidator, QColor, QFont, QKeySequence, QDoubleValidator
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy, QFrame, QScrollArea, \
-    QWidget, QLayout, QMessageBox, QProgressBar, QShortcut, QCheckBox
+    QWidget, QLayout, QMessageBox, QProgressBar, QShortcut, QCheckBox, QStyle
 import numpy as np
 
 from ..widgets import get_icon, show_error
@@ -35,9 +37,7 @@ from .utils import crc32_stm32_batch
 
 __all__ = 'PANEL_NAME', 'spawn', 'get_icon'
 
-PANEL_NAME = 'Delivery Controller: Spool'           # Main panel window title
-SPOOL_CONTROLLER_TUNE_NAME = 'Spool Controller Tuning'  # Header label for the tuning section
-PARAM_FILE_MANAGE_NAME = 'Parameter File Management'    # Label for the file upload/download section
+PANEL_NAME = 'Delivery Controller Tuning'           # Main panel window title
 DESIGN_CONSTANTS_TUNE_NAME = 'Design Constants'  # Label for the design constants section header
 PARAM_SET_EDIT_NAME = 'ParamSet Editing'            # Label for the ParamSet editing section
 PARAM_SET_ID_NAME = 'ParamSet ID'                   # Label next to the ParamSet ID widget
@@ -544,6 +544,11 @@ class _FlowContainer(QWidget):
 
 
 class SpoolControllerPanel(QDialog):
+    @dataclass
+    class NetLockCmd:
+        net_up : bool = True
+        lock_lock : bool = True
+
     
     TEXT_UPLOAD_BTN = '&Upload Params'
     TEXT_DOWNLOAD_BTN = '&Download Params'
@@ -560,12 +565,16 @@ class SpoolControllerPanel(QDialog):
         self.setMinimumSize(700, 400)
 
         self._node = node                      # Local DroneCAN node used for broadcasting messages and registering handlers
+        self._node_param_helper = NodeParametersHelper(self._node)
+        self._monitor = dronecan.app.node_monitor.NodeMonitor(node)
         self._param_set_id_list = []           # List of ParamSet IDs currently being edited
         self._param_set_color_map = {}         # param_set_id -> background color string assigned to its groupbox
         self._available_colors = list(_PARAM_SET_LIGHT_COLORS)  # Colors from the palette not currently assigned to any groupbox
         self._param_set_dirty = {}             # param_set_id -> bool indicating whether any field was edited since opening
         self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLineEdit, type_str, min_val, max_val)} for each ParamSet groupbox
         self._param_set_groupboxes = {}        # param_set_id -> QGroupBox widget for each ParamSet editing groupbox
+
+        self._last_netlock_cmd = SpoolControllerPanel.NetLockCmd()
 
         self._param_set_file: ParamSetFile = ParamSetFile()          # Currently loaded ParamSetFile object, used for editing and uploading
         self._working_file_path = None          # The file under edit
@@ -617,6 +626,7 @@ class SpoolControllerPanel(QDialog):
         atexit.register(self._tempfile_cleanup)
 
         self._setup_ui()
+        self._update_window_data()
 
     def _setup_ui(self):
         '''
@@ -632,19 +642,11 @@ class SpoolControllerPanel(QDialog):
         header_group = QGroupBox(self)
         header_layout = QVBoxLayout(header_group)
 
-        spool_tune_label = QLabel(SPOOL_CONTROLLER_TUNE_NAME)
-        font_main = QFont()
-        font_main.setBold(True)
-        font_main.setPointSize(12)
-        spool_tune_label.setFont(font_main)
-
-        # layout.addWidget(spool_tune_label)
-
         columns_row = QHBoxLayout()
 
         # Left area (narrow): Parameter File Management buttons; Design Constants Tuning
         # is opened via a button here rather than embedded in this layout.
-        left_column = self._create_param_file_manage_section(header_group)
+        left_column = self._make_left_column(header_group)
         left_container = QWidget(header_group)
         left_container.setLayout(left_column)
         left_container.setMaximumWidth(LEFT_COLUMN_MAX_WIDTH)
@@ -712,7 +714,7 @@ class SpoolControllerPanel(QDialog):
         # a button in the Parameter File Management area.
         self._create_design_constants_window()
 
-    def _create_param_file_manage_section(self, parent):
+    def _make_left_column(self, parent):
         '''
         @brief    Create the Parameter File Management section.
         @param    parent - Parent widget.
@@ -721,45 +723,15 @@ class SpoolControllerPanel(QDialog):
         left_column = QVBoxLayout()
         left_column.setContentsMargins(0, 0, 0, 0)
         left_column.setSpacing(6)
-        '''
-        font_secondary = QFont()
-        font_secondary.setBold(True)
-        param_file_manage_label = QLabel(PARAM_FILE_MANAGE_NAME, parent)
-        param_file_manage_label.setFont(font_secondary)
-        param_file_manage_label.setFixedHeight(20)
-        left_column.addWidget(param_file_manage_label, 0, Qt.AlignTop)
-
-        # Horizontal line below param_file_manage_label
-        param_line = QFrame(parent)
-        param_line.setFrameShape(QFrame.HLine)
-        param_line.setFrameShadow(QFrame.Sunken)
-        left_column.addWidget(param_line)
-
-        self._param_file_manage_group = QGroupBox(PARAM_FILE_MANAGE_NAME, parent)
-        param_file_manage_group = self._param_file_manage_group
-        group_layout = QVBoxLayout(param_file_manage_group)
-        group_layout.setSpacing(6)
-        group_layout.setContentsMargins(5, 15, 5, 5)
-        '''
-
-        BUTTON_WIDTH = 110
 
         STATUS_LABEL_WIDTH = 60
         STATUS_TEXTBOX_WIDTH = 80
-
-        # Version/CRC32/Dirty are stacked vertically (rather than side-by-side) so they fit
-        # within the narrow left column.
-
-
-        # left_column.addWidget(param_file_manage_group)
 
         self._param_file_groupbox = QGroupBox('Parameter File', parent)
         param_file_groupbox = self._param_file_groupbox
 
         # Buttons are stacked vertically to fit within the narrow left column.
         save_load_layout = QVBoxLayout(param_file_groupbox)
-        #save_load_layout.setContentsMargins(5, 15, 5, 5)
-        #save_load_layout.setSpacing(6)
 
         version_row = QHBoxLayout()
         version_row.setSpacing(6)
@@ -780,7 +752,6 @@ class SpoolControllerPanel(QDialog):
         self._crc32_textbox.setFixedWidth(STATUS_TEXTBOX_WIDTH)
         crc32_row.addWidget(self._crc32_textbox)
         crc32_row.addStretch(1)
-        # group_layout.addLayout(crc32_row)
 
         save_load_layout.addLayout(version_row)
         save_load_layout.addLayout(crc32_row)
@@ -788,6 +759,11 @@ class SpoolControllerPanel(QDialog):
         self._open_button = QPushButton('&Open', param_file_groupbox)
         self._open_button.clicked.connect(self._on_open_clicked)
         save_load_layout.addWidget(self._open_button)
+
+        self._reload_button = QPushButton('&Reload', param_file_groupbox)
+        self._reload_button.clicked.connect(self._on_reload_clicked)
+        self._reload_button.setEnabled(False)
+        save_load_layout.addWidget(self._reload_button)
 
         self._save_button = QPushButton('Save', param_file_groupbox)
         self._save_button.clicked.connect(self._on_save_clicked)
@@ -805,8 +781,6 @@ class SpoolControllerPanel(QDialog):
         save_load_layout.addWidget(self._design_constants_button)
 
         left_column.addWidget(self._param_file_groupbox)
-
-        #save_load_layout.addWidget(param_file_groupbox)
 
         upload_download = QGroupBox(self)
         upload_download.setTitle('Upload/Download')
@@ -827,14 +801,94 @@ class SpoolControllerPanel(QDialog):
         upload_download_layout.addWidget(self._config_transfer_progress)
         upload_download_layout.addWidget(self._upload_button)
         upload_download_layout.addWidget(self._download_button)
-
         left_column.addWidget(upload_download)
 
+        left_column.addWidget(self._make_device_ops_section(self))
         left_column.addStretch(1)
 
-        self._update_window_data()
-
         return left_column
+
+
+    def _make_device_ops_section(self, parent):
+        # Device operations
+        ops_groupbox = QGroupBox(self)
+        ops_groupbox.setTitle('Device Operations')
+
+        layout = QVBoxLayout(ops_groupbox)
+
+        set_override_button = QPushButton('Override', ops_groupbox)
+        set_override_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.DIRECT_OVERRIDE))
+
+        emergency_release_button = QPushButton('&Emergency Release', ops_groupbox)
+        emergency_release_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.RELEASE_WIRE))
+        emergency_release_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxCritical))
+
+        homing_button = QPushButton('&Homing', ops_groupbox)
+        homing_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.HOMING))
+
+        align_encoder_button = QPushButton('Ali&gn Encoder', ops_groupbox)
+        align_encoder_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.ALIGN_ENCODER))
+
+        layout.addWidget(emergency_release_button)
+        layout.addWidget(set_override_button)
+        layout.addWidget(align_encoder_button)
+        layout.addWidget(homing_button)
+
+        net = QGroupBox(self)
+        net.setTitle('Net')
+
+        net_up = QPushButton('Up', net)
+        net_up.clicked.connect(lambda _: self._send_netlock_command(net_up=True))
+        net_down = QPushButton('Down', net)
+        net_down.clicked.connect(lambda _: self._send_netlock_command(net_up=False))
+        net_layout = QHBoxLayout(net)
+        net_layout.addWidget(net_up)
+        net_layout.addWidget(net_down)
+
+        layout.addWidget(net)
+
+        lock = QGroupBox(self)
+        lock.setTitle('Lock')
+
+        lock_lock = QPushButton('Lock', net)
+        lock_lock.clicked.connect(lambda _: self._send_netlock_command(lock_lock=True))
+        lock_unlock = QPushButton('Unlock', net)
+        lock_unlock.clicked.connect(lambda _: self._send_netlock_command(lock_lock=False))
+        lock_layout = QHBoxLayout(lock)
+        lock_layout.addWidget(lock_lock)
+        lock_layout.addWidget(lock_unlock)
+        layout.addWidget(lock)
+
+        return ops_groupbox
+
+    def _find_first_delcon(self):
+        first_delcon = None
+        for node in self._monitor.find_all(lambda node_:
+                                           True if node_.info and str(node_.info.name).startswith('com.flytrex.delcon')
+                                           else False):
+            first_delcon = node
+            break
+
+        return first_delcon.node_id if first_delcon else None
+
+    def _send_netlock_command(self, net_up = None, lock_lock = None):
+        if net_up is not None:
+            self._last_netlock_cmd.net_up = net_up
+        if lock_lock is not None:
+            self._last_netlock_cmd.lock_lock = lock_lock
+
+        msg = dronecan.flytrex.delcon.NetLockCommand(net_up = self._last_netlock_cmd.net_up,
+                                                     lock_lock = self._last_netlock_cmd.lock_lock)
+        self._node.broadcast(msg)
+
+    def _send_mode_command(self, mode : DeliveryControllerMode):
+        cmd = DeliveryControllerCommand(mode)
+        try:
+            self._node_param_helper.delcon_mode_command(self._find_first_delcon(), cmd)
+        except Exception as e:
+            show_error(title='Failed to send command', text='Mode command not sent',
+                       informative_text=str(e), blocking=False, parent=self)
+            return
 
     def _tempfile_cleanup(self):
         if self._temporary_file is not None:
@@ -1269,6 +1323,19 @@ class SpoolControllerPanel(QDialog):
             show_error('Read Error', 'Could not parse param file.', str(ex), parent=self, blocking=True)
             return
 
+    def _on_reload_clicked(self):
+        if not self._working_file_path:
+            return
+
+        if self._working_file_path.endswith(ParamSetFile.JSON_EXTENSION):
+            self._params_load_text(self._working_file_path)
+        else:
+            self._params_load_binary(self._working_file_path)
+
+        self._populate_ui_from_param_set_file()
+        self._clean_all_dirty()
+        self._update_window_data()
+
     def _on_open_clicked(self):
         directory = os.path.dirname(self._working_file_path) if self._working_file_path is not None else QtCore.QDir.homePath()
 
@@ -1375,6 +1442,7 @@ class SpoolControllerPanel(QDialog):
 
         self._working_file_path = file_path
         self._save_button.setEnabled(True)
+        self._reload_button.setEnabled(True)
         self._clean_all_dirty()
         self._populate_ui_from_param_set_file()
         self._update_window_data()
