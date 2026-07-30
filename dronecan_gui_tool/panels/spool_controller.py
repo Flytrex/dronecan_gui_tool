@@ -20,12 +20,13 @@ import ctypes
 import tempfile
 import atexit
 
+
 from PyQt5 import QtCore
-from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer, pyqtSignal
-from PyQt5.QtGui import QIntValidator, QColor, QFont, QKeySequence
+from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer, QLocale, pyqtSignal
+from PyQt5.QtGui import QIntValidator, QColor, QFont, QKeySequence, QDoubleValidator
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy, QFrame, QScrollArea, \
-    QWidget, QLayout, QMessageBox, QProgressBar, QShortcut
+    QWidget, QLayout, QMessageBox, QProgressBar, QShortcut, QCheckBox
 import numpy as np
 
 from ..widgets import get_icon, show_error
@@ -39,7 +40,7 @@ SPOOL_CONTROLLER_TUNE_NAME = 'Spool Controller Tuning'  # Header label for the t
 PARAM_FILE_MANAGE_NAME = 'Parameter File Management'    # Label for the file upload/download section
 DESIGN_CONSTANTS_TUNE_NAME = 'Design Constants'  # Label for the design constants section header
 PARAM_SET_EDIT_NAME = 'ParamSet Editing'            # Label for the ParamSet editing section
-PARAM_SET_ID_NAME = 'ParamSet ID'                   # Label next to the ParamSet ID textbox
+PARAM_SET_ID_NAME = 'ParamSet ID'                   # Label next to the ParamSet ID widget
 PARAM_SET_NAME = 'ParamSet'                         # Prefix for individual ParamSet groupbox titles
 
 BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) between buttons in button rows
@@ -57,6 +58,7 @@ FLOAT32_MIN = float(np.finfo(np.float32).min)
 FLOAT32_MAX = float(np.finfo(np.float32).max)
 FLOAT64_MIN = float(np.finfo(np.float64).min)
 FLOAT64_MAX = float(np.finfo(np.float64).max)
+FLOAT_DECIMALS = 5
 
 _PARAM_SET_LIGHT_COLORS = [                         # Pool of light background colors assigned to ParamSet groupboxes
     '#FFFFCC',  # light yellow
@@ -666,7 +668,7 @@ class SpoolControllerPanel(QDialog):
         param_set_line.setFrameShadow(QFrame.Sunken)
         right_column.addWidget(param_set_line)
 
-        # ParamSet ID label, textbox, and Edit/Delete buttons
+        # ParamSet ID label, widget, and Edit/Delete buttons
         param_set_id_row = QHBoxLayout()
         param_set_id_label = QLabel(PARAM_SET_ID_NAME + ':', header_group)
         param_set_id_row.addWidget(param_set_id_label)
@@ -1157,21 +1159,19 @@ class SpoolControllerPanel(QDialog):
 
         temp_design_constants = DesignConstantsSetPayload()
         # Extract the current values from the Design Constants fields
-        for field_name, textbox in self._field_inputs.items():
-            raw_value = textbox.text().strip()
-            field_type = self._design_constants_fields.get(field_name, {}).get('type', 'float32')
-            try:
-                value = self._parse_value(field_type, raw_value)
-                setattr(temp_design_constants, field_name, value)
-            except Exception as ex:
-                show_error(
-                    'Invalid field value',
-                    f'Could not parse field "{field_name}".',
-                    f'Type: {field_type}\nValue: {raw_value}\nError: {ex}',
-                    parent=self,
-                    blocking=True,
-                )
-                return False
+        for field_name, widget in self._field_inputs.items():
+            raw_value = None
+            if isinstance(widget, QCheckBox):
+                raw_value = widget.isChecked()
+                setattr(temp_design_constants, field_name, bool(raw_value))
+            elif isinstance(widget, QLineEdit):
+                raw_value = widget.text().strip()
+                if isinstance(widget.validator(), QIntValidator):
+                    setattr(temp_design_constants, field_name, int(raw_value))
+                else:
+                    setattr(temp_design_constants, field_name, float(raw_value))
+            assert raw_value is not None
+
         self._param_set_file.set_design_constants(temp_design_constants)
 
         # Extract current field values from all open ParamSet groupboxes.
@@ -1193,20 +1193,18 @@ class SpoolControllerPanel(QDialog):
                 return False
 
             # Extract and set field values
-            for field_name, (textbox, field_type, *_) in field_inputs.items():
-                raw_value = textbox.text().strip()
-                try:
-                    value = self._parse_value(field_type, raw_value)
-                    setattr(temp_param_set_payload, field_name, value)
-                except Exception as ex:
-                    show_error(
-                        'Invalid field value',
-                        f'Could not parse field "{field_name}" for ParamSet {param_set_id}.',
-                        f'Type: {field_type}\nValue: {raw_value}\nError: {ex}',
-                        parent=self,
-                        blocking=True,
-                    )
-                    return False
+            for field_name, (widget, field_type, *_) in field_inputs.items():
+                raw_value = None
+                if isinstance(widget, QCheckBox):
+                    raw_value = widget.isChecked()
+                    setattr(temp_param_set_payload, field_name, bool(raw_value))
+                elif isinstance(widget, QLineEdit):
+                    raw_value = widget.text().strip()
+                    if isinstance(widget.validator(), QIntValidator):
+                        setattr(temp_param_set_payload, field_name, int(raw_value))
+                    else:
+                        setattr(temp_param_set_payload, field_name, float(raw_value))
+                assert raw_value is not None
 
             # Add the populated payload to the param set file
             self._param_set_file.add_param_set(temp_param_set_payload)
@@ -1228,9 +1226,9 @@ class SpoolControllerPanel(QDialog):
         for field_name, textbox in self._field_inputs.items():
             if not hasattr(design_constants_payload, field_name):
                 continue
-            textbox.blockSignals(True)
-            textbox.setText(str(getattr(design_constants_payload, field_name)))
-            textbox.blockSignals(False)
+            value = getattr(design_constants_payload, field_name)
+            self._set_param_edit_value_guarded(textbox, value)
+
 
         for param_set_payload in self._param_set_file._param_sets:
             param_set_id = str(param_set_payload.param_set_id)
@@ -1239,9 +1237,8 @@ class SpoolControllerPanel(QDialog):
             for field_name, (textbox, _field_type, *_) in field_inputs.items():
                 if not hasattr(param_set_payload, field_name):
                     continue
-                textbox.blockSignals(True)
-                textbox.setText(str(getattr(param_set_payload, field_name)))
-                textbox.blockSignals(False)
+                value = getattr(param_set_payload, field_name)
+                self._set_param_edit_value_guarded(textbox, value)
             self._param_set_dirty[param_set_id] = False
 
         self._version_textbox.setText(str(self._param_set_file._version))
@@ -1530,7 +1527,7 @@ class SpoolControllerPanel(QDialog):
 
         self._parse_param_set_file(param_set_id, param_set_fields_container, param_set_fields_layout)
 
-        # Mark groupbox dirty when any field textbox is edited
+        # Mark groupbox dirty when any field widget is edited
         for textbox in param_set_fields_container.findChildren(QLineEdit):
             textbox.textChanged.connect(lambda _text, _id=param_set_id: self._param_set_dirty.__setitem__(_id, True))
 
@@ -1585,7 +1582,7 @@ class SpoolControllerPanel(QDialog):
         '''
         @brief    Parse a raw string value into the appropriate Python type based on field_type.
         @param    field_type - Type string (e.g. 'float32', 'uint16', 'bool').
-        @param    raw_value - The raw string from the textbox.
+        @param    raw_value - The raw string from the widget.
         @return   Parsed value.
         '''
         ft = (field_type or '').strip()
@@ -1642,7 +1639,7 @@ class SpoolControllerPanel(QDialog):
         '''
         @brief    Return the default clear value text for a field type.
         @param    field_type - Type string (e.g. 'float32', 'uint16', 'bool').
-        @return   String value to place in a textbox when clearing.
+        @return   String value to place in a widget when clearing.
         '''
         ft = (field_type or '').strip().lower()
 
@@ -1656,26 +1653,6 @@ class SpoolControllerPanel(QDialog):
             return '0'
 
         return '0'
-
-    @staticmethod
-    def _randomize_value_for_type(field_type, min_val, max_val):
-        '''
-        @brief    Return a random value string for a field type within [min_val, max_val].
-        @param    field_type - Type string (e.g. 'float32', 'uint16', 'bool').
-        @param    min_val - Minimum allowed value.
-        @param    max_val - Maximum allowed value.
-        @return   String value to place in a textbox when randomizing.
-        '''
-        ft = (field_type or '').strip().lower()
-
-        if ft == 'bool':
-            return str(random.choice([True, False]))
-
-        if ft.startswith('float') or ft in ('float', 'double'):
-            return str(round(random.uniform(float(min_val), float(max_val)), 6))
-
-        # Integer types
-        return str(random.randint(int(min_val), int(max_val)))
 
     def _on_param_set_clear(self, param_set_id):
         '''
@@ -1694,23 +1671,6 @@ class SpoolControllerPanel(QDialog):
         self._param_set_dirty[param_set_id] = True
         self._update_window_data()
 
-    def _on_param_set_randomize(self, param_set_id):
-        '''
-        @brief    Randomize all fields in the specified ParamSet groupbox.
-        @param    param_set_id - The ParamSet ID to randomize.
-        @return   None
-        '''
-        field_inputs = self._param_set_field_inputs.get(param_set_id)
-        if not field_inputs:
-            show_error('Randomize Error', 'No fields found for this ParamSet.', '', parent=self, blocking=True)
-            return
-
-        for _field_name, (textbox, field_type, min_val, max_val) in field_inputs.items():
-            textbox.setText(self._randomize_value_for_type(field_type, min_val, max_val))
-
-        self._param_set_dirty[param_set_id] = True
-        self._update_window_data()
-
     def _on_design_constants_clear(self):
         '''
         @brief    Clear all DesignConstantsSet fields in the groupbox.
@@ -1724,22 +1684,6 @@ class SpoolControllerPanel(QDialog):
             field_type = self._design_constants_fields.get(field_name, {}).get('type', '')
             textbox.setText(self._clear_value_for_type(field_type))
 
-    def _on_design_constants_randomize(self):
-        '''
-        @brief    Randomize all DesignConstantsSet fields in the groupbox.
-        @return   None
-        '''
-        if not self._field_inputs:
-            show_error('Randomize Error', 'No design constant fields found.', '', parent=self, blocking=True)
-            return
-
-        for field_name, textbox in self._field_inputs.items():
-            field_data = self._design_constants_fields.get(field_name, {})
-            field_type = field_data.get('type', '')
-            type_min, type_max = self._get_type_range(field_type)
-            min_val = field_data.get('min_val', type_min)
-            max_val = field_data.get('max_val', type_max)
-            textbox.setText(self._randomize_value_for_type(field_type, min_val, max_val))
 
     def _send_param_set_msg(self, param_set_id, operation_name):
         '''
@@ -1779,7 +1723,7 @@ class SpoolControllerPanel(QDialog):
         if operation_name == 'OPERATION_RECALL':
             msg.param_values = []
             msg.param_value_types = []
-            for field_name, (textbox, field_type, *_) in field_inputs.items():
+            for field_name, (widget, field_type, *_) in field_inputs.items():
                 if not hasattr(msg, field_name):
                     logger.warning('Field "%s" not found on ParamSet message, skipping', field_name)
                     continue
@@ -1787,8 +1731,15 @@ class SpoolControllerPanel(QDialog):
                 msg.param_value_types.append(field_type)
 
         else:
-            for field_name, (textbox, field_type, *_) in field_inputs.items():
-                raw_value = textbox.text().strip()
+            for field_name, (widget, field_type, *_) in field_inputs.items():
+                raw_value = None
+                if isinstance(widget, QCheckBox):
+                    raw_value = widget.isChecked()
+                elif isinstance(widget, QLineEdit):
+                    raw_value = widget.text().strip()
+
+                assert raw_value is not None
+
                 if not hasattr(msg, field_name):
                     logger.warning('Field "%s" not found on ParamSet message, skipping', field_name)
                     continue
@@ -2239,8 +2190,22 @@ class SpoolControllerPanel(QDialog):
         for field_name, textbox in self._field_inputs.items():
             value = getattr(msg, field_name, None)
             if value is not None:
-                textbox.setText(str(value))
+                self._set_param_edit_value_guarded(textbox, value)
         logger.info('DesignConstantsSet received — fields populated')
+
+    @staticmethod
+    def _set_param_edit_value_guarded(widget, value):
+        widget.blockSignals(True)
+        if type(value) is float or type(value) is int:
+            assert isinstance(widget, QLineEdit)
+            widget.setText(str(round(value, FLOAT_DECIMALS)))
+        elif type(value) is bool:
+            assert isinstance(widget, QCheckBox)
+            widget.setChecked(value)
+        else:
+            assert isinstance(widget, QLineEdit)
+            widget.setText(str(value))
+        widget.blockSignals(False)
 
     def _on_param_set_response(self, event):
         '''
@@ -2299,9 +2264,7 @@ class SpoolControllerPanel(QDialog):
         for field_name, (textbox, field_type, *_) in field_inputs.items():
             value = getattr(msg, field_name, None)
             if value is not None:
-                textbox.blockSignals(True)
-                textbox.setText(str(value))
-                textbox.blockSignals(False)
+                self._set_param_edit_value_guarded(textbox, value)
         self._param_set_dirty[param_set_id] = False
         logger.info('ParamSet OPERATION_RESPONSE received — ParamSet %s fields populated', param_set_id)
 
@@ -3355,26 +3318,38 @@ class SpoolControllerPanel(QDialog):
                     label.setStyleSheet(f'color: {color};')
                 fields_layout.addWidget(label, row, 0)
 
-                # Textbox
-                textbox = QLineEdit(fields_container)
-                textbox.setFixedHeight(20)
-                textbox.setStyleSheet("background-color: white;")
-                default_value = field_data.get('default', '')
-                textbox.setText(str(default_value))
                 field_type = field_data.get('type', '')
                 type_min, type_max = self._get_type_range(field_type)
                 min_val = field_data.get('min_val', type_min)
                 max_val = field_data.get('max_val', type_max)
+
+
+                default_value = field_data.get('default', '')
+                if 'float' in field_type:
+                    widget = QLineEdit(fields_container)
+                    widget.setFixedHeight(20)
+                    widget.setStyleSheet("background-color: white;")
+                    widget.setText(str(default_value))
+                    validator = QDoubleValidator(min_val, max_val, FLOAT_DECIMALS, self)
+                    validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+                    validator.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
+                    widget.setValidator(validator)
+                elif 'bool' in field_type:
+                    widget = QCheckBox(fields_container)
+                    widget.setChecked(bool(default_value))
+                else:
+                    raise AssertionError(f'invalid type {field_type}')
+
                 tip_parts = []
                 if field_type:
                     tip_parts.append(f'{field_type} type')
                 if min_val is not None and max_val is not None:
                     tip_parts.append(f'Range: [{min_val}, {max_val}]')
                 if tip_parts:
-                    textbox.setToolTip('\n'.join(tip_parts))
-                fields_layout.addWidget(textbox, row, 1)
+                    widget.setToolTip('\n'.join(tip_parts))
+                fields_layout.addWidget(widget, row, 1)
 
-                field_inputs[field_name] = (textbox, field_type, min_val, max_val)
+                field_inputs[field_name] = (widget, field_type, min_val, max_val)
 
                 fields_layout.setRowMinimumHeight(row, 0)
                 row += 1
@@ -3406,26 +3381,43 @@ class SpoolControllerPanel(QDialog):
                 label.setStyleSheet(f'color: {color};')
             fields_layout.addWidget(label, row, 0)
 
-            # Textbox
-            textbox = QLineEdit(fields_container)
-            textbox.setFixedHeight(20)
-            textbox.setStyleSheet("background-color: white;")
             default_value = field_data.get('default', '')
-            textbox.setText(str(default_value))
             field_type = field_data.get('type', '')
             type_min, type_max = self._get_type_range(field_type)
             min_val = field_data.get('min_val', type_min)
             max_val = field_data.get('max_val', type_max)
+
+            # Textbox
+            if 'float' in field_type or 'int' in field_type:
+                validator = None
+                widget = QLineEdit(fields_container)
+                widget.setFixedHeight(20)
+                widget.setStyleSheet("background-color: white;")
+                widget.setText(str(default_value))
+                if 'float' in field_type:
+                    validator = QDoubleValidator(min_val, max_val, FLOAT_DECIMALS, self)
+                    validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+                    validator.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
+                    widget.setValidator(validator)
+                elif 'int' in field_type:
+                    validator = QIntValidator(min_val, max_val, self)
+                widget.setValidator(validator)
+            elif 'bool' in field_type:
+                widget = QCheckBox(fields_container)
+                widget.setChecked(bool(default_value))
+            else:
+                raise AssertionError(f'invalid type {field_type}')
+
             tip_parts = []
             if field_type:
                 tip_parts.append(f'{field_type} type')
             if min_val is not None and max_val is not None:
                 tip_parts.append(f'Range: [{min_val}, {max_val}]')
             if tip_parts:
-                textbox.setToolTip('\n'.join(tip_parts))
-            fields_layout.addWidget(textbox, row, 1)
+                widget.setToolTip('\n'.join(tip_parts))
+            fields_layout.addWidget(widget, row, 1)
 
-            self._field_inputs[field_name] = textbox
+            self._field_inputs[field_name] = widget
             fields_layout.setRowMinimumHeight(row, 0)
             row += 1
 
@@ -3539,41 +3531,14 @@ class SpoolControllerPanel(QDialog):
 
         try:
             self._cleanup_upload_handler()
-        except Exception:
-            pass
-        try:
             self._cleanup_config_transfer_timeout()
-        except Exception:
-            pass
-        try:
             self._cleanup_download_handler()
-        except Exception:
-            pass
-        try:
             self._cleanup_download_getinfo()
-        except Exception:
-            pass
-        try:
             self._cleanup_recall_handler()
-        except Exception:
-            pass
-        try:
             self._cleanup_store_constants_handler()
-        except Exception:
-            pass
-        try:
             self._cleanup_param_set_recall_handler()
-        except Exception:
-            pass
-        try:
             self._cleanup_param_set_store_handler()
-        except Exception:
-            pass
-        try:
             self._cleanup_param_set_execute_handler()
-        except Exception:
-            pass
-        try:
             self._stop_file_download_thread()
         except Exception:
             pass
