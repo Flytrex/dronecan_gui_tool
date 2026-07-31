@@ -46,7 +46,7 @@ PARAM_SET_NAME = 'ParamSet'                         # Prefix for individual Para
 BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) between buttons in button rows
 PARAM_SET_GROUPBOX_HEIGHT = 500                     # Fixed height (px) for each ParamSet editing groupbox
 PARAM_SET_GROUPBOX_WIDTH = 240                      # Fixed width (px) for each ParamSet editing groupbox
-LEFT_COLUMN_MAX_WIDTH = 260                         # Maximum width (px) of the narrow left-hand button column
+LEFT_COLUMN_MAX_WIDTH = 180                         # Maximum width (px) of the narrow left-hand button column
 RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
 CONFIG_FILE_TRANSFER_TIMEOUT = 30                   # Number of seconds to wait for a param file upload/download to complete before showing a timeout error dialog
 BROADCAST_PRIORITY = 16                             # DroneCAN message broadcast priority (lower number = higher priority)
@@ -707,12 +707,11 @@ class SpoolControllerPanel(QDialog):
         columns_row.addLayout(right_column, 1)
 
         header_layout.addLayout(columns_row)
-
         layout.addWidget(header_group)
 
-        # DesignConstantsSet Tuning lives in its own (non-modal) child window, opened via
-        # a button in the Parameter File Management area.
         self._create_design_constants_window()
+
+        self.setMinimumSize(800, 800)
 
     def _make_left_column(self, parent):
         '''
@@ -819,7 +818,7 @@ class SpoolControllerPanel(QDialog):
         set_override_button = QPushButton('Override', ops_groupbox)
         set_override_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.DIRECT_OVERRIDE))
 
-        emergency_release_button = QPushButton('&Emergency Release', ops_groupbox)
+        emergency_release_button = QPushButton('R&elease', ops_groupbox)
         emergency_release_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.RELEASE_WIRE))
         emergency_release_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxCritical))
 
@@ -829,10 +828,27 @@ class SpoolControllerPanel(QDialog):
         align_encoder_button = QPushButton('Ali&gn Encoder', ops_groupbox)
         align_encoder_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.ALIGN_ENCODER))
 
-        layout.addWidget(emergency_release_button)
-        layout.addWidget(set_override_button)
+        update_constants_button = QPushButton('Update &Constants', ops_groupbox)
+        update_constants_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.INITIAL))
+
+        height_textbox = QLineEdit(self)
+        height_textbox.setText('0.0')
+        height_textbox.setValidator(SpoolControllerPanel._make_double_validator(-100, 100, self))
+
+        stage_hook_button = QPushButton('Stage Hook', ops_groupbox)
+        stage_hook_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.HOOK_STAGING, float(height_textbox.text())))
+
+        stage_hook_row = QHBoxLayout(ops_groupbox)
+        stage_hook_row.addWidget(stage_hook_button)
+        stage_hook_row.addWidget(height_textbox)
+        stage_hook_row.addWidget(QLabel('m', self))
+
+        layout.addWidget(update_constants_button)
         layout.addWidget(align_encoder_button)
         layout.addWidget(homing_button)
+        layout.addWidget(emergency_release_button)
+        layout.addWidget(set_override_button)
+        layout.addLayout(stage_hook_row)
 
         net = QGroupBox(self)
         net.setTitle('Net')
@@ -881,8 +897,10 @@ class SpoolControllerPanel(QDialog):
                                                      lock_lock = self._last_netlock_cmd.lock_lock)
         self._node.broadcast(msg)
 
-    def _send_mode_command(self, mode : DeliveryControllerMode):
+    def _send_mode_command(self, mode : DeliveryControllerMode, wire_extension_m : float | None = None):
         cmd = DeliveryControllerCommand(mode)
+        if wire_extension_m:
+            cmd.wire_extension_m = wire_extension_m
         try:
             self._node_param_helper.delcon_mode_command(self._find_first_delcon(), cmd)
         except Exception as e:
@@ -3398,10 +3416,7 @@ class SpoolControllerPanel(QDialog):
                     widget.setFixedHeight(20)
                     widget.setStyleSheet("background-color: white;")
                     widget.setText(str(default_value))
-                    validator = QDoubleValidator(min_val, max_val, FLOAT_DECIMALS, self)
-                    validator.setNotation(QDoubleValidator.Notation.StandardNotation)
-                    validator.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
-                    widget.setValidator(validator)
+                    widget.setValidator(SpoolControllerPanel._make_double_validator(min_val, max_val, self))
                 elif 'bool' in field_type:
                     widget = QCheckBox(fields_container)
                     widget.setChecked(bool(default_value))
@@ -3427,6 +3442,13 @@ class SpoolControllerPanel(QDialog):
 
         # Add stretch at the bottom to push fields to the top
         fields_layout.setRowStretch(row, 1)
+
+    @staticmethod
+    def _make_double_validator(min_val, max_val, parent) -> QDoubleValidator:
+        validator = QDoubleValidator(min_val, max_val, FLOAT_DECIMALS, parent)
+        validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        validator.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
+        return validator
 
     def _parse_design_constant_set_file(self, fields_container, fields_layout):
         '''
@@ -3463,10 +3485,7 @@ class SpoolControllerPanel(QDialog):
                 widget.setStyleSheet("background-color: white;")
                 widget.setText(str(default_value))
                 if 'float' in field_type:
-                    validator = QDoubleValidator(min_val, max_val, FLOAT_DECIMALS, self)
-                    validator.setNotation(QDoubleValidator.Notation.StandardNotation)
-                    validator.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
-                    widget.setValidator(validator)
+                    widget.setValidator(SpoolControllerPanel._make_double_validator(min_val, max_val, self))
                 elif 'int' in field_type:
                     validator = QIntValidator(min_val, max_val, self)
                 widget.setValidator(validator)
