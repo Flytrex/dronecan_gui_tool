@@ -24,7 +24,7 @@
             "color": "black"
         }
     },
-    "limits": {
+    "limiter": {
         "min_effort_limit": {
             "type": "float32",
             "default": 0,

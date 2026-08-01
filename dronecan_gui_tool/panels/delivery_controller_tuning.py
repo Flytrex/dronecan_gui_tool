@@ -552,6 +552,9 @@ class SpoolControllerPanel(QDialog):
     
     TEXT_UPLOAD_BTN = '&Upload Params'
     TEXT_DOWNLOAD_BTN = '&Download Params'
+
+    PARAMSET_LABEL_WIDTH = 150
+    PARAMSET_LINEEDIT_WIDTH = 65
     
     _file_download_finished_signal = pyqtSignal(bool, str)  # success, error_message
     _file_download_progress_signal = pyqtSignal(int)             # percent 0-100
@@ -562,7 +565,7 @@ class SpoolControllerPanel(QDialog):
         self.setWindowIcon(get_icon())
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.resize(900, 600)
-        self.setMinimumSize(700, 400)
+        self.setMinimumSize(900, 600)
 
         self._node = node                      # Local DroneCAN node used for broadcasting messages and registering handlers
         self._node_param_helper = NodeParametersHelper(self._node)
@@ -571,7 +574,7 @@ class SpoolControllerPanel(QDialog):
         self._param_set_color_map = {}         # param_set_id -> background color string assigned to its groupbox
         self._available_colors = list(_PARAM_SET_LIGHT_COLORS)  # Colors from the palette not currently assigned to any groupbox
         self._param_set_dirty = {}             # param_set_id -> bool indicating whether any field was edited since opening
-        self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLineEdit, type_str, min_val, max_val)} for each ParamSet groupbox
+        self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLabel, QLineEdit, type_str, min_val, max_val)} for each ParamSet groupbox
         self._param_set_groupboxes = {}        # param_set_id -> QGroupBox widget for each ParamSet editing groupbox
 
         self._last_netlock_cmd = SpoolControllerPanel.NetLockCmd()
@@ -687,6 +690,13 @@ class SpoolControllerPanel(QDialog):
         self._delete_button = QPushButton('Delete', header_group)
         self._delete_button.clicked.connect(self._on_delete_clicked)
         param_set_id_row.addWidget(self._delete_button)
+
+        self._hide_zero_values = QCheckBox(header_group)
+        hide_zero_values_label = QLabel('Hide zeros?', header_group)
+        self._hide_zero_values.clicked.connect(self._on_hide_zero_values_clicked)
+
+        param_set_id_row.addWidget(hide_zero_values_label)
+        param_set_id_row.addWidget(self._hide_zero_values)
 
         param_set_id_row.addStretch(1)
         right_column.addLayout(param_set_id_row)
@@ -1035,6 +1045,10 @@ class SpoolControllerPanel(QDialog):
 
         self._show_message('Upload request sent. Waiting for Delivery Controller response...')
 
+    def _on_hide_zero_values_clicked(self):
+        self._extract_param_set_file_from_ui()
+        self._populate_ui_from_param_set_file()
+
     def _on_download_clicked(self):
         '''
         @brief    Handle download button click: validate destination path and send ReadConfigFile.
@@ -1265,7 +1279,7 @@ class SpoolControllerPanel(QDialog):
                 return False
 
             # Extract and set field values
-            for field_name, (widget, field_type, *_) in field_inputs.items():
+            for field_name, (label, widget, field_type, *_) in field_inputs.items():
                 raw_value = None
                 if isinstance(widget, QCheckBox):
                     raw_value = widget.isChecked()
@@ -1295,22 +1309,30 @@ class SpoolControllerPanel(QDialog):
         self._clear_all_param_set_groupboxes()
 
         design_constants_payload = self._param_set_file._design_constants_set_payload
-        for field_name, textbox in self._field_inputs.items():
+        for field_name, widget in self._field_inputs.items():
             if not hasattr(design_constants_payload, field_name):
                 continue
             value = getattr(design_constants_payload, field_name)
-            self._set_param_edit_value_guarded(textbox, value)
+            self._set_param_edit_value_guarded(widget, value)
 
 
         for param_set_payload in self._param_set_file._param_sets:
             param_set_id = str(param_set_payload.param_set_id)
             self._add_param_set_editing_content(param_set_id)
             field_inputs = self._param_set_field_inputs.get(param_set_id, {})
-            for field_name, (textbox, _field_type, *_) in field_inputs.items():
+            for field_name, (field_label, widget, _field_type, *_) in field_inputs.items():
                 if not hasattr(param_set_payload, field_name):
                     continue
                 value = getattr(param_set_payload, field_name)
-                self._set_param_edit_value_guarded(textbox, value)
+                self._set_param_edit_value_guarded(widget, value)
+                if isinstance(widget, QLineEdit):
+                    if abs(value) < 0.000001 and self._hide_zero_values.isChecked():
+                        field_label.setVisible(False)
+                        widget.setVisible(False)
+                    else:
+                        field_label.setVisible(True)
+                        widget.setVisible(True)
+
             self._param_set_dirty[param_set_id] = False
 
         self._version_textbox.setText(str(self._param_set_file._version))
@@ -1378,6 +1400,8 @@ class SpoolControllerPanel(QDialog):
         self._populate_ui_from_param_set_file()
         self._clean_all_dirty()
         self._update_window_data()
+        self._save_button.setEnabled(True)
+        self._reload_button.setEnabled(True)
 
     def _clean_all_dirty(self):
         for k in self._param_set_dirty:
@@ -1751,7 +1775,7 @@ class SpoolControllerPanel(QDialog):
             show_error('Clear Error', 'No fields found for this ParamSet.', '', parent=self, blocking=True)
             return
 
-        for _field_name, (textbox, field_type, *_) in field_inputs.items():
+        for _field_name, (label, textbox, field_type, *_) in field_inputs.items():
             textbox.setText(self._clear_value_for_type(field_type))
 
         self._param_set_dirty[param_set_id] = True
@@ -1809,7 +1833,7 @@ class SpoolControllerPanel(QDialog):
         if operation_name == 'OPERATION_RECALL':
             msg.param_values = []
             msg.param_value_types = []
-            for field_name, (widget, field_type, *_) in field_inputs.items():
+            for field_name, (label, widget, field_type, *_) in field_inputs.items():
                 if not hasattr(msg, field_name):
                     logger.warning('Field "%s" not found on ParamSet message, skipping', field_name)
                     continue
@@ -1817,7 +1841,7 @@ class SpoolControllerPanel(QDialog):
                 msg.param_value_types.append(field_type)
 
         else:
-            for field_name, (widget, field_type, *_) in field_inputs.items():
+            for field_name, (label, widget, field_type, *_) in field_inputs.items():
                 raw_value = None
                 if isinstance(widget, QCheckBox):
                     raw_value = widget.isChecked()
@@ -1864,7 +1888,7 @@ class SpoolControllerPanel(QDialog):
             return None
 
         snapshot = {}
-        for field_name, (textbox, field_type, *_) in field_inputs.items():
+        for field_name, (label, textbox, field_type, *_) in field_inputs.items():
             raw_value = textbox.text().strip()
             try:
                 snapshot[field_name] = self._parse_value(field_type, raw_value)
@@ -2330,7 +2354,7 @@ class SpoolControllerPanel(QDialog):
                 return
 
         if compare_snapshot is not None:
-            for field_name, (textbox, field_type, *_) in field_inputs.items():
+            for field_name, (label, textbox, field_type, *_) in field_inputs.items():
                 if not hasattr(msg, field_name):
                     continue
                 recalled_value = getattr(msg, field_name, None)
@@ -2347,7 +2371,7 @@ class SpoolControllerPanel(QDialog):
             self._param_set_dirty[param_set_id] = False
             return
 
-        for field_name, (textbox, field_type, *_) in field_inputs.items():
+        for field_name, (label, textbox, field_type, *_) in field_inputs.items():
             value = getattr(msg, field_name, None)
             if value is not None:
                 self._set_param_edit_value_guarded(textbox, value)
@@ -3396,6 +3420,7 @@ class SpoolControllerPanel(QDialog):
                 # Label
                 label = QLabel(field_name + ':', fields_container)
                 label.setFixedHeight(20)
+                label.setFixedWidth(SpoolControllerPanel.PARAMSET_LABEL_WIDTH)
                 comment = field_data.get('comment', '')
                 if comment:
                     label.setToolTip(comment)
@@ -3417,6 +3442,7 @@ class SpoolControllerPanel(QDialog):
                     widget.setStyleSheet("background-color: white;")
                     widget.setText(str(default_value))
                     widget.setValidator(SpoolControllerPanel._make_double_validator(min_val, max_val, self))
+                    widget.setFixedWidth(SpoolControllerPanel.PARAMSET_LINEEDIT_WIDTH)
                 elif 'bool' in field_type:
                     widget = QCheckBox(fields_container)
                     widget.setChecked(bool(default_value))
@@ -3432,7 +3458,7 @@ class SpoolControllerPanel(QDialog):
                     widget.setToolTip('\n'.join(tip_parts))
                 fields_layout.addWidget(widget, row, 1)
 
-                field_inputs[field_name] = (widget, field_type, min_val, max_val)
+                field_inputs[field_name] = (label, widget, field_type, min_val, max_val)
 
                 fields_layout.setRowMinimumHeight(row, 0)
                 row += 1
