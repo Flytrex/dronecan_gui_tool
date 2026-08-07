@@ -19,7 +19,6 @@ from . import hobbywing_esc
 from . import rc_panel
 from . import flytrex_esc
 from . import BMS_panel
-from . import delivery_controller_modes
 from . import delivery_controller_tuning
 
 class PanelDescriptor:
@@ -52,6 +51,5 @@ PANELS = [
     PanelDescriptor(hobbywing_esc),
     PanelDescriptor(rc_panel),
     PanelDescriptor(flytrex_esc),
-    PanelDescriptor(delivery_controller_modes),
     PanelDescriptor(delivery_controller_tuning)
 ]

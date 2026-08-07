@@ -12,23 +12,22 @@ import math
 
 logger = getLogger(__name__)
 
-
 class DeliveryControllerMode(IntEnum):
     INITIAL                 = 0
     ALIGN_ENCODER           = 1
     HOMING                  = 2
-    RESERVED1               = 3
+    SELF_TEST               = 3
     DIRECT_OVERRIDE         = 4
     HALT                    = 5
     GROUND_UNLOAD           = 6
-    RESERVED2               = 7
+    CONTROLLED_RELEASE      = 7
     HOOK_STAGING            = 8
-    LIFT_PACKAGE            = 9
+    PACKAGE_STAGING         = 9
     RESERVED3               = 10
-    LANDING                 = 11
-    PREPARE_FOR_DELIVERY    = 12
+    PRE_LANDING             = 11
+    PRE_DELIVERY            = 12
     DELIVERY                = 13
-    RELEASE_WIRE            = 14
+    UNCONTROLLED_RELEASE    = 14
 
 
 @dataclass

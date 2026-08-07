@@ -91,8 +91,6 @@ _MONITORING_GROUPS = [
         ('aux',  'shaft_pos_rad',         'θ',             'rad'),
         ('aux',  'shaft_torque_Nm',       'Torque',        'N·m'),
         ('aux',  'shaft_speed_rad_s',     'ω',             'rad/s'),
-        ('aux',  'Iq_A',                  'I<sub>q</sub>', 'A'),
-        ('aux',  'power_W',               'Power',         'W'),
     ]),
     ('Motor Status', [
         ('aux',  'fet_temp_degC',         'T<sub>FET</sub>',   '°C'),
@@ -104,10 +102,12 @@ _MONITORING_GROUPS = [
         ('aux',  'encoder_agc_value',     'Enc. Gain',         ''),
     ]),
     ('Vector Control', [
-        ('aux',  'Vq_V',              'V<sub>q</sub>',           'V'),
-        ('aux',  'Vd_V',               'V<sub>d</sub>',          'V'),
-        ('aux',  'energy_counter_J',      'Energy',              'J'),
+        ('aux',  'Vq_V',                  'V<sub>q</sub>',       'V'),
+        ('aux',  'Vd_V',                  'V<sub>d</sub>',       'V'),
+        ('aux',  'Iq_A',                  'I<sub>q</sub>',       'A'),
         ('aux',  'Iq_requested_A',        'I<sub>q<sub> req. ',  'A'),
+        ('aux',  'energy_counter_J',      'Energy',              'J'),
+        ('aux',  'power_W',               'Power',               'W'),
     ]),
     ('Servo Status', [
         ('main', 'net_state',             'Net',                 ''),
@@ -596,10 +596,6 @@ class DeliveryControllerPanel(QDialog):
         net_up : bool = True
         lock_lock : bool = True
 
-    
-    TEXT_UPLOAD_BTN = '&Upload Params'
-    TEXT_DOWNLOAD_BTN = '&Download Params'
-
     PARAMSET_LABEL_WIDTH = 150
     PARAMSET_LINEEDIT_WIDTH = 65
     
@@ -611,8 +607,8 @@ class DeliveryControllerPanel(QDialog):
         self.setWindowTitle(PANEL_NAME)
         self.setWindowIcon(get_icon())
         self.setAttribute(Qt.WA_DeleteOnClose)
-        self.resize(1200, 700)
-        self.setMinimumSize(1200, 700)
+        self.resize(1150, 900)
+        self.setMinimumSize(1150, 900)
 
         self._node = node                      # Local DroneCAN node used for broadcasting messages and registering handlers
         self._node_param_helper = NodeParametersHelper(self._node)
@@ -722,13 +718,13 @@ class DeliveryControllerPanel(QDialog):
 
         for group_name, fields in _MONITORING_GROUPS:
             group_box = QGroupBox(group_name, self._monitoring_groupbox)
-            group_box.setFixedWidth(200)
+            group_box.setFixedWidth(200 if group_name == 'Device Status' else 170)
 
             group_layout = QVBoxLayout(group_box)
             group_layout.setSpacing(1)
 
             for _source, field_name, display_name, units in fields:
-                if group_name is 'Device Status':
+                if group_name == 'Device Status':
                     widget, value_label = self._make_monitoring_field_widget(display_name, units, value_width=90)
                 else:
                     widget, value_label = self._make_monitoring_field_widget(display_name, units)
@@ -862,6 +858,7 @@ class DeliveryControllerPanel(QDialog):
         @param    parent - Parent widget.
         @return   QVBoxLayout containing the section.
         '''
+
         left_column = QVBoxLayout()
         left_column.setContentsMargins(0, 0, 0, 0)
         left_column.setSpacing(6)
@@ -900,26 +897,32 @@ class DeliveryControllerPanel(QDialog):
 
         self._open_button = QPushButton('&Open', param_file_groupbox)
         self._open_button.clicked.connect(self._on_open_clicked)
+        self._open_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton))
         save_load_layout.addWidget(self._open_button)
 
         self._reload_button = QPushButton('&Reload', param_file_groupbox)
         self._reload_button.clicked.connect(self._on_reload_clicked)
         self._reload_button.setEnabled(False)
+        self._reload_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         save_load_layout.addWidget(self._reload_button)
 
         self._save_button = QPushButton('Save', param_file_groupbox)
         self._save_button.clicked.connect(self._on_save_clicked)
         self._save_button.setEnabled(False)
+        self._save_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
         save_load_layout.addWidget(self._save_button)
         shortcut = QShortcut(QKeySequence('Ctrl+S'), self)
         shortcut.activated.connect(self._on_save_clicked)
 
         self._save_as_button = QPushButton('&Save As', param_file_groupbox)
         self._save_as_button.clicked.connect(self._on_save_as_clicked)
+        self._save_as_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+
         save_load_layout.addWidget(self._save_as_button)
 
         self._design_constants_button = QPushButton('&Design Constants', parent)
         self._design_constants_button.clicked.connect(self._on_open_design_constants_clicked)
+        self._design_constants_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))
         save_load_layout.addWidget(self._design_constants_button)
 
         left_column.addWidget(self._param_file_groupbox)
@@ -931,9 +934,11 @@ class DeliveryControllerPanel(QDialog):
         # Upload/Download buttons
         self._upload_button = QPushButton('&Upload Params', upload_download)
         self._upload_button.clicked.connect(self._on_upload_clicked)
+        self._upload_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveFDIcon))
 
         self._download_button = QPushButton('&Download Params', upload_download)
         self._download_button.clicked.connect(self._on_download_clicked)
+        self._download_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
 
         self._config_transfer_progress = QProgressBar(param_file_groupbox)
         self._config_transfer_progress.setRange(0, 100)
@@ -954,45 +959,50 @@ class DeliveryControllerPanel(QDialog):
     def _make_device_ops_section(self, parent):
         # Device operations
         ops_groupbox = QGroupBox(self)
-        ops_groupbox.setTitle('Device Operations')
-
+        ops_groupbox.setTitle('Device Modes')
         layout = QVBoxLayout(ops_groupbox)
 
-        set_override_button = QPushButton('Override', ops_groupbox)
-        set_override_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.DIRECT_OVERRIDE))
+        def make_button(text, mode, icon = None):
+            button = QPushButton(text, ops_groupbox)
+            button.clicked.connect(lambda _: self._send_mode_command(mode))
+            if icon:
+                button.setIcon(self.style().standardIcon(icon))
+            layout.addWidget(button)
 
-        emergency_release_button = QPushButton('R&elease', ops_groupbox)
-        emergency_release_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.RELEASE_WIRE))
-        emergency_release_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxCritical))
+        def make_button_with_wire(text, mode, icon = None):
+            textbox = QLineEdit(self)
+            textbox.setText('0.0')
+            textbox.setValidator(DeliveryControllerPanel._make_double_validator(-100, 100, self))
+            textbox.setFixedWidth(30)
 
-        homing_button = QPushButton('&Homing', ops_groupbox)
-        homing_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.HOMING))
+            button = QPushButton(text, ops_groupbox)
+            button.clicked.connect(lambda _: self._send_mode_command(mode, float(textbox.text())))
 
-        align_encoder_button = QPushButton('Ali&gn Encoder', ops_groupbox)
-        align_encoder_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.ALIGN_ENCODER))
+            if icon:
+                button.setIcon(self.style().standardIcon((icon)))
 
-        update_constants_button = QPushButton('Update &Constants', ops_groupbox)
-        update_constants_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.INITIAL))
+            button.setFixedWidth(90)
 
-        height_textbox = QLineEdit(self)
-        height_textbox.setText('0.0')
-        height_textbox.setValidator(DeliveryControllerPanel._make_double_validator(-100, 100, self))
-        height_textbox.setFixedWidth(30)
+            row = QHBoxLayout(ops_groupbox)
+            row.addWidget(button)
+            row.addWidget(textbox)
+            row.addWidget(QLabel('m', self))
 
-        stage_hook_button = QPushButton('Stage Hook', ops_groupbox)
-        stage_hook_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.HOOK_STAGING, float(height_textbox.text())))
+            layout.addLayout(row)
 
-        stage_hook_row = QHBoxLayout(ops_groupbox)
-        stage_hook_row.addWidget(stage_hook_button)
-        stage_hook_row.addWidget(height_textbox)
-        stage_hook_row.addWidget(QLabel('m', self))
-
-        layout.addWidget(update_constants_button)
-        layout.addWidget(align_encoder_button)
-        layout.addWidget(homing_button)
-        layout.addWidget(emergency_release_button)
-        layout.addWidget(set_override_button)
-        layout.addLayout(stage_hook_row)
+        make_button('Set Constants', DeliveryControllerMode.INITIAL)
+        make_button('Align Encoder', DeliveryControllerMode.ALIGN_ENCODER)
+        make_button('Override', DeliveryControllerMode.DIRECT_OVERRIDE)
+        make_button('Free Release', DeliveryControllerMode.UNCONTROLLED_RELEASE, QStyle.StandardPixmap.SP_MessageBoxCritical)
+        make_button('Slow Release', DeliveryControllerMode.CONTROLLED_RELEASE, QStyle.StandardPixmap.SP_MessageBoxWarning)
+        make_button('Homing', DeliveryControllerMode.HOMING)
+        make_button('Self-Test', DeliveryControllerMode.SELF_TEST)
+        make_button_with_wire('Stg Hook', DeliveryControllerMode.HOOK_STAGING, QStyle.StandardPixmap.SP_ArrowDown)
+        make_button_with_wire('Stg Package', DeliveryControllerMode.PACKAGE_STAGING, QStyle.StandardPixmap.SP_ArrowUp)
+        make_button('Pre-Delivery', DeliveryControllerMode.PRE_DELIVERY)
+        make_button_with_wire('Delivery', DeliveryControllerMode.DELIVERY, QStyle.StandardPixmap.SP_ArrowDown)
+        make_button('Pre-Landing', DeliveryControllerMode.PRE_LANDING)
+        make_button('Ground Unload', DeliveryControllerMode.GROUND_UNLOAD)
 
         net = QGroupBox(self)
         net.setTitle('Net')
