@@ -25,7 +25,7 @@ from .delivery_controller import DeliveryControllerCommand, DeliveryControllerMo
 
 from PyQt5 import QtCore
 from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer, QLocale, pyqtSignal
-from PyQt5.QtGui import QIntValidator, QColor, QFont, QKeySequence, QDoubleValidator
+from PyQt5.QtGui import QIntValidator, QColor, QFont, QFontMetrics, QKeySequence, QDoubleValidator
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, \
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QGridLayout, QSizePolicy, QFrame, QScrollArea, \
     QWidget, QLayout, QMessageBox, QProgressBar, QShortcut, QCheckBox, QStyle
@@ -46,7 +46,7 @@ PARAM_SET_NAME = 'ParamSet'                         # Prefix for individual Para
 BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) between buttons in button rows
 PARAM_SET_GROUPBOX_HEIGHT = 500                     # Fixed height (px) for each ParamSet editing groupbox
 PARAM_SET_GROUPBOX_WIDTH = 240                      # Fixed width (px) for each ParamSet editing groupbox
-LEFT_COLUMN_MAX_WIDTH = 180                         # Maximum width (px) of the narrow left-hand button column
+LEFT_COLUMN_MAX_WIDTH = 160                         # Maximum width (px) of the narrow left-hand button column
 RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
 CONFIG_FILE_TRANSFER_TIMEOUT = 30                   # Number of seconds to wait for a param file upload/download to complete before showing a timeout error dialog
 BROADCAST_PRIORITY = 16                             # DroneCAN message broadcast priority (lower number = higher priority)
@@ -73,6 +73,53 @@ _PARAM_SET_LIGHT_COLORS = [                         # Pool of light background c
     '#FFCCFF',  # light magenta
 ]
 
+# Real-Time Monitoring fields, grouped into sub-groupboxes: (source, field_name, display_name, units) per field.
+_MONITORING_GROUPS = [
+    ('Device Status', [
+        ('main', 'safety_state',          'Safety',      ''),
+        ('main', 'readiness',             'Readiness',   ''),
+        ('main', 'mode',                  'Mode',        ''),
+        ('main', 'mode_execution_state',  'State',       ''),
+        ('main', 'error',                 'Error',       ''),
+        ('main', 'package_state',         'Package',     ''),
+        ('main', 'estimated_weight_kg',   'Weight',      'kg'),
+    ]),
+    ('Hoist Status', [
+        ('main', 'wire_extension_m',      'Extension',     'm'),
+        ('main', 'force_on_wire_N',       'F',             'N'),
+        ('main', 'load_speed_m_s',        'v',             'm/s'),
+        ('aux',  'shaft_pos_rad',         'θ',             'rad'),
+        ('aux',  'shaft_torque_Nm',       'Torque',        'N·m'),
+        ('aux',  'shaft_speed_rad_s',     'ω',             'rad/s'),
+        ('aux',  'Iq_A',                  'I<sub>q</sub>', 'A'),
+        ('aux',  'power_W',               'Power',         'W'),
+    ]),
+    ('Motor Status', [
+        ('aux',  'fet_temp_degC',         'T<sub>FET</sub>',   '°C'),
+        ('aux',  'winding_temp_degC',     'T<sub>armature</sub>','°C'),
+        ('aux',  'Iq_max_A',              'I<sub>q</sub> max', 'A'),
+        ('aux',  'Iq_min_A',              'I<sub>q</sub> min', 'A'),
+        ('aux',  'dc_link_current_A',     'I<sub>DC</sub>',    'A'),
+        ('aux',  'dc_link_voltage_V',     'V<sub>DC</sub>',    'V'),
+        ('aux',  'encoder_agc_value',     'Enc. Gain',         ''),
+    ]),
+    ('Vector Control', [
+        ('aux',  'Vq_V',              'V<sub>q</sub>',           'V'),
+        ('aux',  'Vd_V',               'V<sub>d</sub>',          'V'),
+        ('aux',  'energy_counter_J',      'Energy',              'J'),
+        ('aux',  'Iq_requested_A',        'I<sub>q<sub> req. ',  'A'),
+    ]),
+    ('Servo Status', [
+        ('main', 'net_state',             'Net',                 ''),
+        ('main', 'lock_state',            'Lock',                 ''),
+        ('aux',  'net_current_A',         'I<sub>net</sub>',     'A'),
+        ('aux',  'lock_current_A',        'I<sub>lock</sub>',    'A'),
+    ]),
+]
+
+# Flattened view of _MONITORING_GROUPS: (source, field_name, display_name, units) for every field.
+_MONITORING_FIELDS = [field for _group_name, fields in _MONITORING_GROUPS for field in fields]
+
 logger = getLogger(__name__)
 
 _singleton = None
@@ -80,7 +127,7 @@ _singleton = None
 class DesignConstantsSetPayload(ctypes.LittleEndianStructure):
     '''
     @brief    Class representing the payload of a DesignConstantsSet message, responsible for parsing and storing field values.
-    @         Must match `design_constants_set_t` (see the The Delivery Controller firmware) field-for-field, including
+    @         Must match `design_constants_set_t` (see the Delivery Controller firmware) field-for-field, including
     @         its explicit trailing pad bytes; `homing_window_ms` is FreeRTOS's `TickType_t`, assumed to be 32-bit here.
     '''
     _pack_ = 1
@@ -543,7 +590,7 @@ class _FlowContainer(QWidget):
                 self.setMinimumHeight(h)
 
 
-class SpoolControllerPanel(QDialog):
+class DeliveryControllerPanel(QDialog):
     @dataclass
     class NetLockCmd:
         net_up : bool = True
@@ -564,8 +611,8 @@ class SpoolControllerPanel(QDialog):
         self.setWindowTitle(PANEL_NAME)
         self.setWindowIcon(get_icon())
         self.setAttribute(Qt.WA_DeleteOnClose)
-        self.resize(900, 600)
-        self.setMinimumSize(900, 600)
+        self.resize(1200, 700)
+        self.setMinimumSize(1200, 700)
 
         self._node = node                      # Local DroneCAN node used for broadcasting messages and registering handlers
         self._node_param_helper = NodeParametersHelper(self._node)
@@ -577,7 +624,7 @@ class SpoolControllerPanel(QDialog):
         self._param_set_field_inputs = {}      # param_set_id -> {field_name: (QLabel, QLineEdit, type_str, min_val, max_val)} for each ParamSet groupbox
         self._param_set_groupboxes = {}        # param_set_id -> QGroupBox widget for each ParamSet editing groupbox
 
-        self._last_netlock_cmd = SpoolControllerPanel.NetLockCmd()
+        self._last_netlock_cmd = DeliveryControllerPanel.NetLockCmd()
 
         self._param_set_file: ParamSetFile = ParamSetFile()          # Currently loaded ParamSetFile object, used for editing and uploading
         self._working_file_path = None          # The file under edit
@@ -631,6 +678,91 @@ class SpoolControllerPanel(QDialog):
         self._setup_ui()
         self._update_window_data()
 
+        try:
+            self._main_report_sub = self._node.add_handler(dronecan.flytrex.delcon.StateReport, self._on_main_report)
+            self._aux_report_sub = self._node.add_handler(dronecan.flytrex.delcon.StateReportAux, self._on_aux_report)
+        except Exception as ex:
+            show_error('Subscription error', 'Could not create requested subscription', ex, self)
+            return
+
+    def _make_monitoring_field_widget(self, display_name, units, name_width = 55, value_width = 55):
+        '''Build a name/value/units label row for one monitoring field.'''
+        container = QWidget(self._monitoring_groupbox)
+        row = QHBoxLayout(container)
+        row.setContentsMargins(2, 2, 2, 2)
+        row.setSpacing(1)
+
+        name_label = QLabel(display_name, container)
+
+        name_label.setFixedWidth(name_width)
+        row.addWidget(name_label)
+
+        value_label = QLabel('--', container)
+        value_label.setFixedWidth(value_width)
+        value_label.setStyleSheet('border: 1px solid gray;')
+        value_label.setAlignment(Qt.AlignRight)
+        row.addWidget(value_label)
+
+        units_label = QLabel(units, container)
+        units_label.setStyleSheet('color: gray;')
+        units_label.setContentsMargins(3, 0, 0, 0)
+        row.addWidget(units_label)
+
+        row.addStretch(1)
+        return container, value_label
+
+    def _setup_monitoring_ui(self):
+        '''Build the Real-Time Monitoring groupbox, one column-groupbox per _MONITORING_GROUPS entry.'''
+        self._monitoring_groupbox = QGroupBox('Real-Time Monitoring', self)
+        outer_layout = QVBoxLayout(self._monitoring_groupbox)
+
+        self._monitoring_value_labels = {}  # field_name -> QLabel showing that field's current value
+
+        columns_row = QHBoxLayout()
+
+        for group_name, fields in _MONITORING_GROUPS:
+            group_box = QGroupBox(group_name, self._monitoring_groupbox)
+            group_box.setFixedWidth(200)
+
+            group_layout = QVBoxLayout(group_box)
+            group_layout.setSpacing(1)
+
+            for _source, field_name, display_name, units in fields:
+                if group_name is 'Device Status':
+                    widget, value_label = self._make_monitoring_field_widget(display_name, units, value_width=90)
+                else:
+                    widget, value_label = self._make_monitoring_field_widget(display_name, units)
+                self._monitoring_value_labels[field_name] = value_label
+                group_layout.addWidget(widget)
+
+            group_layout.addStretch(1)
+
+            columns_row.addWidget(group_box)
+
+        columns_row.addStretch(1)
+        outer_layout.addLayout(columns_row)
+
+    @staticmethod
+    def _format_monitoring_value(value):
+        '''Format a raw report field value for display.'''
+        if isinstance(value, float):
+            return f'{value:.3f}'
+        return str(value)
+
+    @staticmethod
+    def _decode_dsdl_constant(msg, prefix, value):
+        '''Decode a raw field value to its DSDL constant's short name, or str(value) if none matches.'''
+        for const in msg._type.constants:
+            if const.name.startswith(prefix) and int(const.value) == int(value):
+                return const.name[len(prefix):]
+        return str(value)
+
+    def _update_monitoring_field(self, field_name, value):
+        '''Update a monitoring field's value label, if one exists for field_name.'''
+        label = self._monitoring_value_labels.get(field_name)
+        if label is not None:
+            label.setText(value)
+
     def _setup_ui(self):
         '''
         @brief    Main UI setup function that creates the window layout.
@@ -659,6 +791,10 @@ class SpoolControllerPanel(QDialog):
         right_column = QVBoxLayout()
         right_column.setContentsMargins(0, 0, 0, 0)
         right_column.setSpacing(6)
+
+        # Real-Time Monitoring occupies the top of the right area, above ParamSet Editing.
+        self._setup_monitoring_ui()
+        right_column.addWidget(self._monitoring_groupbox)
 
         # ParamSet Editing label
         param_set_edit_label = QLabel(PARAM_SET_EDIT_NAME, header_group)
@@ -718,10 +854,7 @@ class SpoolControllerPanel(QDialog):
 
         header_layout.addLayout(columns_row)
         layout.addWidget(header_group)
-
         self._create_design_constants_window()
-
-        self.setMinimumSize(800, 800)
 
     def _make_left_column(self, parent):
         '''
@@ -843,7 +976,8 @@ class SpoolControllerPanel(QDialog):
 
         height_textbox = QLineEdit(self)
         height_textbox.setText('0.0')
-        height_textbox.setValidator(SpoolControllerPanel._make_double_validator(-100, 100, self))
+        height_textbox.setValidator(DeliveryControllerPanel._make_double_validator(-100, 100, self))
+        height_textbox.setFixedWidth(30)
 
         stage_hook_button = QPushButton('Stage Hook', ops_groupbox)
         stage_hook_button.clicked.connect(lambda _: self._send_mode_command(DeliveryControllerMode.HOOK_STAGING, float(height_textbox.text())))
@@ -1013,7 +1147,7 @@ class SpoolControllerPanel(QDialog):
         except Exception as ex:
             logger.exception('Failed to broadcast WriteConfigFile: %s', ex)
             show_error('Broadcast failed', 'Could not broadcast WriteConfigFile.', str(ex), parent=self, blocking=True)
-            self._upload_button.setText(SpoolControllerPanel.TEXT_UPLOAD_BTN)
+            self._upload_button.setText(DeliveryControllerPanel.TEXT_UPLOAD_BTN)
             return
 
         # Register handler for the response message
@@ -1024,7 +1158,7 @@ class SpoolControllerPanel(QDialog):
             )
         except Exception as ex:
             logger.exception('Could not register WriteConfigFile handler: %s', ex)
-            self._upload_button.setText(SpoolControllerPanel.TEXT_UPLOAD_BTN)
+            self._upload_button.setText(DeliveryControllerPanel.TEXT_UPLOAD_BTN)
             self._cleanup_upload_handler()
             return
 
@@ -2086,6 +2220,39 @@ class SpoolControllerPanel(QDialog):
         self._pending_param_set_executes[param_set_id] = timer
         timer.start(RESPONSE_TIMEOUT * 1000)
 
+    def _on_main_report(self, r):
+        '''Refresh the Real-Time Monitoring fields sourced from a StateReport message.'''
+        msg = r.message
+
+        self._update_monitoring_field('safety_state', 'SAFE' if msg.safety_state else 'UNSAFE')
+        self._update_monitoring_field('readiness', self._decode_dsdl_constant(msg, 'READINESS_', msg.readiness))
+
+        try:
+            mode_text = DeliveryControllerMode(msg.mode).name
+        except ValueError:
+            mode_text = str(msg.mode)
+        self._update_monitoring_field('mode', mode_text)
+
+        self._update_monitoring_field(
+            'mode_execution_state', self._decode_dsdl_constant(msg, 'MODE_EXECUTION_STATE_', msg.mode_execution_state))
+        self._update_monitoring_field('net_state', self._decode_dsdl_constant(msg, 'NET_STATE_', msg.net_state))
+        self._update_monitoring_field('lock_state', self._decode_dsdl_constant(msg, 'LOCK_STATE_', msg.lock_state))
+        self._update_monitoring_field('error', self._format_monitoring_value(msg.error))
+        self._update_monitoring_field('package_state', self._decode_dsdl_constant(msg, 'PACKAGE_STATE_', msg.package_state))
+        self._update_monitoring_field('wire_extension_m', self._format_monitoring_value(msg.wire_extension_m))
+        self._update_monitoring_field('load_speed_m_s', self._format_monitoring_value(msg.load_speed_m_s))
+        self._update_monitoring_field('force_on_wire_N', self._format_monitoring_value(msg.force_on_wire_N))
+        self._update_monitoring_field('estimated_weight_kg', self._format_monitoring_value(msg.estimated_weight_kg))
+
+    def _on_aux_report(self, r):
+        '''Refresh the Real-Time Monitoring fields sourced from a StateReportAux message.'''
+        msg = r.message
+
+        for _source, field_name, _display_name, _units in _MONITORING_FIELDS:
+            if _source != 'aux':
+                continue
+            self._update_monitoring_field(field_name, self._format_monitoring_value(getattr(msg, field_name)))
+
     def _on_param_set_store(self, param_set_id):
         '''
         @brief    Handle Store button click: broadcast a flytrex.delcon.ParamSet message with OPERATION_STORE.
@@ -2105,13 +2272,7 @@ class SpoolControllerPanel(QDialog):
         if groupbox is not None:
             groupbox.setEnabled(False)
 
-        if not self._send_param_set_msg(param_set_id, 'OPERATION_STORE'):
-            if groupbox is not None:
-                groupbox.setEnabled(True)
-            return
 
-        # Store snapshot for later comparison
-        self._pending_param_set_store_snapshots[param_set_id] = snapshot
 
         # Register the shared handler if this is the first pending store
         if not self._pending_param_set_stores and self._param_set_store_response_handle is None:
@@ -2141,6 +2302,14 @@ class SpoolControllerPanel(QDialog):
         )
         self._pending_param_set_stores[param_set_id] = timer
         timer.start(RESPONSE_TIMEOUT * 1000)
+
+        if not self._send_param_set_msg(param_set_id, 'OPERATION_STORE'):
+            if groupbox is not None:
+                groupbox.setEnabled(True)
+            return
+
+        # Store snapshot for later comparison
+        self._pending_param_set_store_snapshots[param_set_id] = snapshot
 
     def _on_param_set_recall(self, param_set_id):
         '''
@@ -2715,7 +2884,7 @@ class SpoolControllerPanel(QDialog):
                 pass
             self._upload_response_handle = None
         if self._upload_button is not None:
-            self._upload_button.setText(SpoolControllerPanel.TEXT_UPLOAD_BTN)
+            self._upload_button.setText(DeliveryControllerPanel.TEXT_UPLOAD_BTN)
 
 
     def _cleanup_recall_handler(self):
@@ -3420,7 +3589,7 @@ class SpoolControllerPanel(QDialog):
                 # Label
                 label = QLabel(field_name + ':', fields_container)
                 label.setFixedHeight(20)
-                label.setFixedWidth(SpoolControllerPanel.PARAMSET_LABEL_WIDTH)
+                label.setFixedWidth(DeliveryControllerPanel.PARAMSET_LABEL_WIDTH)
                 comment = field_data.get('comment', '')
                 if comment:
                     label.setToolTip(comment)
@@ -3441,8 +3610,8 @@ class SpoolControllerPanel(QDialog):
                     widget.setFixedHeight(20)
                     widget.setStyleSheet("background-color: white;")
                     widget.setText(str(default_value))
-                    widget.setValidator(SpoolControllerPanel._make_double_validator(min_val, max_val, self))
-                    widget.setFixedWidth(SpoolControllerPanel.PARAMSET_LINEEDIT_WIDTH)
+                    widget.setValidator(DeliveryControllerPanel._make_double_validator(min_val, max_val, self))
+                    widget.setFixedWidth(DeliveryControllerPanel.PARAMSET_LINEEDIT_WIDTH)
                 elif 'bool' in field_type:
                     widget = QCheckBox(fields_container)
                     widget.setChecked(bool(default_value))
@@ -3511,7 +3680,7 @@ class SpoolControllerPanel(QDialog):
                 widget.setStyleSheet("background-color: white;")
                 widget.setText(str(default_value))
                 if 'float' in field_type:
-                    widget.setValidator(SpoolControllerPanel._make_double_validator(min_val, max_val, self))
+                    widget.setValidator(DeliveryControllerPanel._make_double_validator(min_val, max_val, self))
                 elif 'int' in field_type:
                     validator = QIntValidator(min_val, max_val, self)
                 widget.setValidator(validator)
@@ -3643,6 +3812,10 @@ class SpoolControllerPanel(QDialog):
         '''
 
         try:
+            self._main_report_sub.remove()
+            self._aux_report_sub.remove()
+            self._node.remove_handler(dronecan.flytrex.delcon.StateReportAux)
+
             self._cleanup_upload_handler()
             self._cleanup_config_transfer_timeout()
             self._cleanup_download_handler()
@@ -3657,7 +3830,7 @@ class SpoolControllerPanel(QDialog):
             pass
 
         try:
-            super(SpoolControllerPanel, self).closeEvent(event)
+            super(DeliveryControllerPanel, self).closeEvent(event)
         finally:
             # Ensure singleton reset/handler cleanup even if shutdown fails.
             try:
@@ -3670,13 +3843,13 @@ def spawn(parent, node):
     @brief    Spawn (or show) the singleton Spool Controller panel.
     @param    parent - Parent Qt widget.
     @param    node - Local DroneCAN node instance.
-    @return   SpoolControllerPanel singleton instance.
+    @return   DeliveryControllerPanel singleton instance.
     '''
 
     global _singleton
     if _singleton is None:
         try:
-            _singleton = SpoolControllerPanel(parent, node)
+            _singleton = DeliveryControllerPanel(parent, node)
         except Exception as ex:
             logger.exception('Failed to spawn Spool Controller panel: %s', ex)
             raise
