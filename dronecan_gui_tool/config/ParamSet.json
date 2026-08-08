@@ -136,12 +136,6 @@
             "max_val": 100,
             "comment": "\"Tension Reached\" detector time window, in seconds",
             "color": "black"
-        },
-        "ob_autostop": {
-            "type": "bool",
-            "default": 0,
-            "comment": "Hold when the limit switch activates",
-            "color": "black"
         }
     },
     "trajectory-generator": {

@@ -91,6 +91,7 @@ _MONITORING_GROUPS = [
         ('aux',  'shaft_pos_rad',         'θ',             'rad'),
         ('aux',  'shaft_torque_Nm',       'Torque',        'N·m'),
         ('aux',  'shaft_speed_rad_s',     'ω',             'rad/s'),
+        ('aux',  'limit_switch',          'Home Sw',        ''),
     ]),
     ('Motor Status', [
         ('aux',  'fet_temp_degC',         'T<sub>FET</sub>',   '°C'),
@@ -204,9 +205,8 @@ class ParamSetPayload(ctypes.LittleEndianStructure):
         ('load_not_shaft_control', ctypes.c_bool),
         ('execute_not_hold', ctypes.c_bool),
         ('ob_hold_on_event', ctypes.c_bool),
-        ('ob_autostop', ctypes.c_bool),
 
-        ('_pad', ctypes.c_uint8 * 1),
+        ('_pad', ctypes.c_uint8 * 2),
 
         ('min_effort_limit', ctypes.c_float),
         ('max_effort_limit', ctypes.c_float),
