@@ -598,6 +598,8 @@ class DeliveryControllerPanel(QDialog):
 
     PARAMSET_LABEL_WIDTH = 150
     PARAMSET_LINEEDIT_WIDTH = 65
+
+    TEXT_UPLOAD_BTN = '&Upload Params'
     
     _file_download_finished_signal = pyqtSignal(bool, str)  # success, error_message
     _file_download_progress_signal = pyqtSignal(int)             # percent 0-100
@@ -932,7 +934,7 @@ class DeliveryControllerPanel(QDialog):
         upload_download_layout = QVBoxLayout(upload_download)
 
         # Upload/Download buttons
-        self._upload_button = QPushButton('&Upload Params', upload_download)
+        self._upload_button = QPushButton(DeliveryControllerPanel.TEXT_UPLOAD_BTN, upload_download)
         self._upload_button.clicked.connect(self._on_upload_clicked)
         self._upload_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveFDIcon))
 
