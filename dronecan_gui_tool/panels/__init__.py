@@ -19,8 +19,7 @@ from . import hobbywing_esc
 from . import rc_panel
 from . import flytrex_esc
 from . import BMS_panel
-from . import delivery_controller
-from . import spool_controller
+from . import delivery_controller_tuning
 
 class PanelDescriptor:
     def __init__(self, module):
@@ -52,6 +51,5 @@ PANELS = [
     PanelDescriptor(hobbywing_esc),
     PanelDescriptor(rc_panel),
     PanelDescriptor(flytrex_esc),
-    PanelDescriptor(delivery_controller),
-    PanelDescriptor(spool_controller)
+    PanelDescriptor(delivery_controller_tuning)
 ]

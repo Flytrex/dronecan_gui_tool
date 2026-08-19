@@ -6,7 +6,6 @@
 # Author: Ilan Graidy
 # Date:   2026-03-10
 #
-
 """
 Utility functions for DroneCAN GUI Tool panels.
 """
