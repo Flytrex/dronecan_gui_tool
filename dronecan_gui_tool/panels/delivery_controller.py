@@ -21,9 +21,9 @@ class DeliveryControllerMode(IntEnum):
     HALT                    = 5
     GROUND_UNLOAD           = 6
     CONTROLLED_RELEASE      = 7
-    HOOK_STAGING            = 8
-    PACKAGE_STAGING         = 9
-    RESERVED3               = 10
+    STAGING                 = 8
+    RESERVED1               = 9
+    RESERVED2               = 10
     PRE_LANDING             = 11
     PRE_DELIVERY            = 12
     DELIVERY                = 13
