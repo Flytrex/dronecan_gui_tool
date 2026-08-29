@@ -148,6 +148,20 @@ class DesignConstantsSetPayload(ctypes.LittleEndianStructure):
         ('homing_max_torque_Nm', ctypes.c_float),
         ('homing_window_ms', ctypes.c_uint32),
         ('torque_constant_Nm_A', ctypes.c_float),
+
+        ('maneuver_retry_limit', ctypes.c_int32),
+        ('safety_wire_length_m', ctypes.c_float),
+        ('package_force_dynamic_reserve_N', ctypes.c_float),
+        ('min_package_pull_force_N', ctypes.c_float),
+        ('delivery_extension_offset_m', ctypes.c_float),
+        ('delivery_ground_detector_time_constant_s', ctypes.c_float),
+        ('delivery_ground_detector_arm_agl_m', ctypes.c_float),
+        ('delivery_ground_detect_window_s', ctypes.c_float),
+        ('delivery_package_detector_window_s', ctypes.c_float),
+        ('delivery_max_retract_attempts', ctypes.c_int32),
+        ('delivery_unhook_offset_m', ctypes.c_float),
+        ('min_package_weight_N', ctypes.c_float),
+
         ('_pad', ctypes.c_uint8 * 3),
         ('reverse_phase_sequence', ctypes.c_bool),
     ]

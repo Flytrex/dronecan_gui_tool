@@ -1,26 +1,22 @@
 {
     "param_id": {
         "type": "uint16",
-        "default": 0,
-        "comment": "The ParamSet ID number"
+        "default": 1
     },
     "general": {
         "energize": {
             "type": "bool",
             "default": 0,
-            "comment": "Energize the motor",
             "color": "black"
         },
         "load_not_shaft_control": {
             "type": "bool",
             "default": 0,
-            "comment": "false: shaft control; true: load control",
             "color": "black"
         },
         "execute_not_hold": {
             "type": "bool",
             "default": 0,
-            "comment": "false: hold the current action; true: execute the current action",
             "color": "black"
         }
     },
@@ -30,7 +26,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "Lower torque (N·m) or force (N) limit, depending on load_not_shaft_control. The sign does not matter.",
             "color": "black"
         },
         "max_effort_limit": {
@@ -38,7 +33,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "Upper torque (N·m) or force (N) limit, depending on load_not_shaft_control. The sign does not matter.",
             "color": "black"
         }
     },
@@ -46,7 +40,6 @@
         "ob_hold_on_event": {
             "type": "bool",
             "default": 0,
-            "comment": "Hold the spool when the observer detects an event",
             "color": "black"
         },
         "ob_neg_departure_error": {
@@ -54,7 +47,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Negative Departure\" detector threshold, in rad or m depending on load_not_shaft_control. The sign does not matter.",
             "color": "black"
         },
         "ob_neg_departure_window_s": {
@@ -62,7 +54,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Negative Departure\" detector time window, in seconds",
             "color": "black"
         },
         "ob_pos_departure_error": {
@@ -70,7 +61,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Positive Departure\" detector threshold, in rad or m depending on load_not_shaft_control. The sign does not matter.",
             "color": "black"
         },
         "ob_pos_departure_window_s": {
@@ -78,7 +68,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Positive Departure\" detector time window, in seconds",
             "color": "black"
         },
         "ob_stationary_speed": {
@@ -86,7 +75,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Stationary\" detector maximum speed threshold, in rad/s or m/s depending on load_not_shaft_control. The sign does not matter.",
             "color": "black"
         },
         "ob_stationary_window_s": {
@@ -94,7 +82,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Stationary\" detector time window, in seconds.",
             "color": "black"
         },
         "ob_target_margin": {
@@ -102,7 +89,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Target Reached\" detector margin, in rad or m depending on load_not_shaft_control. The sign does not matter.",
             "color": "black"
         },
         "ob_on_target_window_s": {
@@ -110,7 +96,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Target Reached\" detector time window, in seconds",
             "color": "black"
         },
         "ob_tension_min_effort": {
@@ -118,7 +103,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Tension Reached\" detector lower threshold, in Nm or N depending on load_not_shaft_control. The sign does not matter.",
             "color": "black"
         },
         "ob_tension_max_effort": {
@@ -126,7 +110,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Tension Reached\" detector upper threshold, in Nm or N depending on load_not_shaft_control. The sign does not matter.",
             "color": "black"
         },
         "ob_tension_window_s": {
@@ -134,7 +117,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Tension Reached\" detector time window, in seconds",
             "color": "black"
         }
     },
@@ -144,7 +126,6 @@
             "default": 0,
             "min_val": -1000000,
             "max_val":  1000000,
-            "comment": "Target position, in rad or m depending on load_not_shaft_control",
             "color": "black"
         },
         "tg_acceleration": {
@@ -152,7 +133,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "Acceleration, in rad/s^2 or m/s^2 depending on load_not_shaft_control",
             "color": "black"
         },
         "tg_deceleration": {
@@ -160,7 +140,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 1000,
-            "comment": "Deceleration, in rad/s^2 or m/s^2 depending on load_not_shaft_control",
             "color": "black"
         },
         "tg_halt_deceleration": {
@@ -168,7 +147,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 1000,
-            "comment": "Halt deceleration, in rad/s^2 or m/s^2 depending on load_not_shaft_control",
             "color": "black"
         },
         "tg_velocity": {
@@ -176,7 +154,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 1000,
-            "comment": "Cruise velocity, in rad/s or m/s depending on load_not_shaft_control",
             "color": "black"
         },
         "tg_movement_time_s": {
@@ -184,7 +161,6 @@
             "default": 0,
             "min_val": 0,
             "max_val": 1000,
-            "comment": "Trajectory execution time",
             "color": "black"
         }
     }
