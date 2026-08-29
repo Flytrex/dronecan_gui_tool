@@ -44,7 +44,7 @@ PARAM_SET_ID_NAME = 'ParamSet ID'                   # Label next to the ParamSet
 PARAM_SET_NAME = 'ParamSet'                         # Prefix for individual ParamSet groupbox titles
 
 BUTTON_HORIZONTAL_SPACING = 3                       # Horizontal spacing (px) between buttons in button rows
-PARAM_SET_GROUPBOX_HEIGHT = 500                     # Fixed height (px) for each ParamSet editing groupbox
+PARAM_SET_GROUPBOX_HEIGHT = 700                     # Fixed height (px) for each ParamSet editing groupbox
 PARAM_SET_GROUPBOX_WIDTH = 240                      # Fixed width (px) for each ParamSet editing groupbox
 LEFT_COLUMN_MAX_WIDTH = 160                         # Maximum width (px) of the narrow left-hand button column
 RESPONSE_TIMEOUT = 3                                # Seconds to wait for a response to a sent message before showing a timeout error dialog
@@ -92,6 +92,7 @@ _MONITORING_GROUPS = [
         ('aux',  'shaft_torque_Nm',       'Torque',        'N·m'),
         ('aux',  'shaft_speed_rad_s',     'ω',             'rad/s'),
         ('aux',  'limit_switch',          'Home Sw',        ''),
+        ('aux',  'ob_stationary',         'Station.',       '')
     ]),
     ('Motor Status', [
         ('aux',  'fet_temp_degC',         'T<sub>FET</sub>',   '°C'),
@@ -215,13 +216,13 @@ class ParamSetPayload(ctypes.LittleEndianStructure):
         ('ob_neg_departure_window_s', ctypes.c_float),
         ('ob_pos_departure_error', ctypes.c_float),
         ('ob_pos_departure_window_s', ctypes.c_float),
-        ('ob_stall_min_speed', ctypes.c_float),
-        ('ob_stall_window_s', ctypes.c_float),
         ('ob_target_margin', ctypes.c_float),
         ('ob_on_target_window_s', ctypes.c_float),
         ('ob_tension_min_effort', ctypes.c_float),
         ('ob_tension_max_effort', ctypes.c_float),
         ('ob_tension_window_s', ctypes.c_float),
+        ('ob_stationary_speed', ctypes.c_float),
+        ('ob_stationary_window_s', ctypes.c_float),
 
         ('tg_position_setpoint', ctypes.c_float),
         ('tg_acceleration', ctypes.c_float),
@@ -299,8 +300,10 @@ def _ctypes_struct_from_dict(struct_instance, data: dict):
         if field_name.startswith('_'):
             continue
         if field_name not in data:
-            raise ValueError(f'Missing field "{field_name}" for {type(struct_instance).__name__} in JSON data')
-        setattr(struct_instance, field_name, data[field_name])
+            setattr(struct_instance, field_name, 0.0)
+            logger.warning(f'Missing field "{field_name}" for {type(struct_instance).__name__} in JSON data')
+        else:
+            setattr(struct_instance, field_name, data[field_name])
     return struct_instance
 
 

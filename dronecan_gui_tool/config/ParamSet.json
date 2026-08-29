@@ -81,20 +81,20 @@
             "comment": "\"Positive Departure\" detector time window, in seconds",
             "color": "black"
         },
-        "ob_stall_min_speed": {
+        "ob_stationary_speed": {
             "type": "float32",
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Stall\" detector minimum speed threshold, in rad/s or m/s depending on load_not_shaft_control. The sign does not matter.",
+            "comment": "\"Stationary\" detector maximum speed threshold, in rad/s or m/s depending on load_not_shaft_control. The sign does not matter.",
             "color": "black"
         },
-        "ob_stall_window_s": {
+        "ob_stationary_window_s": {
             "type": "float32",
             "default": 0,
             "min_val": 0,
             "max_val": 100,
-            "comment": "\"Stall\" detector time window, in seconds",
+            "comment": "\"Stationary\" detector time window, in seconds.",
             "color": "black"
         },
         "ob_target_margin": {
