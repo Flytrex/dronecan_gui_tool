@@ -1594,3 +1594,6 @@ def main():
     node.close()
 
     sys.exit(exit_code)
+
+if __name__ == '__main__':
+    main()

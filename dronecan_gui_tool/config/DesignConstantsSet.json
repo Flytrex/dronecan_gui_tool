@@ -4,7 +4,6 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The width of the spool in meters",
         "color": "black"
     },
     "wire_diameter_m": {
@@ -12,7 +11,6 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "Diameter of the wire in meters",
         "color": "black"
     },
     "spool_barrel_diameter_m": {
@@ -20,7 +18,7 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The diameter of the spool's barrel in meters",
+
         "color": "black"
     },
     "horizontal_packing": {
@@ -28,7 +26,6 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "Horizontal packing efficiency factor of the wound wire",
         "color": "black"
     },
     "radial_packing": {
@@ -36,7 +33,6 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "Radial packing efficiency factor of the wound wire",
         "color": "black"
     },
     "total_wire_length_m": {
@@ -44,7 +40,6 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The wire's total length in meters",
         "color": "black"
     },
     "dead_wire_length_m": {
@@ -52,7 +47,6 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The length of wire permanently wound on the spool that can't be deployed",
         "color": "black"
     },
     "gearbox_ratio": {
@@ -60,13 +54,11 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "Gearbox ratio",
         "color": "black"
     },
     "reverse_phase_sequence": {
         "type": "bool",
         "default": 0,
-        "comment": "Reverse the motor's phase sequence",
         "color": "black"
     },
     "torque_constant_Nm_A": {
@@ -74,7 +66,6 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The motor's torque constant, in Newton-meters per Ampere",
         "color": "black"
     },
     "homing_max_torque_Nm": {
@@ -82,7 +73,6 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The maximum torque allowed while homing, in Newton-meters",
         "color": "black"
     },
     "homing_window_ms": {
@@ -90,7 +80,90 @@
         "default": 0,
         "min_val": 0,
         "max_val": 100,
-        "comment": "The time window used by the homing detector, in milliseconds",
+        "color": "black"
+    },
+    "maneuver_retry_limit": {
+        "type": "int32",
+        "default": 3,
+        "min_val": 0,
+        "max_val": 100,
+        "color": "black"
+    },
+    "safety_wire_length_m": {
+        "type": "float32",
+        "default": 5.0,
+        "min_val": 0,
+        "max_val": 100,
+        "color": "black"
+    },
+    "package_force_dynamic_reserve_N": {
+        "type": "float32",
+        "default": 15.0,
+        "min_val": 0,
+        "max_val": 1000,
+        "color": "black"
+    },
+    "min_package_pull_force_N": {
+        "type": "float32",
+        "default": 35.0,
+        "min_val": 0,
+        "max_val": 1000,
+        "color": "black"
+    },
+    "delivery_extension_offset_m": {
+        "type": "float32",
+        "default": 0.01,
+        "min_val": 0,
+        "max_val": 100,
+        "color": "black"
+    },
+    "delivery_ground_detector_time_constant_s": {
+        "type": "float32",
+        "default": 0.25,
+        "min_val": 0,
+        "max_val": 100,
+        "color": "black"
+    },
+    "delivery_ground_detector_arm_agl_m": {
+        "type": "float32",
+        "default": 0.75,
+        "min_val": 0,
+        "max_val": 100,
+        "color": "black"
+    },
+    "delivery_ground_detect_window_s": {
+        "type": "float32",
+        "default": 0.125,
+        "min_val": 0,
+        "max_val": 100,
+        "color": "black"
+    },
+    "delivery_package_detector_window_s": {
+        "type": "float32",
+        "default": 5.0,
+        "min_val": 0,
+        "max_val": 100,
+        "color": "black"
+    },
+    "delivery_max_retract_attempts": {
+        "type": "int32",
+        "default": 6,
+        "min_val": 0,
+        "max_val": 100,
+        "color": "black"
+    },
+    "delivery_unhook_offset_m": {
+        "type": "float32",
+        "default": 0.1,
+        "min_val": 0,
+        "max_val": 100,
+        "color": "black"
+    },
+    "min_package_weight_N": {
+        "type": "float32",
+        "default": 4.0,
+        "min_val": 0,
+        "max_val": 1000,
         "color": "black"
     }
 }
