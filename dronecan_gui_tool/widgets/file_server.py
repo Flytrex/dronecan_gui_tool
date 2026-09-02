@@ -161,23 +161,15 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         return open(path,'rb').read()
 
     def _check_path_change(self, path):
-        now = monotonic()
-        if self._is_firmware_update_mode() and path in self._images:
-            if self._is_active_firmware_read_window():
-                return False
-            last_checked_at = self._image_last_checked_at.get(path)
-            if last_checked_at is not None and (now - last_checked_at) < READ_CACHE_REVALIDATE_INTERVAL_SEC:
-                return False
-
+        key = FileServer_PathKey(path)
         mtime = os.path.getmtime(path)
-        self._image_last_checked_at[path] = now
-        if path not in self._images or mtime != self._image_timestamps[path]:
+        if path not in self._images or key not in self._key_to_path or mtime != self._image_timestamps.get(path):
             self._image_timestamps[path] = mtime
             self._images[path] = self._load_image(path)
-            self._image_views[path] = memoryview(self._images[path])
-            self._key_to_path[FileServer_PathKey(path)] = path
-            return True
-        return False
+            self._key_to_path[key] = path
+            # transfer progress of the previous image must not leak into the new one
+            self._key_complete.discard(key)
+            self._key_max_offset.pop(key, None)
 
     def purge_path(self, path):
         """Remove all cached data for a path so file.Read requests for it will fail."""
@@ -186,7 +178,9 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         self._images.pop(path, None)
         self._image_views.pop(path, None)
         self._image_timestamps.pop(path, None)
-        self._image_last_checked_at.pop(path, None)
+        self._key_complete.discard(key)
+        self._key_max_offset.pop(key, None)
+        self._key_hit_counters.pop(key, None)
 
     @property
     def key_hit_counters(self):
@@ -356,7 +350,7 @@ class FileServerWidget(QGroupBox):
         if self._controller.is_running:
             for path, count in self._controller.path_hit_counters.items():
                 for w in self._path_widgets:
-                    if path.startswith(w.path):
+                    if w.path and path.startswith(w.path):
                         w.update_hit_count(path, count)
         else:
             for w in self._path_widgets:
@@ -370,6 +364,13 @@ class FileServerWidget(QGroupBox):
         self._controller.set_paths(paths)
         if self._controller.is_running:
             flash(self, 'File server lookup paths: %r', paths, duration=3)
+            for p in paths:
+                # A missing/unreadable path must not prevent the other paths from being served
+                try:
+                    self._file_server._check_path_change(p)
+                except Exception:
+                    logger.warning('Could not load lookup path %r', p, exc_info=True)
+                    self._file_server.purge_path(p)
 
     def _on_start_stop(self):
         if self._controller.is_running:
@@ -404,9 +405,17 @@ class FileServerWidget(QGroupBox):
 
         for it in self._path_widgets:
             if it.path == path:
-                return                  # Already exists, no need to add
+                self._sync_paths()      # Already listed; make sure it is (re)loaded and served
+                return
 
         self._on_add_path(path)
+
+    def serve_path(self, path):
+        """Add the path, make sure the server runs, and load it. Raises if the file cannot be served."""
+        path = os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+        self.add_path(path)
+        self.force_start()
+        self._file_server._check_path_change(path)
 
     def force_start(self):
         if not self._controller.is_running:
