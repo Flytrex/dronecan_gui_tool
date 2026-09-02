@@ -264,8 +264,7 @@ class Controls(QGroupBox):
         # Configuring the file server
         try:
             self.window().show_message('Configuring the file server...')
-            self._file_server_widget.add_path(fw_file)
-            self._file_server_widget.force_start()
+            self._file_server_widget.serve_path(fw_file)
         except Exception as ex:
             show_error('File server error', 'Could not configure the file server', ex, self)
             return
