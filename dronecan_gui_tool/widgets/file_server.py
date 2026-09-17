@@ -166,6 +166,7 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         if path not in self._images or key not in self._key_to_path or mtime != self._image_timestamps.get(path):
             self._image_timestamps[path] = mtime
             self._images[path] = self._load_image(path)
+            self._image_views[path] = memoryview(self._images[path])
             self._key_to_path[key] = path
             # transfer progress of the previous image must not leak into the new one
             self._key_complete.discard(key)

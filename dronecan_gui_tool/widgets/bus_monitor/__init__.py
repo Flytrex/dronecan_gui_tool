@@ -178,7 +178,4 @@ class BusMonitorHookController(QObject):
         if not self._capture_enabled:
             return
 
-        if bool(getattr(self._node, 'firmware_update_mode', False)):
-            return
-
         self.frame_received.emit(direction, frame)

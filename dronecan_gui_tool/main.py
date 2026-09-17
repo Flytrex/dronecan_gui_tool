@@ -226,8 +226,6 @@ class NodeRuntime(QObject):
         self._log_messages = LogMessageController(node, self)
         self._bus_monitor_hook = BusMonitorHookController(node, self)
         self._firmware_update_mode = False
-        self._pre_firmware_update_filter_list = None
-        self._firmware_update_filter_applied = False
         self._base_spin_interval_ms = FIRMWARE_UPDATE_IDLE_SPIN_INTERVAL_MS
 
         self._spin_worker = NodeRuntime._NodeSpinWorker(node)
@@ -280,14 +278,11 @@ class NodeRuntime(QObject):
         self._firmware_update_mode = enabled
         setattr(self._node, '_firmware_update_mode', enabled)
 
-        # Reduce non-essential traffic and GUI work while firmware transfer is active.
+        # Node discovery, bus monitoring and the user's CAN filter profile must keep working
+        # during an update; only the driver-level prioritization is adjusted here.
         self._node_monitor.set_updates_enabled(True)
-        if hasattr(self._node_monitor, 'set_discovery_enabled'):
-            self._node_monitor.set_discovery_enabled(not enabled)
         self._log_messages.set_updates_enabled(not enabled)
-        self._bus_monitor_hook.set_capture_enabled(not enabled)
         self._set_driver_firmware_update_mode(enabled)
-        self._set_firmware_update_filtering(enabled)
         if not enabled:
             setattr(self._node, '_firmware_read_active_until', 0.0)
         self._spin_interval_requested.emit(FIRMWARE_UPDATE_IDLE_SPIN_INTERVAL_MS if enabled else self._base_spin_interval_ms)
@@ -300,53 +295,6 @@ class NodeRuntime(QObject):
             driver.set_firmware_update_mode(enabled)
         except Exception:
             logger.debug('Could not toggle driver firmware-update mode', exc_info=True)
-
-    @staticmethod
-    def _firmware_update_filter_ids():
-        return sorted(set([
-            0,
-            dronecan.uavcan.protocol.NodeStatus.default_dtid,
-            dronecan.uavcan.protocol.GetNodeInfo.default_dtid,
-            dronecan.uavcan.protocol.RestartNode.default_dtid,
-            dronecan.uavcan.protocol.file.BeginFirmwareUpdate.default_dtid,
-            dronecan.uavcan.protocol.file.Read.default_dtid,
-            dronecan.uavcan.protocol.file.GetInfo.default_dtid,
-        ]))
-
-    def _set_firmware_update_filtering(self, enabled):
-        driver = getattr(self._node, 'can_driver', None)
-        if driver is None:
-            return
-        if not hasattr(driver, 'set_filter_list') or not hasattr(driver, 'get_filter_list'):
-            return
-
-        if enabled:
-            if self._firmware_update_filter_applied:
-                return
-            try:
-                self._pre_firmware_update_filter_list = driver.get_filter_list()
-            except Exception:
-                self._pre_firmware_update_filter_list = None
-            try:
-                driver.set_filter_list(self._firmware_update_filter_ids())
-                self._firmware_update_filter_applied = True
-            except Exception:
-                logger.debug('Could not apply firmware-update filter profile', exc_info=True)
-                self._firmware_update_filter_applied = False
-            return
-
-        if not self._firmware_update_filter_applied:
-            return
-        try:
-            restore_filter_list = self._pre_firmware_update_filter_list
-            if restore_filter_list is None:
-                restore_filter_list = []
-            driver.set_filter_list(restore_filter_list)
-        except Exception:
-            logger.debug('Could not restore pre-update filter profile', exc_info=True)
-        finally:
-            self._pre_firmware_update_filter_list = None
-            self._firmware_update_filter_applied = False
 
     @pyqtSlot(int)
     def start(self, interval_ms=10):
@@ -499,7 +447,7 @@ class _UpdateCheckWorker(QObject):
 
     finished = pyqtSignal(dict)
 
-    def __init__(self, updates_dir, dsdl_target, dsdl_skip_marker, repo, branch):
+    def __init__(self, updates_dir, dsdl_target, dsdl_skip_marker, repo, branch, skip_msi=False):
         super().__init__()
         self._updates_dir = updates_dir
         self._dsdl_target = dsdl_target
@@ -508,6 +456,8 @@ class _UpdateCheckWorker(QObject):
         self._dsdl_skip_marker = dsdl_skip_marker
         self._repo = repo
         self._branch = branch
+        # Set when only the DSDL branch changed, to avoid hitting the (slow) shared drive.
+        self._skip_msi = skip_msi
 
     @pyqtSlot()
     def run(self):
@@ -519,26 +469,27 @@ class _UpdateCheckWorker(QObject):
         }
 
         # --- MSI scan on the shared drive (can hang on disconnected SMB) ---
-        try:
-            if not os.path.isdir(self._updates_dir):
-                result['msi']['unreachable'] = True
-            else:
-                pattern = re.compile(
-                    r'^dronecan_gui_tool-(\d+(?:\.\d+)*)-win64-flytrex-(\d+(?:\.\d+)*)\.msi$',
-                    re.IGNORECASE)
-                latest = None
-                for name in os.listdir(self._updates_dir):
-                    m = pattern.match(name)
-                    if not m:
-                        continue
-                    v = tuple(int(x) for x in m.group(1).split('.'))
-                    fv = tuple(int(x) for x in m.group(2).split('.'))
-                    key = (v, fv)
-                    if latest is None or key > latest[0]:
-                        latest = (key, m.group(1), m.group(2), name)
-                result['msi']['latest'] = latest
-        except OSError as ex:
-            result['msi']['error'] = str(ex)
+        if not self._skip_msi:
+            try:
+                if not os.path.isdir(self._updates_dir):
+                    result['msi']['unreachable'] = True
+                else:
+                    pattern = re.compile(
+                        r'^dronecan_gui_tool-(\d+(?:\.\d+)*)-win64-flytrex-(\d+(?:\.\d+)*)\.msi$',
+                        re.IGNORECASE)
+                    latest = None
+                    for name in os.listdir(self._updates_dir):
+                        m = pattern.match(name)
+                        if not m:
+                            continue
+                        v = tuple(int(x) for x in m.group(1).split('.'))
+                        fv = tuple(int(x) for x in m.group(2).split('.'))
+                        key = (v, fv)
+                        if latest is None or key > latest[0]:
+                            latest = (key, m.group(1), m.group(2), name)
+                    result['msi']['latest'] = latest
+            except OSError as ex:
+                result['msi']['error'] = str(ex)
 
         # --- DSDL: GitHub API request (up to 10 s) -------------------------
         try:
@@ -825,8 +776,9 @@ class MainWindow(QMainWindow):
                                     _user_config_file_path(), ex))
             return
         self.statusBar().showMessage('DSDL branch set to {}'.format(dsdl_branch), 3000)
+        self._check_for_updates(dsdl_only=True)
 
-    def _check_for_updates(self, silent=False):
+    def _check_for_updates(self, silent=False, dsdl_only=False):
         """
         Schedule an update check on a background thread.
 
@@ -834,6 +786,9 @@ class MainWindow(QMainWindow):
         several seconds (or much longer if the network/share is unreachable),
         so we never run them on the GUI thread. Results are handled in
         ``_handle_update_result`` once the worker emits ``finished``.
+
+        ``dsdl_only`` skips the (slow) shared-drive MSI scan -- used when the
+        user just switched the DSDL branch and only that needs re-checking.
         """
         if self._update_check_thread is not None:
             if not silent:
@@ -855,12 +810,13 @@ class MainWindow(QMainWindow):
 
         thread = QThread(self)
         worker = _UpdateCheckWorker(updates_dir, dsdl_target, dsdl_skip_marker,
-                                    DSDL_REPO, self._selected_dsdl_branch)
+                                    DSDL_REPO, self._selected_dsdl_branch, skip_msi=dsdl_only)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
         worker.finished.connect(
-            lambda result, silent=silent: self._handle_update_result(result, silent))
+            lambda result, silent=silent, dsdl_only=dsdl_only:
+                self._handle_update_result(result, silent, dsdl_only))
         worker.finished.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -868,70 +824,71 @@ class MainWindow(QMainWindow):
 
         self._update_check_thread = thread
         self._update_check_worker = worker
-        logger.info('Update check started (silent=%s)', silent)
+        logger.info('Update check started (silent=%s, dsdl_only=%s)', silent, dsdl_only)
         thread.start()
 
     def _on_update_check_finished(self):
         self._update_check_thread = None
         self._update_check_worker = None
 
-    def _handle_update_result(self, result, silent):
+    def _handle_update_result(self, result, silent, dsdl_only=False):
         """Slot called on the GUI thread after the worker finishes."""
         updates_dir = r'G:\Shared drives\Engineering\Lab Tools\DroneCAN GUI Tool, Flytrex Version'
         current_version = '.'.join(map(str, __version__))
         current_flytrex = '.'.join(map(str, __flytrex_version__))
         current_combo = (tuple(__version__), tuple(__flytrex_version__))
 
-        # --- MSI part -------------------------------------------------------
-        msi = result['msi']
-        if msi['unreachable']:
-            if silent:
-                logger.info('Update check skipped: %s not accessible', updates_dir)
-            else:
-                QMessageBox.warning(self, 'Check for Updates',
-                                    'Could not access the updates directory:\n{}\n\n'
-                                    'Make sure the shared drive is mounted.'.format(updates_dir))
-        elif msi['error']:
-            logger.warning('Update check failed: %s', msi['error'])
-            if not silent:
-                QMessageBox.warning(self, 'Check for Updates',
-                                    'Could not list the updates directory:\n{}'.format(msi['error']))
-        else:
-            latest = msi['latest']
-            if latest is None:
+        # --- MSI part (skipped when only the DSDL branch changed) ----------
+        if not dsdl_only:
+            msi = result['msi']
+            if msi['unreachable']:
+                if silent:
+                    logger.info('Update check skipped: %s not accessible', updates_dir)
+                else:
+                    QMessageBox.warning(self, 'Check for Updates',
+                                        'Could not access the updates directory:\n{}\n\n'
+                                        'Make sure the shared drive is mounted.'.format(updates_dir))
+            elif msi['error']:
+                logger.warning('Update check failed: %s', msi['error'])
                 if not silent:
                     QMessageBox.warning(self, 'Check for Updates',
-                                        'No installation files were found in:\n{}'.format(updates_dir))
-            elif latest[0] > current_combo:
-                installer_path = os.path.join(updates_dir, latest[3])
-                msg = QMessageBox(self)
-                msg.setIcon(QMessageBox.Information)
-                msg.setWindowTitle('Check for Updates')
-                msg.setTextFormat(Qt.RichText)
-                msg.setText(
-                    'A new version is available.<br><br>'
-                    'Installed: <b>{cur} (flytrex {curf})</b><br>'
-                    'Latest: <b>{latest} (flytrex {latestf})</b><br><br>'
-                    'File: <code>{name}</code><br><br>'
-                    'Press <b>Install Now</b> to close the application and run the installer, '
-                    'or open the <a href="file:///{url}">updates folder</a> to install manually.'.format(
-                        cur=current_version, curf=current_flytrex,
-                        latest=latest[1], latestf=latest[2],
-                        name=latest[3],
-                        url=updates_dir.replace('\\', '/')))
-                msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
-                install_btn = msg.addButton('Install Now', QMessageBox.AcceptRole)
-                msg.addButton('Later', QMessageBox.RejectRole)
-                msg.setDefaultButton(install_btn)
-                msg.exec_()
-                if msg.clickedButton() is install_btn:
-                    self._launch_installer_and_quit(installer_path)
-                    return  # app is quitting; don't bother with DSDL dialog
-            elif not silent:
-                QMessageBox.information(
-                    self, 'Check for Updates',
-                    'You are running the latest version ({} flytrex {}).'.format(
-                        current_version, current_flytrex))
+                                        'Could not list the updates directory:\n{}'.format(msi['error']))
+            else:
+                latest = msi['latest']
+                if latest is None:
+                    if not silent:
+                        QMessageBox.warning(self, 'Check for Updates',
+                                            'No installation files were found in:\n{}'.format(updates_dir))
+                elif latest[0] > current_combo:
+                    installer_path = os.path.join(updates_dir, latest[3])
+                    msg = QMessageBox(self)
+                    msg.setIcon(QMessageBox.Information)
+                    msg.setWindowTitle('Check for Updates')
+                    msg.setTextFormat(Qt.RichText)
+                    msg.setText(
+                        'A new version is available.<br><br>'
+                        'Installed: <b>{cur} (flytrex {curf})</b><br>'
+                        'Latest: <b>{latest} (flytrex {latestf})</b><br><br>'
+                        'File: <code>{name}</code><br><br>'
+                        'Press <b>Install Now</b> to close the application and run the installer, '
+                        'or open the <a href="file:///{url}">updates folder</a> to install manually.'.format(
+                            cur=current_version, curf=current_flytrex,
+                            latest=latest[1], latestf=latest[2],
+                            name=latest[3],
+                            url=updates_dir.replace('\\', '/')))
+                    msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
+                    install_btn = msg.addButton('Install Now', QMessageBox.AcceptRole)
+                    msg.addButton('Later', QMessageBox.RejectRole)
+                    msg.setDefaultButton(install_btn)
+                    msg.exec_()
+                    if msg.clickedButton() is install_btn:
+                        self._launch_installer_and_quit(installer_path)
+                        return  # app is quitting; don't bother with DSDL dialog
+                elif not silent:
+                    QMessageBox.information(
+                        self, 'Check for Updates',
+                        'You are running the latest version ({} flytrex {}).'.format(
+                            current_version, current_flytrex))
 
         # --- DSDL part ------------------------------------------------------
         dsdl = result['dsdl']
