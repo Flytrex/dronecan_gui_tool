@@ -281,7 +281,6 @@ class NodeRuntime(QObject):
         # Node discovery, bus monitoring and the user's CAN filter profile must keep working
         # during an update; only the driver-level prioritization is adjusted here.
         self._node_monitor.set_updates_enabled(True)
-        self._log_messages.set_updates_enabled(not enabled)
         self._set_driver_firmware_update_mode(enabled)
         if not enabled:
             setattr(self._node, '_firmware_read_active_until', 0.0)

@@ -448,7 +448,7 @@ class BusMonitorWindow(QMainWindow):
         ts2 = self._log_widget.table.item(row2, 1).text()
 
         # Use your TimestampRenderer.compute_timestamp_difference method
-        dt = TimestampRenderer.compute_timestamp_difference(ts1, ts2)
+        dt = abs(TimestampRenderer.compute_timestamp_difference(ts1, ts2))
         QMessageBox.information(self, "Time Interval", f"Time difference: {dt:.6f} seconds ({dt * 1000:.3f} msec)")
 
     def _count_selected_commands(self):
