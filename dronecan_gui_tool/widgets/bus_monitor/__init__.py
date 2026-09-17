@@ -11,6 +11,7 @@ import sys
 import queue
 import logging
 import multiprocessing
+from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QTimer
 from .window import BusMonitorWindow
@@ -86,10 +87,13 @@ def _process_entry_point(channel, iface_name):
 # TODO: Duplicates PlotterManager; refactor into an abstract process factory
 class BusMonitorManager:
     def __init__(self, node, can_iface_name):
-        self._node = node
+        if isinstance(node, BusMonitorHookController):
+            self._hook_controller = node
+        else:
+            self._hook_controller = BusMonitorHookController(node)
         self._can_iface_name = can_iface_name
         self._inferiors = []    # process object, channel
-        self._hook_handle = None
+        self._hook_controller.frame_received.connect(self._frame_hook)
 
     def _frame_hook(self, direction, frame):
         for proc, channel in self._inferiors[:]:
@@ -104,9 +108,7 @@ class BusMonitorManager:
 
     def spawn_monitor(self):
         channel = IPCChannel()
-
-        if self._hook_handle is None:
-            self._hook_handle = self._node.can_driver.add_io_hook(self._frame_hook)
+        self._hook_controller.start()
 
         proc = multiprocessing.Process(target=_process_entry_point, name='bus_monitor',
                                        args=(channel, self._can_iface_name))
@@ -118,10 +120,7 @@ class BusMonitorManager:
         logger.info('Spawned new bus monitor process %r', proc)
 
     def close(self):
-        try:
-            self._hook_handle.remove()
-        except Exception:
-            pass
+        self._hook_controller.stop()
 
         for _, channel in self._inferiors:
             try:
@@ -140,3 +139,43 @@ class BusMonitorManager:
                 proc.terminate()
             except Exception:
                 pass
+
+
+class BusMonitorHookController(QObject):
+    frame_received = pyqtSignal(object, object)
+
+    def __init__(self, node, parent=None):
+        super(BusMonitorHookController, self).__init__(parent)
+        self._node = node
+        self._hook_handle = None
+        self._capture_enabled = True
+
+    @property
+    def capture_enabled(self):
+        return self._capture_enabled
+
+    def set_capture_enabled(self, enabled):
+        self._capture_enabled = bool(enabled)
+
+    @pyqtSlot()
+    def start(self):
+        if self._hook_handle is None:
+            self._hook_handle = self._node.can_driver.add_io_hook(self._on_frame)
+
+    @pyqtSlot()
+    def stop(self):
+        if self._hook_handle is not None:
+            try:
+                self._hook_handle.remove()
+            except Exception:
+                pass
+            self._hook_handle = None
+
+    def close(self):
+        self.stop()
+
+    def _on_frame(self, direction, frame):
+        if not self._capture_enabled:
+            return
+
+        self.frame_received.emit(direction, frame)
