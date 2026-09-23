@@ -124,6 +124,34 @@ FIRMWARE_UPDATE_SPIN_INTERVAL_MS = 1
 FIRMWARE_UPDATE_IDLE_SPIN_INTERVAL_MS = 2
 
 
+class _QueuedNodeCallback(QObject):
+    callback_requested = pyqtSignal(object)
+
+    def __init__(self, callback, parent):
+        super(_QueuedNodeCallback, self).__init__(parent)
+        self._callback = callback
+        self.callback_requested.connect(self._invoke, Qt.QueuedConnection)
+
+    def emit(self, *args):
+        self.callback_requested.emit(args)
+
+    @pyqtSlot(object)
+    def _invoke(self, args):
+        try:
+            self._callback(*args)
+        except Exception:
+            logger.error('Unhandled exception in queued node callback', exc_info=True)
+
+
+class _QueuedNodeHandler:
+    def __init__(self, raw_handle, callback_bridge):
+        self._raw_handle = raw_handle
+        self._callback_bridge = callback_bridge
+
+    def remove(self):
+        self._raw_handle.remove()
+
+
 class NodeRuntime(QObject):
     spin_error = pyqtSignal(object, int)
     _spin_start_requested = pyqtSignal(int)
@@ -311,8 +339,7 @@ class NodeRuntime(QObject):
     @pyqtSlot()
     def close(self):
         self.set_firmware_update_mode(False)
-        self.stop()
-        self._spin_close_requested.emit()
+        self._spin_worker.stop()
         self._spin_thread.quit()
         self._spin_thread.wait(2000)
         self._bus_monitor_hook.close()
@@ -349,7 +376,7 @@ class NodeRuntime(QObject):
         except Exception:
             return False
 
-    def request(self, payload, server_node_id, callback, priority=None, timeout=None):
+    def request(self, payload, server_node_id, callback, priority=None, timeout=None, **kwargs):
         if self._firmware_update_mode:
             original_priority = DEFAULT_NODE_REQUEST_PRIORITY if priority is None else int(priority)
             is_firmware_begin_update = self._is_begin_firmware_update_request(payload)
@@ -357,19 +384,35 @@ class NodeRuntime(QObject):
                 priority = min(original_priority, FIRMWARE_UPDATE_REQUEST_PRIORITY)
             else:
                 priority = max(original_priority, NON_FIRMWARE_REQUEST_PRIORITY_DURING_UPDATE)
-        return self._node.request(payload, server_node_id, callback, priority=priority, timeout=timeout)
+        if callback is not None:
+            callback_bridge = _QueuedNodeCallback(callback, self)
+            callback = callback_bridge.emit
+        return self._node.request(payload, server_node_id, callback, priority=priority, timeout=timeout, **kwargs)
 
-    def add_handler(self, dronecan_type, callback):
-        return self._node.add_handler(dronecan_type, callback)
+    def add_handler(self, dronecan_type, callback, **kwargs):
+        if dronecan_type.kind != dronecan_type.KIND_MESSAGE and not kwargs.get('sniff_response', False):
+            return self._node.add_handler(dronecan_type, callback, **kwargs)
+
+        callback_bridge = _QueuedNodeCallback(callback, self)
+        raw_handle = self._node.add_handler(dronecan_type, callback_bridge.emit, **kwargs)
+        return _QueuedNodeHandler(raw_handle, callback_bridge)
+
+    def remove_handler(self, handler):
+        return self._node.remove_handler(handler)
 
     def broadcast(self, payload, priority=None):
         return self._node.broadcast(payload, priority)
 
     def periodic(self, period_sec, callback):
-        return self._node.periodic(period_sec, callback)
+        callback_bridge = _QueuedNodeCallback(callback, self)
+        return self._node.periodic(period_sec, callback_bridge.emit)
 
     def defer(self, delay_sec, callback):
-        return self._node.defer(delay_sec, callback)
+        callback_bridge = _QueuedNodeCallback(callback, self)
+        return self._node.defer(delay_sec, callback_bridge.emit)
+
+    def set_canfd(self, enabled):
+        return self._node.set_canfd(enabled)
 
     def can_send(self, can_id, data, extended=False):
         self._node.can_driver.send(can_id, data, extended=extended)
@@ -633,7 +676,7 @@ class MainWindow(QMainWindow):
                 action.setIcon(icon)
             if idx < 9:
                 action.setShortcut(QKeySequence('Ctrl+Shift+%d' % (idx + 1)))
-            action.triggered.connect(lambda state, panel=panel: panel.safe_spawn(self, self._node))
+            action.triggered.connect(lambda state, panel=panel: panel.safe_spawn(self, self._node_runtime))
             panels_menu.addAction(action)
 
         #
@@ -1388,7 +1431,7 @@ class MainWindow(QMainWindow):
         return [
             InternalObjectDescriptor('can_iface_name', self._iface_name,
                                      'Name of the CAN bus interface'),
-            InternalObjectDescriptor('node', self._node,
+            InternalObjectDescriptor('node', self._node_runtime,
                                      'DroneCAN node instance'),
             InternalObjectDescriptor('node_monitor', self._node_monitor_widget.monitor,
                                      'Object that stores information about nodes currently available on the bus'),

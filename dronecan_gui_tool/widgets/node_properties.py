@@ -34,7 +34,7 @@ class FirmwareUpdateController(QObject):
     error = pyqtSignal(str, str, object)
     _response_received = pyqtSignal(object)
     _node_status_received = pyqtSignal(object)
-    _send_request_requested = pyqtSignal()
+    _send_request_requested = pyqtSignal(int)
 
     def __init__(self, node, target_node_id, parent=None):
         super(FirmwareUpdateController, self).__init__(parent)
@@ -51,6 +51,7 @@ class FirmwareUpdateController(QObject):
         self._last_status_message_monotonic = None
         self._last_status_mode_health = None
         self._last_target_mode = None
+        self._operation_generation = 0
         self._restore_timeout_timer = QTimer(self)
         self._restore_timeout_timer.setSingleShot(True)
         self._restore_timeout_timer.timeout.connect(self._on_update_restore_timeout)
@@ -114,6 +115,7 @@ class FirmwareUpdateController(QObject):
         self._set_log_updates_enabled(not enabled)
 
     def close(self):
+        self._operation_generation += 1
         was_in_progress = self._update_in_progress
         self._update_in_progress = False
         self._update_started_monotonic = None
@@ -128,31 +130,39 @@ class FirmwareUpdateController(QObject):
         if self._node_status_handle is not None:
             self._node_status_handle.remove()
             self._node_status_handle = None
-        if self._monitor_updates_suspended or self._log_updates_suspended:
+        if (self._monitor_updates_suspended or self._log_updates_suspended or
+            bool(getattr(self._node, 'firmware_update_mode', False))):
             self._set_firmware_update_mode(False)
         if was_in_progress:
             self.message.emit('Firmware update mode ended')
 
     def start(self, remote_fw_file):
         self.close()
+        self._operation_generation += 1
+        generation = self._operation_generation
         self._set_firmware_update_mode(True)
         self._update_in_progress = False
         self._remote_fw_file = remote_fw_file
         self._num_remaining_requests = 4
-        self._node_status_handle = self._node.add_handler(dronecan.uavcan.protocol.NodeStatus,
-                                                          self._on_node_status_from_node_thread)
-        self._send_request()
+        self._node_status_handle = self._node.add_handler(
+            dronecan.uavcan.protocol.NodeStatus,
+            lambda e, generation=generation: self._on_node_status_from_node_thread(generation, e))
+        self._send_request(generation)
 
-    def _on_response_from_node_thread(self, e):
-        self._response_received.emit(e)
+    def _on_response_from_node_thread(self, generation, e):
+        self._response_received.emit((generation, e))
 
-    def _on_node_status_from_node_thread(self, e):
-        self._node_status_received.emit(e)
+    def _on_node_status_from_node_thread(self, generation, e):
+        self._node_status_received.emit((generation, e))
 
-    def _request_send_from_node_thread(self):
-        self._send_request_requested.emit()
+    def _request_send_from_node_thread(self, generation):
+        self._send_request_requested.emit(generation)
 
-    def _on_response(self, e):
+    def _on_response(self, event):
+        generation, e = event
+        if generation != self._operation_generation:
+            return
+
         if self._deferred_request_handle is not None:
             try:
                 self._deferred_request_handle.remove()
@@ -163,7 +173,8 @@ class FirmwareUpdateController(QObject):
         if e is None:
             self.message.emit('One of firmware update requests has timed out')
             if (not self._update_in_progress) and (self._num_remaining_requests > 0):
-                self._deferred_request_handle = self._node.defer(2, self._request_send_from_node_thread)
+                self._deferred_request_handle = self._node.defer(
+                    2, partial(self._request_send_from_node_thread, generation))
             return
 
         logger.info('Firmware update response: %s', e.response)
@@ -176,9 +187,14 @@ class FirmwareUpdateController(QObject):
             return
 
         if (not self._update_in_progress) and (self._num_remaining_requests > 0):
-            self._deferred_request_handle = self._node.defer(2, self._request_send_from_node_thread)
+            self._deferred_request_handle = self._node.defer(
+                2, partial(self._request_send_from_node_thread, generation))
 
-    def _on_node_status(self, e):
+    def _on_node_status(self, event):
+        generation, e = event
+        if generation != self._operation_generation:
+            return
+
         if e.transfer.source_node_id != self._target_node_id:
             return
 
@@ -215,7 +231,10 @@ class FirmwareUpdateController(QObject):
         if self._update_in_progress and left_software_update:
             self.close()
 
-    def _send_request(self):
+    def _send_request(self, generation):
+        if generation != self._operation_generation:
+            return
+
         self._deferred_request_handle = None
 
         if self._num_remaining_requests > 0:
@@ -227,7 +246,7 @@ class FirmwareUpdateController(QObject):
             try:
                 self._node.request(request,
                                    self._target_node_id,
-                                   self._on_response_from_node_thread,
+                                   partial(self._on_response_from_node_thread, generation),
                                    priority=REQUEST_PRIORITY)
             except Exception as ex:
                 self.close()
@@ -750,8 +769,8 @@ class ConfigParamEditWindow(QDialog):
         self._update_callback = update_callback
         self._request_controller = ConfigParamRequestController(node, target_node_id, self)
         self._request_controller.value_received.connect(self._assign)
-        self._request_controller.message.connect(lambda text: self.show_message('%s', text))
-        self._request_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
+        self._request_controller.message.connect(self._show_request_message)
+        self._request_controller.error.connect(self._show_request_error)
 
         self._is_tune_editor = AM32_Rtttl.is_am32_melody_param(param_struct)
 
@@ -857,6 +876,12 @@ class ConfigParamEditWindow(QDialog):
     def show_message(self, text, *fmt):
         self._status_bar.showMessage(text % fmt)
 
+    def _show_request_message(self, text):
+        self.show_message('%s', text)
+
+    def _show_request_error(self, title, text, info):
+        show_error(title, text, info, self)
+
     def _assign(self, value_union):
         value = get_union_value(value_union)
 
@@ -945,11 +970,11 @@ class ConfigParams(QGroupBox):
         self._fetch_controller.fetch_started.connect(self._on_fetch_started)
         self._fetch_controller.param_received.connect(self._on_param_received)
         self._fetch_controller.fetch_finished.connect(self._on_fetch_finished)
-        self._fetch_controller.message.connect(lambda text: self.window().show_message('%s', text))
-        self._fetch_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
+        self._fetch_controller.message.connect(self._show_controller_message)
+        self._fetch_controller.error.connect(self._show_controller_error)
         self._action_controller.param_updated.connect(self._on_param_updated)
-        self._action_controller.message.connect(lambda text: self.window().show_message('%s', text))
-        self._action_controller.error.connect(lambda title, text, info: show_error(title, text, info, self))
+        self._action_controller.message.connect(self._show_controller_message)
+        self._action_controller.error.connect(self._show_controller_error)
 
         self._read_all_button = make_icon_button('fa6s.arrows-rotate', self.FETCH_ALL_TOOLTIP, self,
                              text=self.FETCH_ALL_TEXT, on_clicked=self._on_fetch_all_clicked)
@@ -1009,6 +1034,12 @@ class ConfigParams(QGroupBox):
         layout.addLayout(controls_layout)
         layout.addWidget(self._table)
         self.setLayout(layout)
+
+    def _show_controller_message(self, text):
+        self.window().show_message('%s', text)
+
+    def _show_controller_error(self, title, text, info):
+        show_error(title, text, info, self)
 
     def _set_fetch_button_caption(self, fetching):
         '''
