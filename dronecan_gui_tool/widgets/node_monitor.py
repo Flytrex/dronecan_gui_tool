@@ -133,6 +133,9 @@ class NodeTable(BasicTable):
         if isinstance(node, NodeMonitorBridge):
             self._monitor = node
             self._owns_monitor = False
+        elif hasattr(node, 'node_monitor'):
+            self._monitor = node.node_monitor
+            self._owns_monitor = False
         else:
             self._monitor = NodeMonitorBridge(node, self)
             self._owns_monitor = True

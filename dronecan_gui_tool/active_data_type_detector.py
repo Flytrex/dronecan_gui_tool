@@ -7,6 +7,7 @@
 #
 
 import logging
+import threading
 import dronecan
 from PyQt5.QtCore import pyqtSignal, QObject
 
@@ -21,16 +22,18 @@ class ActiveDataTypeDetector(QObject):
     def __init__(self, node):
         super(ActiveDataTypeDetector, self).__init__()
         self._node = node
-        self._hook_handle = node.add_transfer_hook(self._on_transfer)
+        self._state_lock = threading.RLock()
         self._active_messages = set()
         self._active_services = set()
+        self._hook_handle = node.add_transfer_hook(self._on_transfer)
 
     def close(self):
         self._hook_handle.remove()
 
     def reset(self):
-        self._active_messages.clear()
-        self._active_services.clear()
+        with self._state_lock:
+            self._active_messages.clear()
+            self._active_services.clear()
 
     def _on_transfer(self, tr):
         try:
@@ -45,19 +48,25 @@ class ActiveDataTypeDetector(QObject):
                 return
 
         if tr.service_not_message:
-            if dtname not in self._active_services:
+            with self._state_lock:
+                if dtname in self._active_services:
+                    return
                 self._active_services.add(dtname)
                 self.service_types_updated.emit()
         else:
-            if dtname not in self._active_messages:
+            with self._state_lock:
+                if dtname in self._active_messages:
+                    return
                 self._active_messages.add(dtname)
                 self.message_types_updated.emit()
 
     def get_names_of_active_messages(self):
-        return list(sorted(self._active_messages))
+        with self._state_lock:
+            return list(sorted(self._active_messages))
 
     def get_names_of_active_services(self):
-        return list(sorted(self._active_services))
+        with self._state_lock:
+            return list(sorted(self._active_services))
 
     @staticmethod
     def get_names_of_all_message_types_with_data_type_id():

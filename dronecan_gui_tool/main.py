@@ -376,7 +376,7 @@ class NodeRuntime(QObject):
         except Exception:
             return False
 
-    def request(self, payload, server_node_id, callback, priority=None, timeout=None, **kwargs):
+    def request(self, payload, server_node_id, callback=None, priority=None, timeout=None, **kwargs):
         if self._firmware_update_mode:
             original_priority = DEFAULT_NODE_REQUEST_PRIORITY if priority is None else int(priority)
             is_firmware_begin_update = self._is_begin_firmware_update_request(payload)
@@ -387,7 +387,12 @@ class NodeRuntime(QObject):
         if callback is not None:
             callback_bridge = _QueuedNodeCallback(callback, self)
             callback = callback_bridge.emit
-        return self._node.request(payload, server_node_id, callback, priority=priority, timeout=timeout, **kwargs)
+        request_args = dict(kwargs)
+        if priority is not None:
+            request_args['priority'] = priority
+        if timeout is not None:
+            request_args['timeout'] = timeout
+        return self._node.request(payload, server_node_id, callback, **request_args)
 
     def add_handler(self, dronecan_type, callback, **kwargs):
         if dronecan_type.kind != dronecan_type.KIND_MESSAGE and not kwargs.get('sniff_response', False):
@@ -397,11 +402,14 @@ class NodeRuntime(QObject):
         raw_handle = self._node.add_handler(dronecan_type, callback_bridge.emit, **kwargs)
         return _QueuedNodeHandler(raw_handle, callback_bridge)
 
+    def add_transfer_hook(self, hook, **kwargs):
+        return self._node.add_transfer_hook(hook, **kwargs)
+
     def remove_handler(self, handler):
         return self._node.remove_handler(handler)
 
     def broadcast(self, payload, priority=None):
-        return self._node.broadcast(payload, priority)
+        return self._node.broadcast(payload) if priority is None else self._node.broadcast(payload, priority)
 
     def periodic(self, period_sec, callback):
         callback_bridge = _QueuedNodeCallback(callback, self)
@@ -562,6 +570,7 @@ class _UpdateCheckWorker(QObject):
 
 class MainWindow(QMainWindow):
     MAX_SUCCESSIVE_NODE_ERRORS = 1000
+    _update_result_received = pyqtSignal(object, bool, bool)
 
     # noinspection PyTypeChecker,PyCallByClass,PyUnresolvedReferences
     def __init__(self, node, iface_name, iface_kwargs):
@@ -577,6 +586,7 @@ class MainWindow(QMainWindow):
         self._successive_node_errors = 0
         self._iface_name = iface_name
         self._node_runtime.spin_error.connect(self._on_node_spin_error)
+        self._update_result_received.connect(self._handle_update_result, Qt.QueuedConnection)
 
         self._active_data_type_detector = ActiveDataTypeDetector(self._node)
         self._node_runtime.start(2)
@@ -858,7 +868,7 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.finished.connect(
             lambda result, silent=silent, dsdl_only=dsdl_only:
-                self._handle_update_result(result, silent, dsdl_only))
+                self._update_result_received.emit(result, silent, dsdl_only))
         worker.finished.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
