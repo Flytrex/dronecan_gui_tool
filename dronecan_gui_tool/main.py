@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import sys
 import time
+import threading
 import tempfile
 import re
 import glob
@@ -28,7 +29,7 @@ parser.add_argument("--debug", action='store_true', help="enable debugging")
 parser.add_argument("--dsdl", help="path to custom DSDL")
 parser.add_argument("--signing-passphrase", help="MAVLink2 signing passphrase", default=None)
 parser.add_argument("--interface", help="skip the setup dialog by setting the device to connect to")
-parser.add_argument("--baudrate", help="set the baudrate", type=int, default=115200)
+parser.add_argument("--baudrate", help="set the baudrate", type=int, default=921600)
 parser.add_argument("--bitrate", help="set the bitrate of the CAN Bus", type=int, default=1000000)
 parser.add_argument("--bus", help="set the CAN Bus number", type=int, default=1)
 parser.add_argument("--filtered", action='store_true', help="enable filtering of DroneCAN traffic")
@@ -85,14 +86,14 @@ from .setup_window import run_setup_window
 from .active_data_type_detector import ActiveDataTypeDetector
 
 from .widgets import show_error, get_icon, get_app_icon
-from .widgets.node_monitor import NodeMonitorWidget
-from .widgets.local_node import LocalNodeWidget
+from .widgets.node_monitor import NodeMonitorWidget, NodeMonitorBridge
+from .widgets.local_node import LocalNodeWidget, LocalNodeController
 from .widgets.local_node import AdapterSettingsWidget
 from .widgets.local_node import setup_filtering
-from .widgets.log_message_display import LogMessageDisplayWidget
-from .widgets.bus_monitor import BusMonitorManager
+from .widgets.log_message_display import LogMessageDisplayWidget, LogMessageController
+from .widgets.bus_monitor import BusMonitorManager, BusMonitorHookController
 from .widgets.dynamic_node_id_allocator import DynamicNodeIDAllocatorWidget
-from .widgets.file_server import FileServerWidget
+from .widgets.file_server import FileServerWidget, FileServerController
 from .widgets.node_properties import NodePropertiesWindow
 from .widgets.console import ConsoleManager, InternalObjectDescriptor
 from .widgets.subscriber import SubscriberWindow
@@ -115,6 +116,314 @@ DSDL_MANIFEST = '.flytrex_dsdl_manifest'
 # Top-level archive entries that are not DSDL trees and must not be synced.
 DSDL_SYNC_EXCLUDES = {'.github', '.gitignore', 'tests', 'LICENSE', 'README.md',
                      'test.py', '.flytrex_dsdl_version'}
+
+FIRMWARE_UPDATE_REQUEST_PRIORITY = 10
+NON_FIRMWARE_REQUEST_PRIORITY_DURING_UPDATE = 31
+DEFAULT_NODE_REQUEST_PRIORITY = 20
+FIRMWARE_UPDATE_SPIN_INTERVAL_MS = 1
+FIRMWARE_UPDATE_IDLE_SPIN_INTERVAL_MS = 2
+
+
+class _QueuedNodeCallback(QObject):
+    callback_requested = pyqtSignal(object)
+
+    def __init__(self, callback, parent):
+        super(_QueuedNodeCallback, self).__init__(parent)
+        self._callback = callback
+        self.callback_requested.connect(self._invoke, Qt.QueuedConnection)
+
+    def emit(self, *args):
+        self.callback_requested.emit(args)
+
+    @pyqtSlot(object)
+    def _invoke(self, args):
+        try:
+            self._callback(*args)
+        except Exception:
+            logger.error('Unhandled exception in queued node callback', exc_info=True)
+
+
+class _QueuedNodeHandler:
+    def __init__(self, raw_handle, callback_bridge):
+        self._raw_handle = raw_handle
+        self._callback_bridge = callback_bridge
+
+    def remove(self):
+        self._raw_handle.remove()
+
+
+class NodeRuntime(QObject):
+    spin_error = pyqtSignal(object, int)
+    _spin_start_requested = pyqtSignal(int)
+    _spin_interval_requested = pyqtSignal(int)
+    _spin_stop_requested = pyqtSignal()
+    _spin_close_requested = pyqtSignal()
+    _spin_node_close_requested = pyqtSignal()
+
+    class _NodeSpinWorker(QObject):
+        spin_error = pyqtSignal(object, int)
+
+        def __init__(self, node):
+            super(NodeRuntime._NodeSpinWorker, self).__init__()
+            self._node = node
+            self._successive_spin_errors = 0
+            self._spin_interval_ms = 10
+            self._firmware_update_spin_interval_ms = FIRMWARE_UPDATE_SPIN_INTERVAL_MS
+            self._spin_loop_thread = None
+            self._spin_stop_requested = threading.Event()
+            self._spin_loop_lock = threading.Lock()
+
+        @pyqtSlot(int)
+        def start(self, interval_ms=10):
+            self._spin_interval_ms = max(1, int(interval_ms))
+            self.stop()
+            self._spin_stop_requested.clear()
+            self._spin_loop_thread = threading.Thread(
+                target=self._spin_loop,
+                name='NodeSpinWorker',
+                daemon=True,
+            )
+            self._spin_loop_thread.start()
+
+        @pyqtSlot(int)
+        def set_interval(self, interval_ms):
+            self._spin_interval_ms = max(1, int(interval_ms))
+
+        def _effective_spin_interval_ms(self):
+            if bool(getattr(self._node, '_firmware_update_mode', False)):
+                active_until = float(getattr(self._node, '_firmware_read_active_until', 0.0) or 0.0)
+                if active_until > time.monotonic():
+                    return self._firmware_update_spin_interval_ms
+            return self._spin_interval_ms
+
+        @pyqtSlot()
+        def stop(self):
+            self._spin_stop_requested.set()
+            with self._spin_loop_lock:
+                loop_thread = self._spin_loop_thread
+                self._spin_loop_thread = None
+            if loop_thread and loop_thread.is_alive():
+                loop_thread.join(timeout=2.0)
+
+        @pyqtSlot()
+        def close(self):
+            self.stop()
+
+        @pyqtSlot()
+        def close_node(self):
+            try:
+                self._node.close()
+            except Exception:
+                logger.error('Could not close node from spin worker', exc_info=True)
+
+        def _spin_once(self):
+            try:
+                self._node.spin(0)
+                self._successive_spin_errors = 0
+            except Exception as ex:
+                # Ignore common bus-noise decode errors; surfacing each one floods
+                # the GUI/log path and can starve normal request/response handling.
+                ex_text = str(ex)
+                if 'CRC mismatch' in ex_text or 'Toggle bit value' in ex_text:
+                    self._successive_spin_errors = 0
+                    return
+                self._successive_spin_errors += 1
+                self.spin_error.emit(ex, self._successive_spin_errors)
+
+        def _spin_loop(self):
+            next_run_at = time.monotonic()
+            while not self._spin_stop_requested.is_set():
+                interval_sec = self._effective_spin_interval_ms() / 1000.0
+                now = time.monotonic()
+                if now < next_run_at:
+                    self._spin_stop_requested.wait(min(next_run_at - now, 0.001))
+                    continue
+
+                self._spin_once()
+
+                next_run_at += interval_sec
+                if next_run_at < now - interval_sec:
+                    next_run_at = now + interval_sec
+
+    def __init__(self, node, parent=None):
+        super(NodeRuntime, self).__init__(parent)
+        self._node = node
+        self._node_monitor = NodeMonitorBridge(node, self)
+        self._file_server = FileServerController(node, self)
+        self._local_node = LocalNodeController(node, self)
+        self._log_messages = LogMessageController(node, self)
+        self._bus_monitor_hook = BusMonitorHookController(node, self)
+        self._firmware_update_mode = False
+        self._base_spin_interval_ms = FIRMWARE_UPDATE_IDLE_SPIN_INTERVAL_MS
+
+        self._spin_worker = NodeRuntime._NodeSpinWorker(node)
+        self._spin_thread = QThread(self)
+        self._spin_worker.moveToThread(self._spin_thread)
+        self._spin_thread.finished.connect(self._spin_worker.deleteLater)
+
+        self._spin_start_requested.connect(self._spin_worker.start)
+        self._spin_interval_requested.connect(self._spin_worker.set_interval)
+        self._spin_stop_requested.connect(self._spin_worker.stop)
+        self._spin_close_requested.connect(self._spin_worker.close)
+        self._spin_node_close_requested.connect(self._spin_worker.close_node)
+        self._spin_worker.spin_error.connect(self.spin_error)
+
+        self._spin_thread.start()
+
+    @property
+    def node(self):
+        return self._node
+
+    @property
+    def node_monitor(self):
+        return self._node_monitor
+
+    @property
+    def file_server(self):
+        return self._file_server
+
+    @property
+    def local_node(self):
+        return self._local_node
+
+    @property
+    def log_messages(self):
+        return self._log_messages
+
+    @property
+    def bus_monitor_hook(self):
+        return self._bus_monitor_hook
+
+    @property
+    def firmware_update_mode(self):
+        return self._firmware_update_mode
+
+    def set_firmware_update_mode(self, enabled):
+        enabled = bool(enabled)
+        if self._firmware_update_mode == enabled:
+            return
+
+        self._firmware_update_mode = enabled
+        setattr(self._node, '_firmware_update_mode', enabled)
+
+        # Node discovery, bus monitoring and the user's CAN filter profile must keep working
+        # during an update; only the driver-level prioritization is adjusted here.
+        self._node_monitor.set_updates_enabled(True)
+        self._set_driver_firmware_update_mode(enabled)
+        if not enabled:
+            setattr(self._node, '_firmware_read_active_until', 0.0)
+        self._spin_interval_requested.emit(FIRMWARE_UPDATE_IDLE_SPIN_INTERVAL_MS if enabled else self._base_spin_interval_ms)
+
+    def _set_driver_firmware_update_mode(self, enabled):
+        driver = getattr(self._node, 'can_driver', None)
+        if driver is None or not hasattr(driver, 'set_firmware_update_mode'):
+            return
+        try:
+            driver.set_firmware_update_mode(enabled)
+        except Exception:
+            logger.debug('Could not toggle driver firmware-update mode', exc_info=True)
+
+    @pyqtSlot(int)
+    def start(self, interval_ms=10):
+        self._base_spin_interval_ms = max(1, int(interval_ms))
+        self._spin_start_requested.emit(interval_ms)
+
+    @pyqtSlot()
+    def stop(self):
+        self._spin_stop_requested.emit()
+
+    @pyqtSlot()
+    def close_node(self):
+        self._spin_node_close_requested.emit()
+
+    @pyqtSlot()
+    def close(self):
+        self.set_firmware_update_mode(False)
+        self._spin_worker.stop()
+        self._spin_thread.quit()
+        self._spin_thread.wait(2000)
+        self._bus_monitor_hook.close()
+        self._log_messages.close()
+        self._local_node.close()
+        self._file_server.close()
+        self._node_monitor.close()
+
+    @property
+    def is_anonymous(self):
+        return self._node.is_anonymous
+
+    @property
+    def node_id(self):
+        return self._node.node_id
+
+    @node_id.setter
+    def node_id(self, value):
+        self._node.node_id = value
+
+    @staticmethod
+    def _is_begin_firmware_update_request(payload):
+        try:
+            payload_type = dronecan.get_dronecan_data_type(payload)
+            begin_update = dronecan.uavcan.protocol.file.BeginFirmwareUpdate
+            request_type = getattr(begin_update, 'Request', None)
+            if request_type is not None and payload_type == request_type:
+                return True
+            return (
+                getattr(payload_type, 'default_dtid', None) == getattr(begin_update, 'default_dtid', None)
+                and hasattr(payload, 'image_file_remote_path')
+                and hasattr(payload, 'source_node_id')
+            )
+        except Exception:
+            return False
+
+    def request(self, payload, server_node_id, callback=None, priority=None, timeout=None, **kwargs):
+        if self._firmware_update_mode:
+            original_priority = DEFAULT_NODE_REQUEST_PRIORITY if priority is None else int(priority)
+            is_firmware_begin_update = self._is_begin_firmware_update_request(payload)
+            if is_firmware_begin_update:
+                priority = min(original_priority, FIRMWARE_UPDATE_REQUEST_PRIORITY)
+            else:
+                priority = max(original_priority, NON_FIRMWARE_REQUEST_PRIORITY_DURING_UPDATE)
+        if callback is not None:
+            callback_bridge = _QueuedNodeCallback(callback, self)
+            callback = callback_bridge.emit
+        request_args = dict(kwargs)
+        if priority is not None:
+            request_args['priority'] = priority
+        if timeout is not None:
+            request_args['timeout'] = timeout
+        return self._node.request(payload, server_node_id, callback, **request_args)
+
+    def add_handler(self, dronecan_type, callback, **kwargs):
+        if dronecan_type.kind != dronecan_type.KIND_MESSAGE and not kwargs.get('sniff_response', False):
+            return self._node.add_handler(dronecan_type, callback, **kwargs)
+
+        callback_bridge = _QueuedNodeCallback(callback, self)
+        raw_handle = self._node.add_handler(dronecan_type, callback_bridge.emit, **kwargs)
+        return _QueuedNodeHandler(raw_handle, callback_bridge)
+
+    def add_transfer_hook(self, hook, **kwargs):
+        return self._node.add_transfer_hook(hook, **kwargs)
+
+    def remove_handler(self, handler):
+        return self._node.remove_handler(handler)
+
+    def broadcast(self, payload, priority=None):
+        return self._node.broadcast(payload) if priority is None else self._node.broadcast(payload, priority)
+
+    def periodic(self, period_sec, callback):
+        callback_bridge = _QueuedNodeCallback(callback, self)
+        return self._node.periodic(period_sec, callback_bridge.emit)
+
+    def defer(self, delay_sec, callback):
+        callback_bridge = _QueuedNodeCallback(callback, self)
+        return self._node.defer(delay_sec, callback_bridge.emit)
+
+    def set_canfd(self, enabled):
+        return self._node.set_canfd(enabled)
+
+    def can_send(self, can_id, data, extended=False):
+        self._node.can_driver.send(can_id, data, extended=extended)
 
 
 def _bundled_config_file_path():
@@ -188,7 +497,7 @@ class _UpdateCheckWorker(QObject):
 
     finished = pyqtSignal(dict)
 
-    def __init__(self, updates_dir, dsdl_target, dsdl_skip_marker, repo, branch):
+    def __init__(self, updates_dir, dsdl_target, dsdl_skip_marker, repo, branch, skip_msi=False):
         super().__init__()
         self._updates_dir = updates_dir
         self._dsdl_target = dsdl_target
@@ -197,6 +506,8 @@ class _UpdateCheckWorker(QObject):
         self._dsdl_skip_marker = dsdl_skip_marker
         self._repo = repo
         self._branch = branch
+        # Set when only the DSDL branch changed, to avoid hitting the (slow) shared drive.
+        self._skip_msi = skip_msi
 
     @pyqtSlot()
     def run(self):
@@ -208,26 +519,27 @@ class _UpdateCheckWorker(QObject):
         }
 
         # --- MSI scan on the shared drive (can hang on disconnected SMB) ---
-        try:
-            if not os.path.isdir(self._updates_dir):
-                result['msi']['unreachable'] = True
-            else:
-                pattern = re.compile(
-                    r'^dronecan_gui_tool-(\d+(?:\.\d+)*)-win64-flytrex-(\d+(?:\.\d+)*)\.msi$',
-                    re.IGNORECASE)
-                latest = None
-                for name in os.listdir(self._updates_dir):
-                    m = pattern.match(name)
-                    if not m:
-                        continue
-                    v = tuple(int(x) for x in m.group(1).split('.'))
-                    fv = tuple(int(x) for x in m.group(2).split('.'))
-                    key = (v, fv)
-                    if latest is None or key > latest[0]:
-                        latest = (key, m.group(1), m.group(2), name)
-                result['msi']['latest'] = latest
-        except OSError as ex:
-            result['msi']['error'] = str(ex)
+        if not self._skip_msi:
+            try:
+                if not os.path.isdir(self._updates_dir):
+                    result['msi']['unreachable'] = True
+                else:
+                    pattern = re.compile(
+                        r'^dronecan_gui_tool-(\d+(?:\.\d+)*)-win64-flytrex-(\d+(?:\.\d+)*)\.msi$',
+                        re.IGNORECASE)
+                    latest = None
+                    for name in os.listdir(self._updates_dir):
+                        m = pattern.match(name)
+                        if not m:
+                            continue
+                        v = tuple(int(x) for x in m.group(1).split('.'))
+                        fv = tuple(int(x) for x in m.group(2).split('.'))
+                        key = (v, fv)
+                        if latest is None or key > latest[0]:
+                            latest = (key, m.group(1), m.group(2), name)
+                    result['msi']['latest'] = latest
+            except OSError as ex:
+                result['msi']['error'] = str(ex)
 
         # --- DSDL: GitHub API request (up to 10 s) -------------------------
         try:
@@ -258,6 +570,7 @@ class _UpdateCheckWorker(QObject):
 
 class MainWindow(QMainWindow):
     MAX_SUCCESSIVE_NODE_ERRORS = 1000
+    _update_result_received = pyqtSignal(object, bool, bool)
 
     # noinspection PyTypeChecker,PyCallByClass,PyUnresolvedReferences
     def __init__(self, node, iface_name, iface_kwargs):
@@ -268,16 +581,15 @@ class MainWindow(QMainWindow):
             '.'.join(map(str, __flytrex_version__))))
         self.setWindowIcon(get_app_icon())
 
-        self._node = node
+        self._node_runtime = NodeRuntime(node, self)
+        self._node = self._node_runtime.node
         self._successive_node_errors = 0
         self._iface_name = iface_name
+        self._node_runtime.spin_error.connect(self._on_node_spin_error)
+        self._update_result_received.connect(self._handle_update_result, Qt.QueuedConnection)
 
         self._active_data_type_detector = ActiveDataTypeDetector(self._node)
-
-        self._node_spin_timer = QTimer(self)
-        self._node_spin_timer.timeout.connect(self._spin_node)
-        self._node_spin_timer.setSingleShot(False)
-        self._node_spin_timer.start(10)
+        self._node_runtime.start(2)
 
         self._node_windows = {}  # node ID : window object
 
@@ -296,18 +608,18 @@ class MainWindow(QMainWindow):
             except Exception:
                 logger.warning('Could not write default config file: %s', _user_config_file_path(), exc_info=True)
 
-        self._node_monitor_widget = NodeMonitorWidget(self, node)
+        self._node_monitor_widget = NodeMonitorWidget(self, self._node, self._node_runtime.node_monitor)
         self._node_monitor_widget.on_info_window_requested = self._show_node_window
 
-        self._local_node_widget = LocalNodeWidget(self, node)
-        self._adapter_settings_widget = AdapterSettingsWidget(self, node)
-        self._log_message_widget = LogMessageDisplayWidget(self, node)
+        self._local_node_widget = LocalNodeWidget(self, self._node_runtime.local_node)
+        self._adapter_settings_widget = AdapterSettingsWidget(self, self._node_runtime.local_node)
+        self._log_message_widget = LogMessageDisplayWidget(self, self._node_runtime.log_messages)
         self._dynamic_node_id_allocation_widget = DynamicNodeIDAllocatorWidget(self, node,
                                                                                self._node_monitor_widget.monitor)
-        self._file_server_widget = FileServerWidget(self, node)
+        self._file_server_widget = FileServerWidget(self, self._node_runtime.file_server)
 
         self._plotter_manager = PlotterManager(self._node)
-        self._bus_monitor_manager = BusMonitorManager(self._node, iface_name)
+        self._bus_monitor_manager = BusMonitorManager(self._node_runtime.bus_monitor_hook, iface_name)
         # Console manager depends on other stuff via context, initialize it last
         self._console_manager = ConsoleManager(self._make_console_context)
 
@@ -343,7 +655,7 @@ class MainWindow(QMainWindow):
         new_subscriber_action.setShortcut(QKeySequence('Ctrl+Shift+S'))
         new_subscriber_action.setStatusTip('Open subscription tool')
         new_subscriber_action.triggered.connect(
-            lambda: SubscriberWindow.spawn(self, self._node, self._active_data_type_detector))
+            lambda: SubscriberWindow.spawn(self, self._node_runtime, self._active_data_type_detector))
 
         new_plotter_action = QAction(get_icon('fa6s.chart-area'), '&Plotter', self)
         new_plotter_action.setShortcut(QKeySequence('Ctrl+Shift+P'))
@@ -374,7 +686,7 @@ class MainWindow(QMainWindow):
                 action.setIcon(icon)
             if idx < 9:
                 action.setShortcut(QKeySequence('Ctrl+Shift+%d' % (idx + 1)))
-            action.triggered.connect(lambda state, panel=panel: panel.safe_spawn(self, self._node))
+            action.triggered.connect(lambda state, panel=panel: panel.safe_spawn(self, self._node_runtime))
             panels_menu.addAction(action)
 
         #
@@ -516,8 +828,9 @@ class MainWindow(QMainWindow):
                                     _user_config_file_path(), ex))
             return
         self.statusBar().showMessage('DSDL branch set to {}'.format(dsdl_branch), 3000)
+        self._check_for_updates(dsdl_only=True)
 
-    def _check_for_updates(self, silent=False):
+    def _check_for_updates(self, silent=False, dsdl_only=False):
         """
         Schedule an update check on a background thread.
 
@@ -525,6 +838,9 @@ class MainWindow(QMainWindow):
         several seconds (or much longer if the network/share is unreachable),
         so we never run them on the GUI thread. Results are handled in
         ``_handle_update_result`` once the worker emits ``finished``.
+
+        ``dsdl_only`` skips the (slow) shared-drive MSI scan -- used when the
+        user just switched the DSDL branch and only that needs re-checking.
         """
         if self._update_check_thread is not None:
             if not silent:
@@ -546,12 +862,13 @@ class MainWindow(QMainWindow):
 
         thread = QThread(self)
         worker = _UpdateCheckWorker(updates_dir, dsdl_target, dsdl_skip_marker,
-                                    DSDL_REPO, self._selected_dsdl_branch)
+                                    DSDL_REPO, self._selected_dsdl_branch, skip_msi=dsdl_only)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
         worker.finished.connect(
-            lambda result, silent=silent: self._handle_update_result(result, silent))
+            lambda result, silent=silent, dsdl_only=dsdl_only:
+                self._update_result_received.emit(result, silent, dsdl_only))
         worker.finished.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -559,70 +876,71 @@ class MainWindow(QMainWindow):
 
         self._update_check_thread = thread
         self._update_check_worker = worker
-        logger.info('Update check started (silent=%s)', silent)
+        logger.info('Update check started (silent=%s, dsdl_only=%s)', silent, dsdl_only)
         thread.start()
 
     def _on_update_check_finished(self):
         self._update_check_thread = None
         self._update_check_worker = None
 
-    def _handle_update_result(self, result, silent):
+    def _handle_update_result(self, result, silent, dsdl_only=False):
         """Slot called on the GUI thread after the worker finishes."""
         updates_dir = r'G:\Shared drives\Engineering\Lab Tools\DroneCAN GUI Tool, Flytrex Version'
         current_version = '.'.join(map(str, __version__))
         current_flytrex = '.'.join(map(str, __flytrex_version__))
         current_combo = (tuple(__version__), tuple(__flytrex_version__))
 
-        # --- MSI part -------------------------------------------------------
-        msi = result['msi']
-        if msi['unreachable']:
-            if silent:
-                logger.info('Update check skipped: %s not accessible', updates_dir)
-            else:
-                QMessageBox.warning(self, 'Check for Updates',
-                                    'Could not access the updates directory:\n{}\n\n'
-                                    'Make sure the shared drive is mounted.'.format(updates_dir))
-        elif msi['error']:
-            logger.warning('Update check failed: %s', msi['error'])
-            if not silent:
-                QMessageBox.warning(self, 'Check for Updates',
-                                    'Could not list the updates directory:\n{}'.format(msi['error']))
-        else:
-            latest = msi['latest']
-            if latest is None:
+        # --- MSI part (skipped when only the DSDL branch changed) ----------
+        if not dsdl_only:
+            msi = result['msi']
+            if msi['unreachable']:
+                if silent:
+                    logger.info('Update check skipped: %s not accessible', updates_dir)
+                else:
+                    QMessageBox.warning(self, 'Check for Updates',
+                                        'Could not access the updates directory:\n{}\n\n'
+                                        'Make sure the shared drive is mounted.'.format(updates_dir))
+            elif msi['error']:
+                logger.warning('Update check failed: %s', msi['error'])
                 if not silent:
                     QMessageBox.warning(self, 'Check for Updates',
-                                        'No installation files were found in:\n{}'.format(updates_dir))
-            elif latest[0] > current_combo:
-                installer_path = os.path.join(updates_dir, latest[3])
-                msg = QMessageBox(self)
-                msg.setIcon(QMessageBox.Information)
-                msg.setWindowTitle('Check for Updates')
-                msg.setTextFormat(Qt.RichText)
-                msg.setText(
-                    'A new version is available.<br><br>'
-                    'Installed: <b>{cur} (flytrex {curf})</b><br>'
-                    'Latest: <b>{latest} (flytrex {latestf})</b><br><br>'
-                    'File: <code>{name}</code><br><br>'
-                    'Press <b>Install Now</b> to close the application and run the installer, '
-                    'or open the <a href="file:///{url}">updates folder</a> to install manually.'.format(
-                        cur=current_version, curf=current_flytrex,
-                        latest=latest[1], latestf=latest[2],
-                        name=latest[3],
-                        url=updates_dir.replace('\\', '/')))
-                msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
-                install_btn = msg.addButton('Install Now', QMessageBox.AcceptRole)
-                msg.addButton('Later', QMessageBox.RejectRole)
-                msg.setDefaultButton(install_btn)
-                msg.exec_()
-                if msg.clickedButton() is install_btn:
-                    self._launch_installer_and_quit(installer_path)
-                    return  # app is quitting; don't bother with DSDL dialog
-            elif not silent:
-                QMessageBox.information(
-                    self, 'Check for Updates',
-                    'You are running the latest version ({} flytrex {}).'.format(
-                        current_version, current_flytrex))
+                                        'Could not list the updates directory:\n{}'.format(msi['error']))
+            else:
+                latest = msi['latest']
+                if latest is None:
+                    if not silent:
+                        QMessageBox.warning(self, 'Check for Updates',
+                                            'No installation files were found in:\n{}'.format(updates_dir))
+                elif latest[0] > current_combo:
+                    installer_path = os.path.join(updates_dir, latest[3])
+                    msg = QMessageBox(self)
+                    msg.setIcon(QMessageBox.Information)
+                    msg.setWindowTitle('Check for Updates')
+                    msg.setTextFormat(Qt.RichText)
+                    msg.setText(
+                        'A new version is available.<br><br>'
+                        'Installed: <b>{cur} (flytrex {curf})</b><br>'
+                        'Latest: <b>{latest} (flytrex {latestf})</b><br><br>'
+                        'File: <code>{name}</code><br><br>'
+                        'Press <b>Install Now</b> to close the application and run the installer, '
+                        'or open the <a href="file:///{url}">updates folder</a> to install manually.'.format(
+                            cur=current_version, curf=current_flytrex,
+                            latest=latest[1], latestf=latest[2],
+                            name=latest[3],
+                            url=updates_dir.replace('\\', '/')))
+                    msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
+                    install_btn = msg.addButton('Install Now', QMessageBox.AcceptRole)
+                    msg.addButton('Later', QMessageBox.RejectRole)
+                    msg.setDefaultButton(install_btn)
+                    msg.exec_()
+                    if msg.clickedButton() is install_btn:
+                        self._launch_installer_and_quit(installer_path)
+                        return  # app is quitting; don't bother with DSDL dialog
+                elif not silent:
+                    QMessageBox.information(
+                        self, 'Check for Updates',
+                        'You are running the latest version ({} flytrex {}).'.format(
+                            current_version, current_flytrex))
 
         # --- DSDL part ------------------------------------------------------
         dsdl = result['dsdl']
@@ -898,7 +1216,7 @@ class MainWindow(QMainWindow):
             print(dronecan.to_yaml(obj))
 
         def throw_if_anonymous():
-            if self._node.is_anonymous:
+            if self._node_runtime.is_anonymous:
                 raise RuntimeError('Local node is configured in anonymous mode. '
                                    'You need to set the local node ID (see the main window) in order to be able '
                                    'to send transfers.')
@@ -919,7 +1237,7 @@ class MainWindow(QMainWindow):
             throw_if_anonymous()
             priority = priority or default_transfer_priority
             callback = callback or print_yaml
-            return self._node.request(payload, server_node_id, callback, priority=priority, timeout=timeout)
+            return self._node_runtime.request(payload, server_node_id, callback, priority=priority, timeout=timeout)
 
         def serve(dronecan_type, callback):
             """
@@ -946,7 +1264,7 @@ class MainWindow(QMainWindow):
                                  dronecan_type, exc_info=True)
                     sub_handle.remove()
 
-            sub_handle = self._node.add_handler(dronecan_type, process_callback)
+            sub_handle = self._node_runtime.add_handler(dronecan_type, process_callback)
             active_handles.append(sub_handle)
             return sub_handle
 
@@ -992,7 +1310,7 @@ class MainWindow(QMainWindow):
 
             # Business end is here
             def do_broadcast():
-                self._node.broadcast(payload, priority or default_transfer_priority)
+                self._node_runtime.broadcast(payload, priority or default_transfer_priority)
 
             do_broadcast()
 
@@ -1016,7 +1334,7 @@ class MainWindow(QMainWindow):
                                         dronecan.get_dronecan_data_type(payload).full_name)
                             timer_handle.remove()
 
-                timer_handle = self._node.periodic(interval, process_next)
+                timer_handle = self._node_runtime.periodic(interval, process_next)
                 active_handles.append(timer_handle)
                 return timer_handle
 
@@ -1075,10 +1393,10 @@ class MainWindow(QMainWindow):
                     if on_end is not None:
                         on_end()
 
-            sub_handle = self._node.add_handler(dronecan_type, process_callback)
+            sub_handle = self._node_runtime.add_handler(dronecan_type, process_callback)
             timer_handle = None
             if duration is not None:
-                timer_handle = self._node.defer(duration, cancel_callback)
+                timer_handle = self._node_runtime.defer(duration, cancel_callback)
             active_handles.append(sub_handle)
             return sub_handle
 
@@ -1086,7 +1404,7 @@ class MainWindow(QMainWindow):
             """
             Calls the specified callback with the specified time interval.
             """
-            handle = self._node.periodic(period_sec, callback)
+            handle = self._node_runtime.periodic(period_sec, callback)
             active_handles.append(handle)
             return handle
 
@@ -1094,7 +1412,7 @@ class MainWindow(QMainWindow):
             """
             Calls the specified callback after the specified amount of time.
             """
-            handle = self._node.defer(delay_sec, callback)
+            handle = self._node_runtime.defer(delay_sec, callback)
             active_handles.append(handle)
             return handle
 
@@ -1118,12 +1436,12 @@ class MainWindow(QMainWindow):
                 data:       Payload as bytes()
                 extended:   True to send a 29-bit frame; False to send an 11-bit frame
             """
-            self._node.can_driver.send(can_id, data, extended=extended)
+            self._node_runtime.can_send(can_id, data, extended=extended)
 
         return [
             InternalObjectDescriptor('can_iface_name', self._iface_name,
                                      'Name of the CAN bus interface'),
-            InternalObjectDescriptor('node', self._node,
+            InternalObjectDescriptor('node', self._node_runtime,
                                      'DroneCAN node instance'),
             InternalObjectDescriptor('node_monitor', self._node_monitor_widget.monitor,
                                      'Object that stores information about nodes currently available on the bus'),
@@ -1170,37 +1488,32 @@ class MainWindow(QMainWindow):
                 pass    # Sometimes fails with "wrapped C/C++ object of type NodePropertiesWindow has been deleted"
             del self._node_windows[node_id]
 
-        w = NodePropertiesWindow(self, self._node, node_id, self._file_server_widget,
+        w = NodePropertiesWindow(self, self._node_runtime, node_id, self._file_server_widget,
                                  self._node_monitor_widget.monitor, self._dynamic_node_id_allocation_widget)
         w.show()
         self._node_windows[node_id] = w
 
-    def _spin_node(self):
-        # We're running the node in the GUI thread.
-        # This is not great, but at the moment seems like other options are even worse.
-        try:
-            self._node.spin(0)
-            self._successive_node_errors = 0
-        except Exception as ex:
-            self._successive_node_errors += 1
+    def _on_node_spin_error(self, ex, successive_errors):
+        self._successive_node_errors = successive_errors
 
-            msg = 'Node spin error [%d of %d]: %r' % (self._successive_node_errors, self.MAX_SUCCESSIVE_NODE_ERRORS, ex)
+        msg = 'Node spin error [%d of %d]: %r' % (self._successive_node_errors, self.MAX_SUCCESSIVE_NODE_ERRORS, ex)
 
-            if self._successive_node_errors >= self.MAX_SUCCESSIVE_NODE_ERRORS:
-                show_error('Node failure',
-                           'Local DroneCAN node has generated too many errors and will be terminated.\n'
-                           'Please restart the application.',
-                           msg, self)
-                self._node_spin_timer.stop()
-                self._node.close()
+        if self._successive_node_errors >= self.MAX_SUCCESSIVE_NODE_ERRORS:
+            show_error('Node failure',
+                       'Local DroneCAN node has generated too many errors and will be terminated.\n'
+                       'Please restart the application.',
+                       msg, self)
+            self._node_runtime.stop()
+            self._node_runtime.close_node()
 
-            logger.error(msg, exc_info=True)
-            self.statusBar().showMessage(msg, 3000)
+        logger.error(msg, exc_info=True)
+        self.statusBar().showMessage(msg, 3000)
 
     def closeEvent(self, qcloseevent):
         self._plotter_manager.close()
         self._console_manager.close()
         self._active_data_type_detector.close()
+        self._node_runtime.close()
         super(MainWindow, self).closeEvent(qcloseevent)
 
 def main():

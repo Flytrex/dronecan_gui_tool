@@ -13,13 +13,19 @@ import json
 import zlib
 import base64
 import struct
+import threading
+from time import monotonic
 from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QHBoxLayout, QWidget, QDirModel, QCompleter, QFileDialog, QLabel
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, QObject
 from logging import getLogger
 from . import make_icon_button, CommitableComboBoxWithHistory, get_icon, flash, LabelWithIcon
 
 
 logger = getLogger(__name__)
+
+
+READ_ACTIVITY_WINDOW_SEC = 0.250
+READ_CACHE_REVALIDATE_INTERVAL_SEC = 1.000
 
 def FileServer_PathKey(path):
     '''
@@ -111,12 +117,23 @@ def hex2bin(heximage):
 class FileServerJson(dronecan.app.file_server.FileServer):
     def __init__(self, node):
         super(FileServerJson, self).__init__(node)
+        self._node = node
         self._images = {}
+        self._image_views = {}
         self._image_timestamps = {}
+        self._image_last_checked_at = {}
         self._key_to_path = {}
         self._key_hit_counters = {}
         self._key_complete = set()
         self._key_max_offset = {}
+        self._cache_lock = threading.RLock()
+
+    def _is_firmware_update_mode(self):
+        return bool(getattr(self._node, '_firmware_update_mode', False))
+
+    def _is_active_firmware_read_window(self):
+        active_until = float(getattr(self._node, '_firmware_read_active_until', 0.0) or 0.0)
+        return active_until > monotonic()
 
     def _resolve_path(self, relative):
         rel = relative.path.decode().replace(chr(relative.SEPARATOR), os.path.sep)
@@ -146,69 +163,158 @@ class FileServerJson(dronecan.app.file_server.FileServer):
         return open(path,'rb').read()
 
     def _check_path_change(self, path):
-        key = FileServer_PathKey(path)
-        mtime = os.path.getmtime(path)
-        if path not in self._images or key not in self._key_to_path or mtime != self._image_timestamps.get(path):
-            self._image_timestamps[path] = mtime
-            self._images[path] = self._load_image(path)
-            self._key_to_path[key] = path
-            # transfer progress of the previous image must not leak into the new one
-            self._key_complete.discard(key)
-            self._key_max_offset.pop(key, None)
+        with self._cache_lock:
+            key = FileServer_PathKey(path)
+            mtime = os.path.getmtime(path)
+            if path not in self._images or key not in self._key_to_path or mtime != self._image_timestamps.get(path):
+                self._image_timestamps[path] = mtime
+                self._images[path] = self._load_image(path)
+                self._image_views[path] = memoryview(self._images[path])
+                self._key_to_path[key] = path
+                # transfer progress of the previous image must not leak into the new one
+                self._key_complete.discard(key)
+                self._key_max_offset.pop(key, None)
 
     def purge_path(self, path):
         """Remove all cached data for a path so file.Read requests for it will fail."""
-        key = FileServer_PathKey(path)
-        self._key_to_path.pop(key, None)
-        self._images.pop(path, None)
-        self._image_timestamps.pop(path, None)
-        self._key_complete.discard(key)
-        self._key_max_offset.pop(key, None)
-        self._key_hit_counters.pop(key, None)
+        with self._cache_lock:
+            key = FileServer_PathKey(path)
+            self._key_to_path.pop(key, None)
+            self._images.pop(path, None)
+            self._image_views.pop(path, None)
+            self._image_timestamps.pop(path, None)
+            self._key_complete.discard(key)
+            self._key_max_offset.pop(key, None)
+            self._key_hit_counters.pop(key, None)
+
+    def set_lookup_paths(self, paths):
+        with self._cache_lock:
+            self.lookup_paths = list(paths)
+            for cached_path in list(self._images.keys()):
+                if cached_path not in self.lookup_paths:
+                    self.purge_path(cached_path)
 
     @property
     def key_hit_counters(self):
-        return dict(self._key_hit_counters)
+        with self._cache_lock:
+            return dict(self._key_hit_counters)
 
     def is_key_complete(self, key):
-        return key in self._key_complete
+        with self._cache_lock:
+            return key in self._key_complete
 
     def get_key_progress(self, key):
-        if key not in self._key_to_path:
-            return (0, 0)
-        path = self._key_to_path[key]
-        total = len(self._images.get(path, b''))
-        sent = min(self._key_max_offset.get(key, 0), total)
-        return (sent, total)
+        with self._cache_lock:
+            if key not in self._key_to_path:
+                return (0, 0)
+            path = self._key_to_path[key]
+            total = len(self._images.get(path, b''))
+            sent = min(self._key_max_offset.get(key, 0), total)
+            return (sent, total)
 
     def _read(self, e):
-        logger.debug("[#{0:03d}:uavcan.protocol.file.Read] {1!r} @ offset {2:d}"
-                     .format(e.transfer.source_node_id, e.request.path.path.decode(), e.request.offset))
-        try:
+        with self._cache_lock:
+            if not self._is_firmware_update_mode():
+                logger.debug("[#{0:03d}:uavcan.protocol.file.Read] {1!r} @ offset {2:d}"
+                             .format(e.transfer.source_node_id, e.request.path.path.decode(), e.request.offset))
+            if self._is_firmware_update_mode():
+                setattr(self._node, '_firmware_read_active_until', monotonic() + READ_ACTIVITY_WINDOW_SEC)
             key = e.request.path.path.decode()
-            if key in self._key_to_path:
-                path = self._key_to_path[key]
-                self._key_hit_counters[key] = self._key_hit_counters.get(key, 0) + 1
-            else:
-                path = self._resolve_path(e.request.path)
-            self._check_path_change(path)
-            resp = uavcan.protocol.file.Read.Response()
-            read_size = dronecan.get_dronecan_data_type(dronecan.get_fields(resp)['data']).max_size
-            resp.data = self._images[path][e.request.offset:e.request.offset+read_size]
-            resp.error.value = resp.error.OK
-            if key in self._key_to_path:
-                end_offset = e.request.offset + len(resp.data)
-                prev = self._key_max_offset.get(key, 0)
-                if end_offset > prev:
-                    self._key_max_offset[key] = end_offset
-                if len(resp.data) < read_size:
-                    self._key_complete.add(key)
-        except Exception:
-            logger.exception("[#{0:03d}:uavcan.protocol.file.Read] error")
-            resp = uavcan.protocol.file.Read.Response()
-            resp.error.value = resp.error.UNKNOWN_ERROR
+            try:
+                if key in self._key_to_path:
+                    path = self._key_to_path[key]
+                    self._key_hit_counters[key] = self._key_hit_counters.get(key, 0) + 1
+                else:
+                    path = self._resolve_path(e.request.path)
 
-        return resp
+                self._check_path_change(path)
+
+                resp = uavcan.protocol.file.Read.Response()
+                read_size = dronecan.get_dronecan_data_type(dronecan.get_fields(resp)['data']).max_size
+
+                image_view = self._image_views[path]
+                end_offset = min(e.request.offset + read_size, len(image_view))
+                payload_size = max(0, end_offset - e.request.offset)
+                resp.data = image_view[e.request.offset:end_offset]
+                resp.error.value = resp.error.OK
+
+                if key in self._key_to_path:
+                    end_offset = e.request.offset + payload_size
+                    prev = self._key_max_offset.get(key, 0)
+                    if end_offset > prev:
+                        self._key_max_offset[key] = end_offset
+                    if payload_size < read_size:
+                        self._key_complete.add(key)
+            except Exception:
+                logger.exception("[#{0:03d}:uavcan.protocol.file.Read] error")
+                resp = uavcan.protocol.file.Read.Response()
+                resp.error.value = resp.error.UNKNOWN_ERROR
+
+            return resp
+
+
+class FileServerController(QObject):
+    def __init__(self, node, parent=None):
+        super(FileServerController, self).__init__(parent)
+        self._node = node
+        self._file_server = None
+        self._paths = []
+
+    @property
+    def node(self):
+        return self._node
+
+    @property
+    def file_server(self):
+        return self._file_server
+
+    @property
+    def is_running(self):
+        return self._file_server is not None
+
+    @property
+    def path_hit_counters(self):
+        return {} if self._file_server is None else self._file_server.path_hit_counters
+
+    def set_paths(self, paths):
+        self._paths = [os.path.normcase(os.path.abspath(os.path.expanduser(path))) for path in paths if path]
+
+        if self._file_server:
+            logger.info('Updating lookup paths: %r', self._paths)
+            self._file_server.set_lookup_paths(self._paths)
+
+    def add_path(self, path):
+        path = os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+        if path not in self._paths:
+            self.set_paths(self._paths + [path])
+
+    def remove_path(self, path):
+        path = os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+        if path in self._paths:
+            self.set_paths([existing for existing in self._paths if existing != path])
+
+    def force_start(self):
+        if not self._file_server:
+            self._file_server = FileServerJson(self._node)
+            self.set_paths(self._paths)
+
+    def stop(self):
+        if self._file_server:
+            try:
+                self._file_server.close()
+            except Exception:
+                logger.error('Could not stop file server', exc_info=True)
+            self._file_server = None
+            logger.info('File server stopped')
+
+    def close(self):
+        self.stop()
+
+    def is_key_complete(self, key):
+        return self._file_server.is_key_complete(key) if self._file_server else False
+
+    def get_key_progress(self, key):
+        return self._file_server.get_key_progress(key) if self._file_server else (0, 0)
 
 
 class FileServerWidget(QGroupBox):
@@ -216,8 +322,12 @@ class FileServerWidget(QGroupBox):
         super(FileServerWidget, self).__init__(parent)
         self.setTitle('File server (dronecan.uavcan.protocol.file.*)')
 
-        self._node = node
-        self._file_server = None
+        if isinstance(node, FileServerController):
+            self._controller = node
+            self._owns_controller = False
+        else:
+            self._controller = FileServerController(node, self)
+            self._owns_controller = True
 
         self._path_widgets = []
 
@@ -246,10 +356,10 @@ class FileServerWidget(QGroupBox):
         self.setLayout(layout)
 
     def _update_on_timer(self):
-        self._start_button.setEnabled(not self._node.is_anonymous)
-        self._start_button.setChecked(self._file_server is not None)
-        if self._file_server:
-            for path, count in self._file_server.path_hit_counters.items():
+        self._start_button.setEnabled(not self._controller.node.is_anonymous)
+        self._start_button.setChecked(self._controller.is_running)
+        if self._controller.is_running:
+            for path, count in self._controller.path_hit_counters.items():
                 for w in self._path_widgets:
                     if w.path and path.startswith(w.path):
                         w.update_hit_count(path, count)
@@ -261,34 +371,17 @@ class FileServerWidget(QGroupBox):
         return [x.path for x in self._path_widgets if x.path]
 
     def _sync_paths(self):
-        if self._file_server:
-            paths = self._get_paths()
-            logger.info('Updating lookup paths: %r', paths)
-            self._file_server.lookup_paths = paths
-            # Purge cached images for paths no longer in the list
-            for cached_path in list(self._file_server._images.keys()):
-                if cached_path not in paths:
-                    self._file_server.purge_path(cached_path)
+        paths = self._get_paths()
+        self._controller.set_paths(paths)
+        if self._controller.is_running:
             flash(self, 'File server lookup paths: %r', paths, duration=3)
-            for p in paths:
-                # A missing/unreadable path must not prevent the other paths from being served
-                try:
-                    self._file_server._check_path_change(p)
-                except Exception:
-                    logger.warning('Could not load lookup path %r', p, exc_info=True)
-                    self._file_server.purge_path(p)
 
     def _on_start_stop(self):
-        if self._file_server:
-            try:
-                self._file_server.close()
-            except Exception:
-                logger.error('Could not stop file server', exc_info=True)
-            self._file_server = None
-            logger.info('File server stopped')
+        if self._controller.is_running:
+            self._controller.stop()
         else:
-            self._file_server = FileServerJson(self._node)
-            self._sync_paths()
+            self._controller.force_start()
+        self._sync_paths()
 
     def _on_remove_path(self, path):
         orig_len = len(self._path_widgets)
@@ -329,7 +422,7 @@ class FileServerWidget(QGroupBox):
         self._file_server._check_path_change(path)
 
     def force_start(self):
-        if not self._file_server:
+        if not self._controller.is_running:
             self._on_start_stop()
 
     def remove_path(self, path):
@@ -339,4 +432,8 @@ class FileServerWidget(QGroupBox):
             if it.path == path:
                 self._on_remove_path(it)
                 return
+
+    @property
+    def _file_server(self):
+        return self._controller.file_server
 
