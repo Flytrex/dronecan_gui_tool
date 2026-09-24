@@ -9,6 +9,6 @@
 #
 #
 __version__ = 1, 2, 28
-__flytrex_version__ = 0, 0, 3
+__flytrex_version__ = 1, 0, 0
 
 
